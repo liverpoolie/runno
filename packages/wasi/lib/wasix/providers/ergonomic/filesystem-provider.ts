@@ -190,6 +190,14 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
     if (err !== Preview1Result.SUCCESS) {
       throw new WASIXError(toWasixResult(err));
     }
+    // The provider contract types `cookie` as `bigint`; reject cookies
+    // that would lose precision when narrowed to a Number so we surface
+    // the overflow instead of silently slicing at the wrong index. The
+    // drive list is always well below 2^53 entries in practice — this
+    // is a type-safety guard rather than a real limit.
+    if (cookie > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new WASIXError(Result.EOVERFLOW);
+    }
     const entries: DirEntry[] = list.map((entry, index) => ({
       next: BigInt(index + 1),
       ino: cyrb53Bigint(entry.name),
