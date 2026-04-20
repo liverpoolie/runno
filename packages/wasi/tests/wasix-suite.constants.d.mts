@@ -6,3 +6,4 @@ export declare const WASMER_SHA: string;
 export declare const WASIX_INCLUDE_DIRS: readonly string[];
 export declare const WASIX_VENDOR_DIR: string;
 export declare const WASIX_SUITE_BIN_DIR: string;
+export declare function resolveWasixIncludeDirs(): string[];
