@@ -27,8 +27,13 @@ import { join } from "node:path";
 
 import { test, expect } from "@playwright/test";
 
-import type { WASIX, WASIXContext, WASIFS } from "../lib/main";
-import { WASIX_SUITE_BIN_DIR, WASIX_VENDOR_DIR } from "./wasix-suite.config";
+import type { WASIX, WASIXContext, WASIXWorkerHost, WASIFS } from "../lib/main";
+import {
+  WASIX_SUITE_BIN_DIR,
+  WASIX_SUITE_MODES,
+  WASIX_VENDOR_DIR,
+  type WASIXSuiteMode,
+} from "./wasix-suite.config";
 import type { SkipEntry } from "./wasix-suite.skip";
 import { WASIX_SUITE_SKIPS } from "./wasix-suite.skip";
 
@@ -255,77 +260,97 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
 
     const plan = planForTest(name);
 
-    test(`wasix-suite: ${name}`, async ({ page }) => {
-      if (skip) {
-        test.info().annotations.push({
-          type: "wasix-skip",
-          description: skip.note
-            ? `${skip.reason} — ${skip.note}`
-            : skip.reason,
-        });
-        test.fixme(true, `wasix-skip:${skip.reason}`);
-      }
-
-      const result = await page.evaluate(async (p: TestPlan) => {
-        while (
-          (window as unknown as { WASIX?: unknown })["WASIX"] === undefined
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
+    for (const mode of WASIX_SUITE_MODES) {
+      test(`wasix-suite [${mode}]: ${name}`, async ({ page }) => {
+        if (skip) {
+          test.info().annotations.push({
+            type: "wasix-skip",
+            description: skip.note
+              ? `${skip.reason} — ${skip.note}`
+              : skip.reason,
+          });
+          test.fixme(true, `wasix-skip:${skip.reason}`);
         }
 
-        const w = window as unknown as {
-          WASIX: typeof WASIX;
-          WASIXContext: typeof WASIXContext;
-        };
-        const W = w.WASIX;
-        const WC = w.WASIXContext;
+        const result = await page.evaluate(
+          async (input: { plan: TestPlan; mode: WASIXSuiteMode }) => {
+            const p = input.plan;
+            while (
+              (window as unknown as { WASIX?: unknown })["WASIX"] === undefined
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
 
-        // Seed a fresh WASIFS for this run from the per-test inputs.
-        // Paths are rooted at `/` so they resolve through the single
-        // preopen (".") the WASIDrive exposes.
-        const now = new Date();
-        const fs: WASIFS = {};
-        for (const input of p.inputs) {
-          const guestPath = `/${input.path}`;
-          fs[guestPath] = {
-            path: guestPath,
-            timestamps: { access: now, modification: now, change: now },
-            mode: "binary",
-            content: new Uint8Array(input.bytes),
-          };
-        }
+            const w = window as unknown as {
+              WASIX: typeof WASIX;
+              WASIXContext: typeof WASIXContext;
+              WASIXWorkerHost: typeof WASIXWorkerHost;
+            };
 
-        let stdout = "";
-        let stderr = "";
+            // Seed a fresh WASIFS for this run from the per-test inputs.
+            // Paths are rooted at `/` so they resolve through the single
+            // preopen (".") the WASIDrive exposes.
+            const now = new Date();
+            const fs: WASIFS = {};
+            for (const input of p.inputs) {
+              const guestPath = `/${input.path}`;
+              fs[guestPath] = {
+                path: guestPath,
+                timestamps: { access: now, modification: now, change: now },
+                mode: "binary",
+                content: new Uint8Array(input.bytes),
+              };
+            }
 
-        const wasiResult = await W.start(
-          fetch(p.wasmUrl),
-          new WC({
-            args: p.args,
-            stdout: (out: string) => {
-              stdout += out;
-            },
-            stderr: (err: string) => {
-              stderr += err;
-            },
-            stdin: () => null,
-            fs,
-          }),
+            let stdout = "";
+            let stderr = "";
+
+            if (input.mode === "main") {
+              const wasiResult = await w.WASIX.start(
+                fetch(p.wasmUrl),
+                new w.WASIXContext({
+                  args: p.args,
+                  stdout: (out: string) => {
+                    stdout += out;
+                  },
+                  stderr: (err: string) => {
+                    stderr += err;
+                  },
+                  stdin: () => null,
+                  fs,
+                }),
+              );
+              return { exitCode: wasiResult.exitCode, stdout, stderr };
+            }
+
+            // worker mode — WASIXWorkerHost spawns a dedicated worker and
+            // drives it through the bridge. No async-capable providers are
+            // supplied for the suite; the bridge still handles stdout /
+            // stderr via postMessage events.
+            const host = new w.WASIXWorkerHost(fetch(p.wasmUrl), {
+              args: p.args,
+              fs,
+              stdout: (out: string) => {
+                stdout += out;
+              },
+              stderr: (err: string) => {
+                stderr += err;
+              },
+              stdin: () => null,
+            });
+            const workerResult = await host.start();
+            return { exitCode: workerResult.exitCode, stdout, stderr };
+          },
+          { plan, mode },
         );
 
-        return {
-          exitCode: wasiResult.exitCode,
-          stdout,
-          stderr,
-        };
-      }, plan);
-
-      expect(
-        result.exitCode,
-        `args: ${JSON.stringify(plan.args)}\ninputs: ${plan.inputs
-          .map((i) => i.path)
-          .join(", ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-      ).toBe(0);
-    });
+        expect(
+          result.exitCode,
+          `mode: ${mode}\nargs: ${JSON.stringify(plan.args)}\ninputs: ${plan.inputs
+            .map((i) => i.path)
+            .join(", ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+        ).toBe(0);
+      });
+    }
   }
 });

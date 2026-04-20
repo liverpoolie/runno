@@ -31,6 +31,14 @@ export const WASIX_VENDOR_DIR = "tests/wasix-vendor";
  */
 export const WASIX_SUITE_BIN_DIR = "public/bin/wasix-tests";
 
+/**
+ * Execution modes the suite runs every test under. Slice 4 parameterises
+ * the harness so each `.wasm` runs through both `WASIX.start` on the main
+ * thread and `WASIXWorkerHost.start()` in a dedicated worker. Skip-map
+ * entries apply to both modes by default — no mode-specific skips yet.
+ */
+export const WASIX_SUITE_MODES = /** @type {const} */ (["main", "worker"]);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgDir = resolve(__dirname, "..");
 
