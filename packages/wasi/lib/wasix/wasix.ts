@@ -1,4 +1,4 @@
-import { Result } from "./wasix-32v1.js";
+import { ClockId, Result, WASIXError } from "./wasix-32v1.js";
 import { WASIXContext, WASIXContextOptions } from "./wasix-context.js";
 import {
   WASI,
@@ -6,6 +6,9 @@ import {
   InitializationError,
 } from "../wasi/wasi.js";
 import { WASIXExecutionResult } from "../types.js";
+import { SystemClockProvider } from "./providers/system-clock.js";
+import { SystemRandomProvider } from "./providers/system-random.js";
+import type { ClockProvider, RandomProvider } from "./providers.js";
 
 class WASIXExit extends Error {
   code: number;
@@ -35,6 +38,8 @@ export class WASIX {
   hasBeenInitialized: boolean = false;
 
   private wasi: WASI;
+  private _clock?: ClockProvider;
+  private _random?: RandomProvider;
 
   /**
    * Start a WASIX command.
@@ -143,8 +148,66 @@ export class WASIX {
   }
 
   //
-  // wasix_32v1 stubs — all return ENOSYS this slice.
+  // Provider accessors — lazy-init system defaults when context slot is unset.
   //
+
+  private get clock(): ClockProvider {
+    return this.context.clock ?? (this._clock ??= new SystemClockProvider());
+  }
+
+  private get random(): RandomProvider {
+    return this.context.random ?? (this._random ??= new SystemRandomProvider());
+  }
+
+  //
+  // wasix_32v1 syscall handlers — clock + random wired; all others ENOSYS.
+  //
+
+  private wasix_clock_time_get(
+    id: number,
+    _precision: bigint,
+    retptr: number,
+  ): number {
+    try {
+      const view = new DataView(this.memory.buffer);
+      view.setBigUint64(retptr, this.clock.now(id as ClockId), true);
+      return Result.SUCCESS;
+    } catch (e) {
+      if (e instanceof WASIXError) return e.result;
+      this.context.debug?.("clock_time_get", [], Result.EIO, [
+        { error: String(e) },
+      ]);
+      return Result.EIO;
+    }
+  }
+
+  private wasix_clock_res_get(id: number, retptr: number): number {
+    try {
+      const view = new DataView(this.memory.buffer);
+      view.setBigUint64(retptr, this.clock.resolution(id as ClockId), true);
+      return Result.SUCCESS;
+    } catch (e) {
+      if (e instanceof WASIXError) return e.result;
+      this.context.debug?.("clock_res_get", [], Result.EIO, [
+        { error: String(e) },
+      ]);
+      return Result.EIO;
+    }
+  }
+
+  private wasix_random_get(bufPtr: number, bufLen: number): number {
+    try {
+      const buf = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
+      this.random.fill(buf);
+      return Result.SUCCESS;
+    } catch (e) {
+      if (e instanceof WASIXError) return e.result;
+      this.context.debug?.("random_get", [], Result.EIO, [
+        { error: String(e) },
+      ]);
+      return Result.EIO;
+    }
+  }
 
   private getWasix32v1Stubs(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
@@ -156,8 +219,8 @@ export class WASIX {
       environ_sizes_get: enosys,
 
       // Clock
-      clock_res_get: enosys,
-      clock_time_get: enosys,
+      clock_res_get: this.wasix_clock_res_get.bind(this),
+      clock_time_get: this.wasix_clock_time_get.bind(this),
 
       // File descriptors
       fd_advise: enosys,
@@ -209,7 +272,7 @@ export class WASIX {
       proc_parent: enosys,
 
       // Random
-      random_get: enosys,
+      random_get: this.wasix_random_get.bind(this),
 
       // Scheduling
       sched_yield: enosys,
