@@ -26,6 +26,10 @@ dist-ssr
 # These are built with npm run build:programs
 public/bin
 
+# Vendored wasmer checkout + built wasix integration-suite binaries
+tests/wasix-vendor/
+public/bin/wasix-tests/
+
 # Playwright
 playwright-report
 
