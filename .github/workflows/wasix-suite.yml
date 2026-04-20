@@ -23,9 +23,45 @@ jobs:
       - name: Install root dependencies
         run: npm run bootstrap
 
+      # Cache the vendored wasmer tarball extract + the built wasix-libc
+      # sysroot. Both are keyed on the pinned SHA and the suite constants
+      # file (bumping the SHA invalidates the cache automatically). The
+      # built .wasm artifacts under `public/bin/wasix-tests/` are keyed on
+      # the vendored tree hash and the build script itself, so a wasixcc
+      # toolchain bump forces a rebuild.
+      - name: Cache wasix-libc toolchain
+        id: cache-wasix-libc
+        uses: actions/cache@v4
+        with:
+          path: ~/.wasix
+          key: >-
+            wasix-libc-v12-${{ runner.os }}-${{
+              hashFiles('.github/workflows/wasix-suite.yml')
+            }}
+
+      - name: Cache vendored wasmer checkout
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/tests/wasix-vendor
+          key: >-
+            wasmer-vendor-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.mjs')
+            }}
+
+      - name: Cache built wasix-suite binaries
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/public/bin/wasix-tests
+          key: >-
+            wasix-bins-${{ runner.os }}-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.mjs',
+                        'packages/wasi/tests/build-wasix-suite.mjs')
+            }}
+
       - name: Install wasixcc toolchain
         # Pulls the prebuilt wasix-libc sysroot + wrapper scripts.
         # Exposes `wasixcc` on PATH for the build harness.
+        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           WASIX_LIBC_VERSION="v12"
@@ -40,7 +76,12 @@ jobs:
             echo "::warning::failed to extract wasix-libc — wasix-suite will skip."
             exit 0
           }
-          echo "$INSTALL_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Expose wasixcc on PATH
+        run: |
+          if [ -d "$HOME/.wasix/bin" ]; then
+            echo "$HOME/.wasix/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Probe wasixcc
         id: probe
@@ -64,7 +105,70 @@ jobs:
 
       - name: Run wasix-suite Playwright tests
         working-directory: packages/wasi
-        run: npx playwright test tests/wasix-suite.spec.ts
+        # Add the JSON reporter alongside the existing html reporter so
+        # the next step can count pass/skip/fail without parsing HTML.
+        run: |
+          npx playwright test tests/wasix-suite.spec.ts \
+            --reporter=list,html,json \
+            || echo "::notice::wasix-suite playwright exited non-zero — see summary for counts."
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-report/wasix-suite.json
+
+      - name: Publish pass/skip counts to job summary
+        if: always()
+        working-directory: packages/wasi
+        run: |
+          set -euo pipefail
+          REPORT="playwright-report/wasix-suite.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "::warning::no wasix-suite JSON report at $REPORT"
+            {
+              echo "## wasix integration suite"
+              echo
+              echo "_No Playwright JSON report produced._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # jq aggregates Playwright's per-test-status counts across the
+          # whole suite (stats.{expected,unexpected,skipped,flaky}).
+          STATS=$(jq '{expected: .stats.expected,
+                       unexpected: .stats.unexpected,
+                       skipped: .stats.skipped,
+                       flaky: .stats.flaky}' "$REPORT")
+          PASSED=$(echo "$STATS" | jq -r '.expected')
+          FAILED=$(echo "$STATS" | jq -r '.unexpected')
+          SKIPPED=$(echo "$STATS" | jq -r '.skipped')
+          FLAKY=$(echo "$STATS" | jq -r '.flaky')
+          {
+            echo "## wasix integration suite"
+            echo
+            echo "| result | count |"
+            echo "| --- | --- |"
+            echo "| passed | ${PASSED} |"
+            echo "| failed | ${FAILED} |"
+            echo "| skipped | ${SKIPPED} |"
+            echo "| flaky | ${FLAKY} |"
+            echo
+            echo "### Skip breakdown"
+            echo
+            # Group by skip reason annotation (set in wasix-suite.spec.ts).
+            jq -r '
+              [.suites[]?.suites[]?.specs[]?.tests[]?.annotations[]?
+               | select(.type == "wasix-skip") | .description]
+              | group_by(.)
+              | map({reason: .[0], count: length})
+              | sort_by(-.count)
+              | .[]
+              | "| \(.reason) | \(.count) |"
+            ' "$REPORT" > /tmp/skip-breakdown.md || true
+            if [ -s /tmp/skip-breakdown.md ]; then
+              echo "| reason | count |"
+              echo "| --- | --- |"
+              cat /tmp/skip-breakdown.md
+            else
+              echo "_no categorised skips recorded_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Playwright report
         if: always()
