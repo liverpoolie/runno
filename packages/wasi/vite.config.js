@@ -3,17 +3,30 @@ import typescript from "@rollup/plugin-typescript";
 import { resolve } from "path";
 import { defineConfig } from "vite";
 
+// Cross-origin isolation headers.
+//
+// wasix-libc binaries import a shared `env.memory`, and WASIXWorkerHost
+// uses SharedArrayBuffer + Atomics.wait between the main thread and the
+// dedicated worker. Browsers gate both behind cross-origin isolation,
+// which requires:
+//
+//   Cross-Origin-Opener-Policy:   same-origin
+//   Cross-Origin-Embedder-Policy: require-corp
+//
+// We set them on both the dev server (`vite`) and the preview server
+// (`vite preview`); the `npm run test:server` script used by Playwright
+// points at `vite --port 5173` and picks them up from here.
+const crossOriginIsolationHeaders = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
 export default defineConfig({
-  // wasix-libc binaries import a shared `env.memory`. Browsers reject
-  // SharedArrayBuffer-backed memories unless the host page is
-  // cross-origin-isolated (COOP `same-origin` + COEP `require-corp`).
-  // The Playwright suite drives the dev server via `test:server`, so the
-  // headers carry into every test run.
   server: {
-    headers: {
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp",
-    },
+    headers: crossOriginIsolationHeaders,
+  },
+  preview: {
+    headers: crossOriginIsolationHeaders,
   },
   build: {
     copyPublicDir: false, // Public dir contains testing binaries
