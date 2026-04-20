@@ -1,10 +1,23 @@
 import "./style.css";
-import { WASI, WASIContext, WASIX, WASIXContext } from "../lib/main.js";
+import {
+  WASI,
+  WASIContext,
+  WASIX,
+  WASIXContext,
+  SystemClockProvider,
+  SystemRandomProvider,
+  FixedClockProvider,
+  SeededRandomProvider,
+} from "../lib/main.js";
 
 (window as any)["WASI"] = WASI;
 (window as any)["WASIContext"] = WASIContext;
 (window as any)["WASIX"] = WASIX;
 (window as any)["WASIXContext"] = WASIXContext;
+(window as any)["SystemClockProvider"] = SystemClockProvider;
+(window as any)["SystemRandomProvider"] = SystemRandomProvider;
+(window as any)["FixedClockProvider"] = FixedClockProvider;
+(window as any)["SeededRandomProvider"] = SeededRandomProvider;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;
 const argsInput = document.getElementById("args")! as HTMLInputElement;
