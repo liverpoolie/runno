@@ -127,3 +127,15 @@ export enum Signal {
   SIGPWR = 30,
   SIGSYS = 31,
 }
+
+// ─── Error class ─────────────────────────────────────────────────────────────
+
+// Thrown by provider implementations to signal a specific WASIX errno.
+// WASIX catches this and returns result directly; any other throw → EIO.
+export class WASIXError extends Error {
+  readonly result: Result;
+  constructor(result: Result, message?: string) {
+    super(message ?? `WASIXError: ${Result[result]}`);
+    this.result = result;
+  }
+}
