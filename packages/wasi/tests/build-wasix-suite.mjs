@@ -27,7 +27,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  WASIX_INCLUDE_DIRS,
+  resolveWasixIncludeDirs,
   WASIX_SUITE_BIN_DIR,
   WASIX_VENDOR_DIR,
 } from "./wasix-suite.constants.mjs";
@@ -61,7 +61,12 @@ let built = 0;
 let skipped = 0;
 let failed = 0;
 
-for (const name of WASIX_INCLUDE_DIRS) {
+// Re-resolve at this point rather than trusting the module-load-time
+// snapshot — `test:prepare:wasmer` may have populated the vendor dir
+// between module import and the build step in the combined prepare run.
+const includeDirs = resolveWasixIncludeDirs();
+
+for (const name of includeDirs) {
   const srcDir = join(vendorRoot, name);
   if (!existsSync(srcDir)) {
     console.warn(`[build-wasix-suite] skip (missing in vendor): ${name}`);
