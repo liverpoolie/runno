@@ -32,6 +32,10 @@ public/bin/tests/*.wasi.wasm
 !public/bin/tests/wasix-clock-random.wasm
 !public/bin/tests/wasix-deterministic.wasm
 
+# Vendored wasmer checkout + built wasix integration-suite binaries
+tests/wasix-vendor/
+public/bin/wasix-tests/
+
 # Playwright
 playwright-report
 
