@@ -69,7 +69,14 @@ const config: PlaywrightTestConfig = {
   /* Folder for test artifacts such as screenshots, videos, traces, etc. */
   // outputDir: 'test-results/',
 
-  /* Run your local dev server before starting the tests */
+  /* Run your local dev server before starting the tests.
+   *
+   * `npm run test:server` runs `vite --port 5173`, which picks up the
+   * Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy headers
+   * from `vite.config.js`. Those headers are required for
+   * `SharedArrayBuffer` + `Atomics.wait` availability in all three
+   * browsers WASIXWorkerHost depends on.
+   */
   webServer: {
     command: "npm run test:server",
     url: "http://localhost:5173/",
