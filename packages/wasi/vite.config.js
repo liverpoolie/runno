@@ -3,13 +3,30 @@ import typescript from "@rollup/plugin-typescript";
 import { resolve } from "path";
 import { defineConfig } from "vite";
 
-// NOTE (Slice 4): WASIXWorkerHost will need COOP/COEP headers on the dev
-// server so SharedArrayBuffer/Atomics are available. Set
-// `server.headers['Cross-Origin-Opener-Policy']   = 'same-origin'` and
-// `server.headers['Cross-Origin-Embedder-Policy'] = 'require-corp'` when the
-// worker lands. Slice 1 does not exercise threads, so headers stay off here.
+// Cross-origin isolation headers.
+//
+// WASIXWorkerHost uses SharedArrayBuffer + Atomics.wait between the main
+// thread and the dedicated worker. Both are gated behind cross-origin
+// isolation in every current browser, which requires:
+//
+//   Cross-Origin-Opener-Policy:   same-origin
+//   Cross-Origin-Embedder-Policy: require-corp
+//
+// We set them on both the dev server (`vite`) and the preview server
+// (`vite preview`); the `npm run test:server` script used by Playwright
+// points at `vite --port 5173` and picks them up from here.
+const crossOriginIsolationHeaders = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
 
 export default defineConfig({
+  server: {
+    headers: crossOriginIsolationHeaders,
+  },
+  preview: {
+    headers: crossOriginIsolationHeaders,
+  },
   build: {
     copyPublicDir: false, // Public dir contains testing binaries
     lib: {
