@@ -252,10 +252,43 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
   }
 
   pathRemoveDirectory(fdDir: number, path: string): void {
-    // WASIDrive doesn't distinguish empty vs non-empty; reuse unlink which
-    // removes directories recursively in the current drive model. Future
-    // slices may add strict empty-dir enforcement when the drive grows
-    // real directory support.
+    // POSIX `rmdir` contract (mirrored by wasix `path_remove_directory`):
+    //   - `path` points at a file → ENOTDIR.
+    //   - directory is non-empty → ENOTEMPTY.
+    //   - anything else → delegate to the drive's unlink.
+    //
+    // `WASIDrive.unlink` happily removes both files and non-empty
+    // directories (it just prefix-walks the flat path map). Guard the
+    // two error cases here so slice-4+ tests that exercise directory
+    // semantics see the right errno. Slice 9 lifts these checks into
+    // the extracted drive.
+    const [statErr, stat] = this.drive.pathStat(fdDir, path);
+    if (statErr !== Preview1Result.SUCCESS) {
+      throw new WASIXError(toWasixResult(statErr));
+    }
+    if ((stat.type as unknown as FileType) !== FileType.DIRECTORY) {
+      throw new WASIXError(Result.ENOTDIR);
+    }
+
+    // Open the target directory just long enough to read its entries —
+    // the drive's list() requires an fd. Close on both success and
+    // failure paths so we don't leak fds on the ENOTEMPTY return.
+    const [openErr, dirFd] = this.drive.open(fdDir, path, 0, 0);
+    if (openErr !== Preview1Result.SUCCESS) {
+      throw new WASIXError(toWasixResult(openErr));
+    }
+    try {
+      const [listErr, entries] = this.drive.list(dirFd);
+      if (listErr !== Preview1Result.SUCCESS) {
+        throw new WASIXError(toWasixResult(listErr));
+      }
+      if (entries.length > 0) {
+        throw new WASIXError(Result.ENOTEMPTY);
+      }
+    } finally {
+      this.drive.close(dirFd);
+    }
+
     const err = this.drive.unlink(fdDir, path);
     if (err !== Preview1Result.SUCCESS) {
       throw new WASIXError(toWasixResult(err));
