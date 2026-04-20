@@ -8,6 +8,10 @@ export * as WASISnapshotPreview1 from "./wasi/snapshot-preview1.js";
 export * from "./wasix/wasix.js";
 export * from "./wasix/wasix-context.js";
 export * as WASIX32v1 from "./wasix/wasix-32v1.js";
+export { SystemClockProvider } from "./wasix/providers/system-clock.js";
+export { SystemRandomProvider } from "./wasix/providers/system-random.js";
+export { FixedClockProvider } from "./wasix/providers/fixed-clock.js";
+export { SeededRandomProvider } from "./wasix/providers/seeded-random.js";
 export type {
   ClockProvider,
   RandomProvider,
