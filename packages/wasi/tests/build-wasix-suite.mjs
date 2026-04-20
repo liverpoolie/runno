@@ -21,7 +21,13 @@
 //     `public/bin/wasix-tests/`, so a developer without wasixcc still
 //     sees a green (empty) wasix-suite run.
 
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +44,13 @@ const pkgDir = resolve(__dirname, "..");
 const vendorRoot = join(pkgDir, WASIX_VENDOR_DIR, "wasmer", "tests", "wasix");
 const outDir = join(pkgDir, WASIX_SUITE_BIN_DIR);
 
+// Sidecar file of tests that failed to build. The Playwright spec reads
+// it alongside the hand-authored skip map and tags those tests
+// `requires-wasixcc-build-fix` — per the Issue #4 contract that build
+// failures auto-populate into the skip list instead of silently masking
+// runtime regressions.
+const buildSkipPath = join(__dirname, "wasix-suite.build-skip.json");
+
 mkdirSync(outDir, { recursive: true });
 
 const wasixcc = resolveWasixcc();
@@ -46,6 +59,7 @@ if (!wasixcc) {
     "[build-wasix-suite] wasixcc not found on PATH — skipping suite build.\n" +
       "  Install the wasix-libc toolchain to enable these tests locally.",
   );
+  writeBuildSkip([]);
   process.exit(0);
 }
 
@@ -54,12 +68,14 @@ if (!existsSync(vendorRoot)) {
     `[build-wasix-suite] vendor directory missing: ${vendorRoot}\n` +
       "  Run `npm run test:prepare:wasmer` first.",
   );
+  writeBuildSkip([]);
   process.exit(0);
 }
 
 let built = 0;
 let skipped = 0;
 let failed = 0;
+const buildFailures = [];
 
 for (const name of WASIX_INCLUDE_DIRS) {
   const srcDir = join(vendorRoot, name);
@@ -88,9 +104,12 @@ for (const name of WASIX_INCLUDE_DIRS) {
     console.log(`[build-wasix-suite] built: ${name}`);
   } else {
     failed++;
+    buildFailures.push(name);
     console.warn(`[build-wasix-suite] FAILED (exit ${result.status}): ${name}`);
   }
 }
+
+writeBuildSkip(buildFailures);
 
 console.log(
   `[build-wasix-suite] summary: built=${built} skipped=${skipped} failed=${failed}`,
@@ -118,4 +137,22 @@ function collectSources(dir) {
     if (entry.endsWith(".c")) out.push(full);
   }
   return out;
+}
+
+/**
+ * Persist the list of build-failed test names to a sidecar JSON file.
+ * The Playwright spec merges this list with the hand-authored skip map
+ * using the `requires-wasixcc-build-fix` reason token from Issue #4.
+ *
+ * Writing an empty list is intentional: it clears a stale sidecar from a
+ * previous run so the "green (empty) wasix-suite" degrade path stays
+ * truly green instead of inheriting failures from a prior build.
+ */
+function writeBuildSkip(failures) {
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    reason: "requires-wasixcc-build-fix",
+    tests: failures.slice().sort(),
+  };
+  writeFileSync(buildSkipPath, `${JSON.stringify(payload, null, 2)}\n`);
 }

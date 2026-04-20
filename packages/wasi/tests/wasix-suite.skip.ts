@@ -5,41 +5,53 @@
 // `test.fixme()` by the Playwright spec with a structured reason token.
 //
 // Guardrails (enforced by the slice-3 review):
-//   - Filesystem tests are **not** allowed to carry a `filesystem-stub`
-//     reason — Slice 3 ships real filesystem semantics through the
-//     FileSystemProvider wiring. If a filesystem test fails, fix the
-//     provider, don't skip.
-//   - Reason tokens are drawn from a fixed union (`SkipReason`). Pick the
-//     most specific match; add new tokens only by extending the union in
-//     this file with a short comment.
+//   - Filesystem tests are **not** allowed to carry a
+//     `requires-wasixcc-build-fix` reason permanently — Slice 3 ships real
+//     filesystem semantics through the FileSystemProvider wiring. If a
+//     filesystem test fails at runtime, fix the provider, don't skip.
+//   - Reason tokens are drawn from the fixed union specified in Issue #4.
+//     The token names are a grep contract: `grep requires-provider-sockets`
+//     is meant to return every test blocked on that capability, so later
+//     slices can flip the entries atomically when the provider lands.
 
 /**
- * Fixed reason vocabulary. Extend by adding a new union member **and** a
- * one-line comment documenting when it applies — don't smuggle in
- * `string` escape hatches.
+ * Fixed reason vocabulary from Issue #4 (Slice 3 exit criteria). Pick the
+ * most specific match. Do **not** extend this union without matching
+ * plan + issue discussion — the tokens are shared across slices.
+ *
+ * - `requires-asyncify`            — needs Asyncify (e.g. post-fork longjmp).
+ * - `requires-provider-sockets`    — needs SocketProvider (Slice 6).
+ * - `requires-provider-threads`    — needs ThreadsProvider (Slice 4/5).
+ * - `requires-provider-futex`      — needs FutexProvider (Slice 5).
+ * - `requires-provider-signals`    — needs SignalProvider (Slice 7).
+ * - `requires-provider-proc`       — needs ProcessProvider / proc_fork /
+ *                                    proc_exec / proc_spawn (Slice 8).
+ * - `requires-slice-N`             — needs a capability scheduled for a
+ *                                    later slice (N = 3..10). Use this
+ *                                    when no single provider token fits
+ *                                    (e.g. TTY features, poll/epoll).
+ * - `requires-wasixcc-build-fix`   — test failed to build under wasixcc.
+ *                                    Auto-populated by `build-wasix-suite.mjs`
+ *                                    at prepare time; do not hand-author
+ *                                    unless you've triaged a persistent
+ *                                    build failure.
  */
 export type SkipReason =
-  // Requires a real OS process model (fork / exec / spawn / wait).
-  | "process-model"
-  // Requires TCP / UDP sockets that Runno's browser host does not proxy.
-  | "networking"
-  // Requires pthreads / wasi-threads / shared-memory support.
-  | "threads"
-  // Requires kernel-backed signal delivery (SIGCHLD / SIGALRM / …).
-  | "signals"
-  // Requires TTY ioctls / pty semantics beyond the flat TTYProvider.
-  | "tty"
-  // Requires filesystem features not modelled by WASIDrive (mounts,
-  // hard links, real readlink/symlink). Never use for plain CRUD tests.
-  | "fs-unsupported"
-  // Requires epoll / eventfd / poll semantics not yet wired in WASIX.
-  | "async-io"
-  // Requires a feature Wasmer ships that upstream wasix-libc doesn't
-  // yet expose via a public-header surface (e.g. procfs, shm, ioctl).
-  | "unsupported-api"
-  // Test builds but is known flaky under headless browsers (timing,
-  // pty detection) — triage before skipping.
-  | "flaky";
+  | "requires-asyncify"
+  | "requires-provider-sockets"
+  | "requires-provider-threads"
+  | "requires-provider-futex"
+  | "requires-provider-signals"
+  | "requires-provider-proc"
+  | "requires-slice-3"
+  | "requires-slice-4"
+  | "requires-slice-5"
+  | "requires-slice-6"
+  | "requires-slice-7"
+  | "requires-slice-8"
+  | "requires-slice-9"
+  | "requires-slice-10"
+  | "requires-wasixcc-build-fix";
 
 export type SkipEntry = {
   reason: SkipReason;
@@ -52,56 +64,107 @@ export type SkipEntry = {
  *
  * Keep entries alphabetised; `wasix-suite.spec.ts` reads this map and
  * marks each matching test `test.fixme(true, reason)`.
+ *
+ * Classification notes (for later slices un-skipping their own entries):
+ *   - `fork*` / `spawn` / `pipe` / `unix-pipe` / `fd-pipe` → Slice 8
+ *     (process provider) via `requires-provider-proc`. `fork-longjmp`
+ *     additionally needs `requires-asyncify`, picking the more specific
+ *     token per the plan (process comes first on the critical path).
+ *   - `multi-threading` → `requires-provider-threads` (Slice 4/5).
+ *   - `socket-*`, `sockets` → `requires-provider-sockets` (Slice 6).
+ *   - `signals`, `fork-signals` → `requires-provider-signals` (Slice 7).
+ *   - `epoll` / `eventfd` / `poll` / `poll-fifo` → Slice 5 poll surface.
+ *   - `tty` / `ptyname` / `ioctl` → TTY work (Slice 10 grab-bag).
+ *   - `link`, `mount`, `readlink`, `symlink`, `shm`, `procfs` → Slice 9
+ *     (filesystem extraction) where WASIDrive grows the missing pieces.
+ *   - `close-preopen`, `dup` → rely on fd_renumber / mount-table work
+ *     deferred to Slice 9 alongside the drive refactor.
  */
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   "close-preopen": {
-    reason: "unsupported-api",
+    reason: "requires-slice-9",
     note: "fd_renumber on preopened fds; requires mount-table plumbing.",
   },
   dup: {
-    reason: "unsupported-api",
+    reason: "requires-slice-9",
     note: "fd_renumber / dup2 semantics not wired in Slice 3.",
   },
-  epoll: { reason: "async-io" },
-  eventfd: { reason: "async-io" },
-  "fd-pipe": { reason: "process-model", note: "anonymous pipe pair" },
-  fork: { reason: "process-model" },
-  "fork-and-exec": { reason: "process-model" },
-  "fork-longjmp": { reason: "process-model" },
-  "fork-pipes": { reason: "process-model" },
-  "fork-signals": { reason: "process-model" },
-  ioctl: { reason: "tty" },
+  epoll: {
+    reason: "requires-slice-5",
+    note: "epoll surface lands with poll slice.",
+  },
+  eventfd: {
+    reason: "requires-slice-5",
+    note: "eventfd surface lands with poll slice.",
+  },
+  "fd-pipe": {
+    reason: "requires-provider-proc",
+    note: "anonymous pipe pair — needs process/pipe plumbing.",
+  },
+  fork: { reason: "requires-provider-proc" },
+  "fork-and-exec": { reason: "requires-provider-proc" },
+  "fork-longjmp": {
+    // Needs both Asyncify (post-fork longjmp) and the process provider.
+    // The plan flags Asyncify as the blocker it cannot un-skip; favour
+    // that token so the grep on `requires-asyncify` surfaces this test.
+    reason: "requires-asyncify",
+    note: "post-fork longjmp requires Asyncify (plan § Future-asyncify).",
+  },
+  "fork-pipes": { reason: "requires-provider-proc" },
+  "fork-signals": {
+    reason: "requires-provider-signals",
+    note: "signal delivery across fork — signals provider drives this.",
+  },
+  ioctl: {
+    reason: "requires-slice-10",
+    note: "TTY ioctls — lands with TTY slice.",
+  },
   link: {
-    reason: "fs-unsupported",
+    reason: "requires-slice-9",
     note: "hard links; WASIDrive has no link table.",
   },
   mount: {
-    reason: "fs-unsupported",
+    reason: "requires-slice-9",
     note: "mount syscall; Runno has a single preopen root.",
   },
-  "multi-threading": { reason: "threads" },
-  pipe: { reason: "process-model" },
-  poll: { reason: "async-io" },
-  "poll-fifo": { reason: "async-io" },
+  "multi-threading": { reason: "requires-provider-threads" },
+  pipe: { reason: "requires-provider-proc" },
+  poll: {
+    reason: "requires-slice-5",
+    note: "poll surface lands with Slice 5.",
+  },
+  "poll-fifo": {
+    reason: "requires-slice-5",
+    note: "poll surface lands with Slice 5.",
+  },
   procfs: {
-    reason: "unsupported-api",
-    note: "Wasmer-specific /proc view.",
+    reason: "requires-slice-9",
+    note: "Wasmer-specific /proc view — deferred to filesystem extraction.",
   },
-  ptyname: { reason: "tty" },
+  ptyname: {
+    reason: "requires-slice-10",
+    note: "TTY feature — lands with TTY slice.",
+  },
   readlink: {
-    reason: "fs-unsupported",
+    reason: "requires-slice-9",
     note: "Symlinks are not represented in WASIDrive.",
   },
-  shm: { reason: "unsupported-api", note: "POSIX shared memory." },
-  signals: { reason: "signals" },
-  "socket-tcp": { reason: "networking" },
-  "socket-udp": { reason: "networking" },
-  sockets: { reason: "networking" },
-  spawn: { reason: "process-model" },
+  shm: {
+    reason: "requires-slice-9",
+    note: "POSIX shared memory — deferred alongside filesystem extraction.",
+  },
+  signals: { reason: "requires-provider-signals" },
+  "socket-tcp": { reason: "requires-provider-sockets" },
+  "socket-udp": { reason: "requires-provider-sockets" },
+  sockets: { reason: "requires-provider-sockets" },
+  spawn: { reason: "requires-provider-proc" },
   symlink: {
-    reason: "fs-unsupported",
+    reason: "requires-slice-9",
     note: "Symlinks are not represented in WASIDrive.",
   },
-  tty: { reason: "tty" },
-  "unix-pipe": { reason: "process-model" },
+  tty: {
+    reason: "requires-slice-10",
+    note: "TTY semantics — lands with TTY slice.",
+  },
+  "unix-pipe": { reason: "requires-provider-proc" },
 };
