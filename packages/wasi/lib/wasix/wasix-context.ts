@@ -2,6 +2,7 @@ import { WASIFS } from "../types.js";
 import { DebugFn } from "../wasi/wasi.js";
 import {
   ClockProvider,
+  FileSystemProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
@@ -13,7 +14,11 @@ import {
 
 export type WASIXContextOptions = {
   // File / process basics — same semantics as WASIContext
-  fs: WASIFS;
+  //
+  // `fs` accepts either a legacy `WASIFS` object (auto-wrapped into a
+  // `WASIDriveFileSystemProvider`) or a `FileSystemProvider` instance
+  // if the host wants to supply its own filesystem semantics.
+  fs: WASIFS | FileSystemProvider;
   args: string[];
   env: Record<string, string>;
   stdin: (maxByteLength: number) => string | null;
@@ -46,7 +51,14 @@ export type WASIXContextOptions = {
  * corresponding wasix_32v1 syscall handler.
  */
 export class WASIXContext {
-  fs: WASIFS;
+  /**
+   * Either the legacy `WASIFS` object (auto-wrapped at WASIX construction
+   * time) or a pre-built `FileSystemProvider`. The internal WASI still
+   * consumes a `WASIFS`, so when a raw provider is supplied the internal
+   * WASI is constructed with an empty fs — preview1 imports on such a
+   * host route through the provider only via WASIX.
+   */
+  fs: WASIFS | FileSystemProvider;
   args: string[];
   env: Record<string, string>;
   stdin: WASIXContextOptions["stdin"];
