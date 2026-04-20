@@ -2,7 +2,7 @@
 // CPU-time clocks (PROCESS_CPUTIME, THREAD_CPUTIME) fall back to monotonic —
 // fine-grained CPU accounting is unavailable in the browser sandbox.
 
-import { ClockId } from "../wasix-32v1.js";
+import { ClockId, Result, WASIXError } from "../wasix-32v1.js";
 import type { ClockProvider } from "../providers.js";
 
 export class SystemClockProvider implements ClockProvider {
@@ -14,6 +14,8 @@ export class SystemClockProvider implements ClockProvider {
       case ClockId.PROCESS_CPUTIME:
       case ClockId.THREAD_CPUTIME:
         return BigInt(Math.floor(performance.now() * 1_000_000));
+      default:
+        throw new WASIXError(Result.EINVAL);
     }
   }
 
@@ -25,6 +27,8 @@ export class SystemClockProvider implements ClockProvider {
       case ClockId.PROCESS_CPUTIME:
       case ClockId.THREAD_CPUTIME:
         return 1_000n; // ~1µs (approximate; browser may clamp higher)
+      default:
+        throw new WASIXError(Result.EINVAL);
     }
   }
 }

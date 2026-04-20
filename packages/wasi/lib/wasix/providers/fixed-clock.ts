@@ -8,7 +8,7 @@
 // CPU-time clocks (PROCESS_CPUTIME, THREAD_CPUTIME) share the monotonic
 // counter and increment the same way.
 
-import { ClockId } from "../wasix-32v1.js";
+import { ClockId, Result, WASIXError } from "../wasix-32v1.js";
 import type { ClockProvider } from "../providers.js";
 
 export class FixedClockProvider implements ClockProvider {
@@ -33,10 +33,20 @@ export class FixedClockProvider implements ClockProvider {
         this.counter += this.tick;
         return value;
       }
+      default:
+        throw new WASIXError(Result.EINVAL);
     }
   }
 
-  resolution(_id: ClockId): bigint {
-    return this.tick > 0n ? this.tick : 1n;
+  resolution(id: ClockId): bigint {
+    switch (id) {
+      case ClockId.REALTIME:
+      case ClockId.MONOTONIC:
+      case ClockId.PROCESS_CPUTIME:
+      case ClockId.THREAD_CPUTIME:
+        return this.tick > 0n ? this.tick : 1n;
+      default:
+        throw new WASIXError(Result.EINVAL);
+    }
   }
 }
