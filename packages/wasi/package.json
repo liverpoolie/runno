@@ -34,7 +34,7 @@
     "dev": "vite --port 5173",
     "build:docs": "typedoc --options typedoc.config.cjs",
     "build:tests:cargo": "cd programs && cargo wasi build -r && cd .. && cp programs/target/wasm32-wasi/release/*.wasi.wasm public/bin/tests/",
-    "build:tests:wat": "wat2wasm programs/wasix-clock-random/wasix-clock-random.wat -o public/bin/tests/wasix-clock-random.wasm && wat2wasm programs/wasix-deterministic/wasix-deterministic.wat -o public/bin/tests/wasix-deterministic.wasm",
+    "build:tests:wat": "wat2wasm programs/wasix-clock-random/wasix-clock-random.wat -o public/bin/tests/wasix-clock-random.wasm && wat2wasm programs/wasix-deterministic/wasix-deterministic.wat -o public/bin/tests/wasix-deterministic.wasm && wat2wasm programs/wasix-bridge-clock/wasix-bridge-clock.wat -o public/bin/tests/wasix-bridge-clock.wasm",
     "build:tests": "(npm run build:tests:cargo || echo 'cargo-wasi step failed or missing — skipping Rust test binaries') && npm run build:tests:wat",
     "build:vite": "tsc --noEmit && vite build",
     "build": "npm run build:docs && npm run build:vite && rimraf dist/src && mv dist/lib/* dist/ && rmdir dist/lib",
