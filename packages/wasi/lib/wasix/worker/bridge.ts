@@ -484,6 +484,11 @@ export function callBridgeSync(
  * Main-thread side: wait until the worker posts a request (non-blocking — uses
  * `Atomics.waitAsync` when available, otherwise a microtask poll).
  *
+ * The wait races the abort signal so `kill()` tear-down is deterministic — a
+ * dispatcher promise that's parked inside `Atomics.waitAsync` returns within
+ * one event-loop turn of `signal.abort()`, not at the next idle-poll
+ * boundary.
+ *
  * Returns the decoded request. The caller is responsible for dispatching to
  * its provider, then calling `writeBridgeResponse` / `writeBridgeWasixError`
  * / `writeBridgeGenericError` and notifying.
@@ -500,7 +505,7 @@ export async function awaitBridgeRequest(
       const argLen = Atomics.load(state, ARG_LEN_INDEX);
       return decodeRequest(opcode, requestRegion(buffer), argLen);
     }
-    await waitAsync(state, STATE_INDEX, current);
+    await raceAbort(waitAsync(state, STATE_INDEX, current), signal);
   }
   return null;
 }
@@ -511,9 +516,20 @@ export async function awaitBridgeRequest(
  * Promise resolves to inform the caller the state MAY have changed — the
  * caller re-reads under `Atomics.load` to confirm.
  *
- * Firefox's lack of `Atomics.waitAsync` is the reason for the fallback.
- * Chromium and Safari support it. The polling path is obviously suboptimal
- * but it is correct — the main thread never blocks.
+ * Defensive fallback: Chromium, Firefox (≥ 119), and Safari all ship
+ * `Atomics.waitAsync` natively, so this fallback is dead in the browsers
+ * Slice 4's test suite runs against. It exists for embedders (older worker
+ * shells, bundled runtimes) that expose `Atomics` without `waitAsync`.
+ * Such embedders typically also lack `SharedArrayBuffer` (because COOP/COEP
+ * gates both), so the fallback path should be unreachable in practice — but
+ * keeping it costs nothing and makes the bridge robust to one fewer
+ * environmental variable.
+ *
+ * The `Atomics.waitAsync` timeout is left at `Infinity` (omitted): the
+ * worker side always `Atomics.notify`s after every state-word write, so
+ * there is no need for the dispatcher to wake periodically just to re-read
+ * the state. `kill()` interrupts the wait via `signal` (see
+ * `awaitBridgeRequest`'s `raceAbort`).
  */
 function waitAsync(
   state: Int32Array,
@@ -534,13 +550,35 @@ function waitAsync(
         };
   };
   if (typeof anyAtomics.waitAsync === "function") {
-    const res = anyAtomics.waitAsync(state, index, expected, 100);
+    const res = anyAtomics.waitAsync(state, index, expected);
     if (res.async) {
       return res.value.then(() => undefined);
     }
     return Promise.resolve();
   }
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Race a promise against an `AbortSignal`. If the signal fires first, the
+ * returned promise resolves immediately so the caller's loop can re-check
+ * `signal.aborted` and exit cleanly. The original promise is left to
+ * resolve (or reject) on its own — it is not cancelled, but the caller no
+ * longer awaits it.
+ */
+function raceAbort(promise: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    signal.addEventListener("abort", finish, { once: true });
+    promise.then(finish, finish);
+  });
 }
 
 /**
