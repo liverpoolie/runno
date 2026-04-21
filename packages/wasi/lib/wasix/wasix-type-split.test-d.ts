@@ -92,14 +92,20 @@ const workerAsync: WASIXWorkerHostOptions = {
 
 // ─── Negative cases — async-capable on WASIX(...) is a type error ──────────
 
-// Async providers with at least one non-void return-type method are
-// rejected. The ones marshalled below cover every slot that returns a
-// typed value; `AsyncRandomProvider` is intentionally omitted because
-// its only method returns `void`, and TypeScript's void-subtyping rule
-// (any function whose declared return is `void` accepts a Promise return
-// at the call site) makes the negative case unenforceable at the type
-// level — this is a known, documented limitation. The bridge still
-// awaits Promise returns at runtime.
+// Every async-capable provider variant whose declared return type contains
+// a non-void member is rejected. `AsyncRandomProvider` is the lone gap and
+// is structural rather than fixable: TypeScript's void-subtyping rule
+// states that any function whose return type is `void | X` is assignable
+// to a function returning `void` regardless of `X`. So `(buf) => void |
+// Promise<void>` is assignable to the slot type `(buf) => void` no matter
+// how clever `Sync<T>` is — the rejection has to happen on the *source*
+// side of the assignment, but `Sync<T>` only sees the (sync) target type.
+// Closing this would require either tagging the provider interfaces with
+// a brand symbol (invasive) or runtime detection. The bridge in
+// `WASIXWorkerHost` still awaits Promise returns at runtime, so async
+// `RandomProvider`s work correctly under the worker host; the gap is
+// purely a missing compile-time error on the main-thread `WASIX(...)`
+// constructor when an `AsyncRandomProvider` is passed.
 
 // @ts-expect-error — AsyncClockProvider is not assignable to Sync<ClockProvider>
 const badClock: Partial<WASIXContextOptions> = { clock: asyncClock };
@@ -122,9 +128,8 @@ export const _types = {
   mainSync,
   workerSync,
   workerAsync,
-  // asyncRandom in mainSync is structurally identical to syncRandom at
-  // the type level because RandomProvider.fill returns void; this is a
-  // known void-subtyping gap and is covered at runtime by the bridge.
+  // asyncRandom is structurally compatible with the sync slot due to
+  // void-subtyping; see the comment block above.
   asyncRandomOk: { random: asyncRandom } satisfies Partial<WASIXContextOptions>,
   badClock,
   badTTY,
