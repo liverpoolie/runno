@@ -12,6 +12,11 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: "22"
+      - name: Install wabt (wat2wasm)
+        # `packages/wasi`'s `build:tests:wat` step needs wat2wasm to compile
+        # the hand-written WAT smoke binaries (added in Slice 2) and the
+        # Slice 4 bridge unit-test binary into wasm before Playwright runs.
+        run: sudo apt-get update && sudo apt-get install -y wabt
       - name: Install dependencies
         run: npm run bootstrap
       - name: Build Runno
