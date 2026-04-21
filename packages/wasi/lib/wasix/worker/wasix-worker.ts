@@ -72,12 +72,20 @@ export type WASIXWorkerStartMessage = {
   type: "start";
   /** Compiled module or raw bytes. Module is preferred (no re-compile). */
   module: WebAssembly.Module | ArrayBuffer;
+  /** SharedArrayBuffer is shared (not transferred) across postMessage; the
+   *  main thread keeps its reference for the bridge dispatcher. */
   sharedBuffer: SharedArrayBuffer;
   contextConfig: SerialisableContext;
   /** Which provider slots the host declared as async-capable. */
   asyncSlots: AsyncBridgedSlot[];
   /** True if the host configured a stdin callback (async or sync). */
   hasStdin: boolean;
+  /** Pre-resolved `clock.resolution(id)` values, keyed by `ClockId` numeric.
+   *  Resolution is allowed to be a constant on every real provider, so we
+   *  cache it once at start instead of round-tripping every `clock_res_get`
+   *  through the bridge. Slots not present in this record fall back to the
+   *  bridge shim's `1µs` default and log a debug warning. */
+  clockResolutions?: Partial<Record<ClockId, bigint>>;
 };
 
 export type WASIXWorkerHostMessage =
@@ -96,7 +104,10 @@ export type WASIXWorkerHostMessage =
 
 // ─── Provider shims ────────────────────────────────────────────────────────
 
-function bridgeClockProvider(sharedBuffer: SharedArrayBuffer): ClockProvider {
+function bridgeClockProvider(
+  sharedBuffer: SharedArrayBuffer,
+  cachedResolutions: Partial<Record<ClockId, bigint>>,
+): ClockProvider {
   return {
     now(id: ClockId): bigint {
       const response = callBridgeSync(sharedBuffer, {
@@ -105,11 +116,15 @@ function bridgeClockProvider(sharedBuffer: SharedArrayBuffer): ClockProvider {
       }) as Extract<BridgeResponse, { opcode: Opcode.CLOCK_NOW }>;
       return response.result.timeNs;
     },
-    resolution(_id: ClockId): bigint {
-      // Resolution is a fixed compile-time fact on every host we care about;
-      // plumbing it through the bridge for minimal savings isn't worth a new
-      // opcode this slice. 1µs matches SystemClockProvider's fallback.
-      return 1_000n;
+    resolution(id: ClockId): bigint {
+      // The host pre-resolves and ships every supported clock's resolution
+      // in the start message — see WASIXWorkerHost.runOnce. We look it up
+      // here so async-capable `ClockProvider`s with non-default resolutions
+      // (e.g. `new FixedClockProvider({ resolution: 5_000n })`) round-trip
+      // correctly. The 1µs fallback only fires for clock IDs the host did
+      // not pre-resolve (typically because the provider threw on
+      // resolution(id)) — matches SystemClockProvider's default.
+      return cachedResolutions[id] ?? 1_000n;
     },
   };
 }
@@ -172,7 +187,7 @@ async function runGuest(
   const asyncSet = new Set<AsyncBridgedSlot>(msg.asyncSlots);
 
   const clock: ClockProvider | undefined = asyncSet.has("clock")
-    ? bridgeClockProvider(msg.sharedBuffer)
+    ? bridgeClockProvider(msg.sharedBuffer, msg.clockResolutions ?? {})
     : undefined;
 
   // Remaining slots — no opcodes defined this slice. If the host declared

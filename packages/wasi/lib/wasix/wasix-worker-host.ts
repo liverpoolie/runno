@@ -10,6 +10,14 @@
 // the worker-side guest sees a sync return, because the round trip goes
 // through the bridge.
 //
+// Performance note: every configured provider slot routes through the
+// bridge, regardless of whether the host supplied a sync or async-capable
+// provider. Each invocation incurs one `Atomics.wait`/`notify` round trip
+// + one main-thread dispatcher tick. For slices 4–8's opcode set this is
+// fine; for hot-path syscalls in later slices, hosts that supply purely
+// sync providers should prefer `WASIX.start(...)` on the main thread —
+// they avoid the bridge entirely and pay zero overhead.
+//
 // Responsibilities:
 //   1. Compile the wasm module (main thread — workers can't fetch on their
 //      own without network access in every browser).
@@ -148,6 +156,14 @@ export class WASIXWorkerHost {
       this.dispatcherAbort.signal,
     );
 
+    // Pre-resolve clock resolutions on the host so the worker's
+    // bridge-backed `ClockProvider.resolution(id)` returns the host's
+    // configured value without a per-call bridge round trip. Async-capable
+    // providers may return a Promise<bigint>; we await each. Errors are
+    // tolerated (a clock id the provider doesn't support throws — we omit
+    // it from the cache and the worker shim falls back to 1µs).
+    const clockResolutions = await resolveClockResolutions(this.options.clock);
+
     // Send the start message. Transfer the module when available to avoid
     // a re-compile in the worker.
     const startMessage: WASIXWorkerStartMessage = {
@@ -158,6 +174,7 @@ export class WASIXWorkerHost {
       contextConfig: serialisableContext(this.options),
       asyncSlots: detectAsyncSlots(this.options),
       hasStdin: !!this.options.stdin,
+      clockResolutions,
     };
     worker.postMessage(startMessage);
 
@@ -335,6 +352,35 @@ function serialisableContext(
     // pass a plain WASIFS.
     fs: options.fs,
   };
+}
+
+/**
+ * Pre-resolve `clock.resolution(id)` for every supported `ClockId`. Async
+ * providers may return a Promise; we await each. Errors throw out per-id —
+ * an id the provider can't service is omitted from the cache and the
+ * worker shim's 1µs fallback applies.
+ */
+async function resolveClockResolutions(
+  clock?: ClockProvider | AsyncClockProvider,
+): Promise<Partial<Record<ClockId, bigint>>> {
+  if (!clock) return {};
+  const ids: ClockId[] = [
+    ClockId.REALTIME,
+    ClockId.MONOTONIC,
+    ClockId.PROCESS_CPUTIME,
+    ClockId.THREAD_CPUTIME,
+  ];
+  const out: Partial<Record<ClockId, bigint>> = {};
+  for (const id of ids) {
+    try {
+      const value = await clock.resolution(id);
+      out[id] = value;
+    } catch {
+      // Provider doesn't support this clock id at construction-time —
+      // leave it out of the cache. The bridge shim's 1µs fallback applies.
+    }
+  }
+  return out;
 }
 
 /**
