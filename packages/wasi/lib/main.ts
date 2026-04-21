@@ -12,6 +12,7 @@ export { SystemClockProvider } from "./wasix/providers/system-clock.js";
 export { SystemRandomProvider } from "./wasix/providers/system-random.js";
 export { FixedClockProvider } from "./wasix/providers/fixed-clock.js";
 export { SeededRandomProvider } from "./wasix/providers/seeded-random.js";
+export { WASIDriveFileSystemProvider } from "./wasix/providers/ergonomic/filesystem-provider.js";
 export type {
   ClockProvider,
   RandomProvider,
@@ -21,6 +22,7 @@ export type {
   SignalsProvider,
   SocketsProvider,
   ProcProvider,
+  FileSystemProvider,
   SockAddr,
   AddrHints,
   SockRecvResult,
@@ -29,6 +31,11 @@ export type {
   ProcSpawnRequest,
   ProcExecRequest,
   ProcExitInfo,
+  Filestat,
+  Fdstat,
+  FsTimestamps,
+  PreopenInfo,
+  DirEntry,
 } from "./wasix/providers.js";
 export type {
   AsyncCapable,
