@@ -16,6 +16,7 @@
 import { test, expect } from "@playwright/test";
 
 import type { WASIXWorkerHost, AsyncClockProvider } from "../lib/main";
+import { ClockId } from "../lib/wasix/wasix-32v1";
 
 test.describe("wasix-worker-bridge", () => {
   test.beforeEach(async ({ page }) => {
@@ -65,6 +66,6 @@ test.describe("wasix-worker-bridge", () => {
     // Proof the main-thread provider was actually called at least once.
     expect(result.invocations.length).toBeGreaterThan(0);
     // MONOTONIC clock id from the guest.
-    expect(result.invocations[0]).toBe(1);
+    expect(result.invocations[0]).toBe(ClockId.MONOTONIC);
   });
 });
