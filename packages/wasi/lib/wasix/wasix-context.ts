@@ -12,6 +12,26 @@ import {
   TTYProvider,
 } from "./providers.js";
 
+/**
+ * Sync<T> — structural assertion that every method of `T` returns a
+ * non-Promise value. Applying this to a provider slot causes TypeScript to
+ * reject any `AsyncCapable<T>` variant at the call site of `new WASIX(…)`.
+ *
+ * Implementation: walk each method, and if its declared return type contains
+ * `Promise<unknown>` as a union member, collapse the slot to `never` so
+ * assignment fails. We use `Extract<R, Promise<unknown>>` rather than
+ * `[R] extends [Promise<unknown>]` so methods declared `void | Promise<void>`
+ * (e.g. `AsyncCapable<RandomProvider>.fill`) are caught — `void`'s
+ * subtyping rule means a bare-extends check passes through them silently.
+ */
+export type Sync<T> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R
+    ? [Extract<R, Promise<unknown>>] extends [never]
+      ? (...args: A) => R
+      : never
+    : T[K];
+};
+
 export type WASIXContextOptions = {
   // File / process basics — same semantics as WASIContext
   //
@@ -27,16 +47,17 @@ export type WASIXContextOptions = {
   isTTY: boolean;
   debug?: DebugFn;
 
-  // Providers — all sync. Async variants are configured via
-  // WASIXWorkerHostOptions; see providers/async.ts.
-  clock?: ClockProvider;
-  random?: RandomProvider;
-  tty?: TTYProvider;
-  threads?: ThreadsProvider;
-  futex?: FutexProvider;
-  signals?: SignalsProvider;
-  sockets?: SocketsProvider;
-  proc?: ProcProvider;
+  // Providers — all sync. Each slot is wrapped in `Sync<T>` so that passing
+  // an `AsyncCapable<T>` fails typecheck at the `new WASIX(…)` call site.
+  // Async variants are accepted exclusively by `WASIXWorkerHost(...)`.
+  clock?: Sync<ClockProvider>;
+  random?: Sync<RandomProvider>;
+  tty?: Sync<TTYProvider>;
+  threads?: Sync<ThreadsProvider>;
+  futex?: Sync<FutexProvider>;
+  signals?: Sync<SignalsProvider>;
+  sockets?: Sync<SocketsProvider>;
+  proc?: Sync<ProcProvider>;
 };
 
 /**
