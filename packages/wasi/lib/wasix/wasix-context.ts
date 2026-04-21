@@ -17,20 +17,18 @@ import {
  * non-Promise value. Applying this to a provider slot causes TypeScript to
  * reject any `AsyncCapable<T>` variant at the call site of `new WASIX(…)`.
  *
- * Implementation: walk each method, and if its return type is a `Promise<U>`,
- * collapse the slot to `never` so assignment fails.
- *
- * The structural match (`bigint | Promise<bigint>` not assignable to
- * `bigint`) already rejects async providers today, but this utility makes
- * the intent explicit in the public type signature. It is the
- * `AsyncCapable<T>`-counterpart enforced on the `WASIX(...)` side of the
- * split.
+ * Implementation: walk each method, and if its declared return type contains
+ * `Promise<unknown>` as a union member, collapse the slot to `never` so
+ * assignment fails. We use `Extract<R, Promise<unknown>>` rather than
+ * `[R] extends [Promise<unknown>]` so methods declared `void | Promise<void>`
+ * (e.g. `AsyncCapable<RandomProvider>.fill`) are caught — `void`'s
+ * subtyping rule means a bare-extends check passes through them silently.
  */
 export type Sync<T> = {
   [K in keyof T]: T[K] extends (...args: infer A) => infer R
-    ? [R] extends [Promise<unknown>]
-      ? never
-      : (...args: A) => R
+    ? [Extract<R, Promise<unknown>>] extends [never]
+      ? (...args: A) => R
+      : never
     : T[K];
 };
 
