@@ -80,14 +80,18 @@ test("wasix-deterministic: byte-identical stdout across two runs with fixed prov
     return {
       exitCode1: run1.exitCode,
       exitCode2: run2.exitCode,
-      stdoutMatch: run1.stdout === run2.stdout,
-      stdoutLen: run1.stdout.length,
+      stdout1: run1.stdout,
+      stdout2: run2.stdout,
     };
   });
 
+  // Golden output: 8 SFC32(seed=42) bytes hex-encoded, then 8 zero bytes from
+  // FixedClockProvider(0n, 0n). Pinning the exact bytes catches algorithm drift
+  // that mere reproducibility-across-runs would not.
+  const expectedStdout = "b4b5424d031fbb710000000000000000";
+
   expect(result.exitCode1).toBe(0);
   expect(result.exitCode2).toBe(0);
-  expect(result.stdoutMatch).toBe(true);
-  // 16 bytes written; TextDecoder may merge into fewer chars but length > 0
-  expect(result.stdoutLen).toBeGreaterThan(0);
+  expect(result.stdout1).toBe(expectedStdout);
+  expect(result.stdout2).toBe(expectedStdout);
 });
