@@ -77,17 +77,24 @@ export type SkipEntry = {
  *   - `tty` / `ptyname` / `ioctl` → TTY work (Slice 10 grab-bag).
  *   - `link`, `mount`, `readlink`, `symlink`, `shm`, `procfs` → Slice 9
  *     (filesystem extraction) where WASIDrive grows the missing pieces.
- *   - `close-preopen`, `dup` → rely on fd_renumber / mount-table work
- *     deferred to Slice 9 alongside the drive refactor.
+ *   - `close-preopen`, `dup` → these are basic fd-table ops (not new fs
+ *     semantics), but the WASIX layer deliberately stubs `fd_renumber`
+ *     as ENOSYS in slice 3 (`wasix.ts` ABI table). The blocker is the
+ *     dual preview1/WASIX fd-table mgmt that lives inside `WASIDrive`,
+ *     which slice 9 extracts. Reclassify (or fix) when that lands.
  */
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   "close-preopen": {
     reason: "requires-slice-9",
-    note: "fd_renumber on preopened fds; requires mount-table plumbing.",
+    note:
+      "fd-table re-binding after closing a preopen — needs fd_renumber, " +
+      "stubbed ENOSYS in slice 3 pending the WASIDrive fd-table extraction.",
   },
   dup: {
     reason: "requires-slice-9",
-    note: "fd_renumber / dup2 semantics not wired in Slice 3.",
+    note:
+      "dup2 = fd_renumber, deliberately stubbed ENOSYS in slice 3 — fd-table " +
+      "mgmt is co-located with WASIDrive and lifts in slice 9.",
   },
   epoll: {
     reason: "requires-slice-5",

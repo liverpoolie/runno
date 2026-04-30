@@ -16,10 +16,11 @@
 //     is older than our include list), log a warning and skip that
 //     entry rather than failing the build. The Playwright spec is the
 //     source of truth for which binaries must pass.
-//   - If `wasixcc` is not installed, exit 0 with a diagnostic. The
-//     Playwright spec iterates over whatever landed in
-//     `public/bin/wasix-tests/`, so a developer without wasixcc still
-//     sees a green (empty) wasix-suite run.
+//   - If `wasixcc` is not installed, exit 0 with a diagnostic so a
+//     developer without wasixcc still sees a green (empty) wasix-suite
+//     run. CI overrides this via `WASIX_SUITE_REQUIRE_BUILD=1`, which
+//     promotes a missing toolchain or zero produced binaries to a hard
+//     failure — silent green on CI is a footgun (Issue #4 review).
 
 import {
   existsSync,
@@ -53,21 +54,33 @@ const buildSkipPath = join(__dirname, "wasix-suite.build-skip.json");
 
 mkdirSync(outDir, { recursive: true });
 
+// CI sets this to forbid silent no-ops. See Issue #4 review: a missing
+// wasixcc used to greenwash the whole harness with a single categorised
+// skip. Locally it stays unset so a casual developer can run other test
+// suites without the wasix toolchain installed.
+const requireBuild = process.env.WASIX_SUITE_REQUIRE_BUILD === "1";
+
 const wasixcc = resolveWasixcc();
 if (!wasixcc) {
-  console.warn(
-    "[build-wasix-suite] wasixcc not found on PATH — skipping suite build.\n" +
-      "  Install the wasix-libc toolchain to enable these tests locally.",
-  );
+  const msg =
+    "[build-wasix-suite] wasixcc not found on PATH — install the wasix " +
+    "toolchain (wasix-org/wasix-libc + wasix-org/wasixcc) to build the suite.";
+  if (requireBuild) {
+    console.error(msg);
+    process.exit(1);
+  }
+  console.warn(`${msg}\n  Skipping suite build.`);
   writeBuildSkip([]);
   process.exit(0);
 }
 
 if (!existsSync(vendorRoot)) {
-  console.warn(
-    `[build-wasix-suite] vendor directory missing: ${vendorRoot}\n` +
-      "  Run `npm run test:prepare:wasmer` first.",
-  );
+  const msg = `[build-wasix-suite] vendor directory missing: ${vendorRoot}`;
+  if (requireBuild) {
+    console.error(`${msg}\n  Run \`npm run test:prepare:wasmer\` first.`);
+    process.exit(1);
+  }
+  console.warn(`${msg}\n  Run \`npm run test:prepare:wasmer\` first.`);
   writeBuildSkip([]);
   process.exit(0);
 }
@@ -119,6 +132,18 @@ writeBuildSkip(buildFailures);
 console.log(
   `[build-wasix-suite] summary: built=${built} skipped=${skipped} failed=${failed}`,
 );
+
+// In CI, refuse to produce zero binaries. The Playwright spec still
+// reports per-test build failures via the `requires-wasixcc-build-fix`
+// reason, but a wholesale empty result means the install step is
+// broken — surface that loudly instead of greenwashing the job.
+if (requireBuild && built === 0) {
+  console.error(
+    "[build-wasix-suite] WASIX_SUITE_REQUIRE_BUILD=1 set but produced zero " +
+      "binaries — refusing to continue. Check the wasixcc install.",
+  );
+  process.exit(1);
+}
 
 // Don't make a failing per-test build fail the whole test:prepare step —
 // the Playwright spec surfaces missing binaries per-test, so a triage

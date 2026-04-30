@@ -1,5 +1,4 @@
 import {
-  ALL_RIGHTS,
   ClockId,
   DIRENT_SIZE,
   FDSTAT_SIZE,
@@ -581,6 +580,8 @@ export class WASIX {
       fd_pwrite: enosys,
       fd_read: this.wasix_fd_read.bind(this),
       fd_readdir: this.wasix_fd_readdir.bind(this),
+      // Stubbed ENOSYS in slice 3 — un-skips `dup` / `close-preopen` in
+      // wasix-suite.skip.ts when slice 9 extracts WASIDrive's fd table.
       fd_renumber: enosys,
       fd_seek: this.wasix_fd_seek.bind(this),
       fd_sync: enosys,
@@ -821,7 +822,3 @@ function encodeDirectoryEntries(
   }
   return out;
 }
-
-// Re-export so consumers don't need the internal path. Used by wasix.ts
-// only for lint/types; ALL_RIGHTS currently isn't referenced externally.
-export { ALL_RIGHTS };

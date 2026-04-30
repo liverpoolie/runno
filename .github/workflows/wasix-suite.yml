@@ -23,19 +23,19 @@ jobs:
       - name: Install root dependencies
         run: npm run bootstrap
 
-      # Cache the vendored wasmer tarball extract + the built wasix-libc
-      # sysroot. Both are keyed on the pinned SHA and the suite constants
-      # file (bumping the SHA invalidates the cache automatically). The
-      # built .wasm artifacts under `public/bin/wasix-tests/` are keyed on
-      # the vendored tree hash and the build script itself, so a wasixcc
-      # toolchain bump forces a rebuild.
-      - name: Cache wasix-libc toolchain
+      # Cache the vendored wasmer tarball extract + the installed wasix
+      # toolchain (wasix-libc sysroot + wasix-org/wasixcc wrapper). All
+      # caches are keyed on the workflow file so any install-step edit
+      # invalidates them. The built .wasm artifacts under
+      # `public/bin/wasix-tests/` are keyed on the suite constants and
+      # the build script, so a vendored-SHA bump forces a rebuild.
+      - name: Cache wasix toolchain
         id: cache-wasix-libc
         uses: actions/cache@v4
         with:
           path: ~/.wasix
           key: >-
-            wasix-libc-v12-${{ runner.os }}-${{
+            wasix-toolchain-v2-${{ runner.os }}-${{
               hashFiles('.github/workflows/wasix-suite.yml')
             }}
 
@@ -55,47 +55,81 @@ jobs:
           key: >-
             wasix-bins-${{ runner.os }}-${{
               hashFiles('packages/wasi/tests/wasix-suite.constants.mjs',
-                        'packages/wasi/tests/build-wasix-suite.mjs')
+                        'packages/wasi/tests/build-wasix-suite.mjs',
+                        '.github/workflows/wasix-suite.yml')
             }}
 
-      - name: Install wasixcc toolchain
-        # Pulls the prebuilt wasix-libc sysroot + wrapper scripts.
-        # Exposes `wasixcc` on PATH for the build harness.
+      - name: Install LLVM (host clang for wasixcc wrapper)
+        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+
+      - name: Install wasix-libc sysroot
+        # Pulls the prebuilt wasix-libc sysroot release. The sysroot ships
+        # the `lib/wasm32-wasi/libc.a` + headers that the wasixcc wrapper
+        # consumes via WASIX_SYSROOT.
         if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           WASIX_LIBC_VERSION="v12"
           WASIX_SDK_URL="https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/wasix-libc-${WASIX_LIBC_VERSION}-linux.tar.gz"
           INSTALL_DIR="$HOME/.wasix"
-          mkdir -p "$INSTALL_DIR"
-          if ! curl --fail --location --retry 3 --output /tmp/wasix-libc.tar.gz "$WASIX_SDK_URL"; then
-            echo "::warning::failed to download wasix-libc ${WASIX_LIBC_VERSION} — wasix-suite will skip."
-            exit 0
-          fi
-          tar -xzf /tmp/wasix-libc.tar.gz -C "$INSTALL_DIR" --strip-components=1 || {
-            echo "::warning::failed to extract wasix-libc — wasix-suite will skip."
-            exit 0
-          }
+          SYSROOT_DIR="$INSTALL_DIR/sysroot"
+          mkdir -p "$SYSROOT_DIR"
+          curl --fail --location --retry 3 --output /tmp/wasix-libc.tar.gz "$WASIX_SDK_URL"
+          tar -xzf /tmp/wasix-libc.tar.gz -C "$SYSROOT_DIR" --strip-components=1
+
+      - name: Install wasixcc compiler wrapper
+        # `wasixcc` is the clang wrapper from wasix-org/wasixcc. It lives
+        # in a separate repo from wasix-libc — the libc tarball ships the
+        # sysroot only. We shallow-clone the repo, locate the executable
+        # `wasixcc` script (its layout has shifted across upstream
+        # commits, so we discover it rather than hard-coding the path),
+        # and symlink it into `~/.wasix/bin/`.
+        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          INSTALL_DIR="$HOME/.wasix"
+          rm -rf "$INSTALL_DIR/wasixcc"
+          git clone --depth=1 https://github.com/wasix-org/wasixcc.git "$INSTALL_DIR/wasixcc"
+          mkdir -p "$INSTALL_DIR/bin"
+          # Locate any executable file named `wasixcc` / `wasixc++` /
+          # `clang-wasix*` under the cloned repo and symlink each one.
+          while IFS= read -r script; do
+            chmod +x "$script" || true
+            ln -sf "$script" "$INSTALL_DIR/bin/$(basename "$script")"
+          done < <(find "$INSTALL_DIR/wasixcc" -maxdepth 4 -type f \( \
+                     -name wasixcc -o -name 'wasixc++' -o -name 'clang-wasix*' \
+                   \))
+          ls -la "$INSTALL_DIR/bin"
 
       - name: Expose wasixcc on PATH
         run: |
-          if [ -d "$HOME/.wasix/bin" ]; then
-            echo "$HOME/.wasix/bin" >> "$GITHUB_PATH"
-          fi
+          set -euxo pipefail
+          mkdir -p "$HOME/.wasix/bin"
+          echo "$HOME/.wasix/bin" >> "$GITHUB_PATH"
+          echo "WASIX_SYSROOT=$HOME/.wasix/sysroot" >> "$GITHUB_ENV"
 
       - name: Probe wasixcc
-        id: probe
+        # Hard fail: a missing wasixcc used to silently green the job (the
+        # build script no-op'd and Playwright reported one categorised
+        # "no binaries built" skip). That made the entire harness
+        # unverified. Refuse to continue without the compiler.
         run: |
-          if command -v wasixcc >/dev/null 2>&1; then
-            echo "available=1" >> "$GITHUB_OUTPUT"
-            wasixcc --version || true
-          else
-            echo "available=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::wasixcc not on PATH — the suite job will run with no built binaries."
+          set -euxo pipefail
+          if ! command -v wasixcc >/dev/null 2>&1; then
+            echo "::error::wasixcc not on PATH after install. Listing $HOME/.wasix for triage:"
+            ls -laR "$HOME/.wasix" || true
+            exit 1
           fi
+          wasixcc --version || true
 
       - name: Fetch + build wasix suite binaries
         working-directory: packages/wasi
+        env:
+          WASIX_SUITE_REQUIRE_BUILD: "1"
         run: |
           npm run test:prepare:wasix-suite
 
@@ -103,14 +137,30 @@ jobs:
         working-directory: packages/wasi
         run: npx playwright install --with-deps
 
+      - name: Assert at least one wasix-suite binary was built
+        # Defence-in-depth alongside `WASIX_SUITE_REQUIRE_BUILD=1`:
+        # ensure the cached / freshly-built `public/bin/wasix-tests/`
+        # actually has artefacts before we hand control to Playwright.
+        # An empty dir would otherwise present as a single categorised
+        # skip and greenwash the suite (Issue #4 review).
+        working-directory: packages/wasi
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          binaries=(public/bin/wasix-tests/*.wasm)
+          if [ "${#binaries[@]}" -eq 0 ]; then
+            echo "::error::no wasix-suite binaries under public/bin/wasix-tests — wasixcc install or build script is broken."
+            exit 1
+          fi
+          echo "found ${#binaries[@]} wasix-suite binaries."
+
       - name: Run wasix-suite Playwright tests
         working-directory: packages/wasi
         # Add the JSON reporter alongside the existing html reporter so
         # the next step can count pass/skip/fail without parsing HTML.
         run: |
           npx playwright test tests/wasix-suite.spec.ts \
-            --reporter=list,html,json \
-            || echo "::notice::wasix-suite playwright exited non-zero — see summary for counts."
+            --reporter=list,html,json
         env:
           PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-report/wasix-suite.json
 
