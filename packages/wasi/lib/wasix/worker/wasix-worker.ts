@@ -23,11 +23,15 @@ import {
 } from "../providers/ergonomic/filesystem-provider.js";
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
+  AddrHints,
   ClockProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
   SignalsProvider,
+  SockAcceptResult,
+  SockAddr,
+  SockRecvResult,
   SocketsProvider,
   ThreadsProvider,
   TTYProvider,
@@ -217,7 +221,7 @@ async function runGuest(
     ? stubSignalsProvider()
     : undefined;
   const sockets: SocketsProvider | undefined = asyncSet.has("sockets")
-    ? stubSocketsProvider()
+    ? bridgeSocketsProvider(msg.sharedBuffer)
     : undefined;
   const proc: ProcProvider | undefined = asyncSet.has("proc")
     ? stubProcProvider()
@@ -314,27 +318,195 @@ function stubSignalsProvider(): SignalsProvider {
     raiseInterval: () => throwEnosys(),
   };
 }
-function stubSocketsProvider(): SocketsProvider {
+/**
+ * Bridge-backed sync `SocketsProvider`. Every method serialises args into
+ * the SAB request region, blocks on `Atomics.wait` while the host-side
+ * dispatcher invokes the async provider, and decodes the response back into
+ * the JS-native shapes the inner `WASIX` consumes.
+ */
+function bridgeSocketsProvider(
+  sharedBuffer: SharedArrayBuffer,
+): SocketsProvider {
+  const call = <T extends BridgeResponse>(
+    req: Parameters<typeof callBridgeSync>[1],
+  ) => callBridgeSync(sharedBuffer, req) as T;
   return {
-    open: () => throwEnosys(),
-    bind: () => throwEnosys(),
-    connect: () => throwEnosys(),
-    listen: () => throwEnosys(),
-    accept: () => throwEnosys(),
-    send: () => throwEnosys(),
-    recv: () => throwEnosys(),
-    shutdown: () => throwEnosys(),
-    addrResolve: () => throwEnosys(),
-    getOptFlag: () => throwEnosys(),
-    getOptSize: () => throwEnosys(),
-    getOptTime: () => throwEnosys(),
-    setOptFlag: () => throwEnosys(),
-    setOptSize: () => throwEnosys(),
-    setOptTime: () => throwEnosys(),
-    addrLocal: () => throwEnosys(),
-    addrPeer: () => throwEnosys(),
-    status: () => throwEnosys(),
+    open(af: number, type: number, proto: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_OPEN }>>({
+        opcode: Opcode.SOCK_OPEN,
+        args: { af, type, proto },
+      });
+      return r.result.fd;
+    },
+    bind(fd: number, addr: SockAddr): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_BIND }>>({
+        opcode: Opcode.SOCK_BIND,
+        args: { fd, addr },
+      });
+      return r.result.result;
+    },
+    connect(fd: number, addr: SockAddr): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_CONNECT }>>({
+        opcode: Opcode.SOCK_CONNECT,
+        args: { fd, addr },
+      });
+      return r.result.result;
+    },
+    listen(fd: number, backlog: number): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_LISTEN }>>({
+        opcode: Opcode.SOCK_LISTEN,
+        args: { fd, backlog },
+      });
+      return r.result.result;
+    },
+    accept(fd: number): SockAcceptResult {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_ACCEPT }>>({
+        opcode: Opcode.SOCK_ACCEPT,
+        args: { fd },
+      });
+      return { fd: r.result.fd, addr: r.result.addr };
+    },
+    send(fd: number, bufs: Uint8Array[], flags: number): number {
+      // Concatenate iovecs — the bridge ships a single buffer; the host
+      // provider treats it as one logical send. Capping at 60 KiB leaves
+      // headroom for the request-region header (currently 13 bytes).
+      const data = concatBufs(bufs);
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_SEND }>>({
+        opcode: Opcode.SOCK_SEND,
+        args: { fd, flags, data },
+      });
+      return r.result.written;
+    },
+    recv(fd: number, bufs: Uint8Array[], flags: number): SockRecvResult {
+      const total = bufs.reduce((acc, b) => acc + b.byteLength, 0);
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_RECV }>>({
+        opcode: Opcode.SOCK_RECV,
+        args: { fd, flags, maxLen: total },
+      });
+      const bytesRead = scatterIntoIovecs(r.result.data, bufs);
+      return { bytesRead, flags: r.result.flags };
+    },
+    shutdown(fd: number, how: number): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_SHUTDOWN }>>(
+        { opcode: Opcode.SOCK_SHUTDOWN, args: { fd, how } },
+      );
+      return r.result.result;
+    },
+    addrResolve(host: string, port: number, _hints: AddrHints): SockAddr[] {
+      const r = call<
+        Extract<BridgeResponse, { opcode: Opcode.SOCK_ADDR_RESOLVE }>
+      >({
+        opcode: Opcode.SOCK_ADDR_RESOLVE,
+        args: { host, port, maxAddrs: 8 },
+      });
+      return r.result.addrs;
+    },
+    getOptFlag(fd: number, level: number, name: number): boolean {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_GET_OPT }>>({
+        opcode: Opcode.SOCK_GET_OPT,
+        args: { fd, level, name, kind: "flag" },
+      });
+      if (r.result.kind !== "flag") {
+        throw new WASIXError(Result.EINVAL);
+      }
+      return r.result.value;
+    },
+    getOptSize(fd: number, level: number, name: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_GET_OPT }>>({
+        opcode: Opcode.SOCK_GET_OPT,
+        args: { fd, level, name, kind: "size" },
+      });
+      if (r.result.kind !== "size") {
+        throw new WASIXError(Result.EINVAL);
+      }
+      return r.result.value;
+    },
+    getOptTime(fd: number, level: number, name: number): bigint | null {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_GET_OPT }>>({
+        opcode: Opcode.SOCK_GET_OPT,
+        args: { fd, level, name, kind: "time" },
+      });
+      if (r.result.kind !== "time") {
+        throw new WASIXError(Result.EINVAL);
+      }
+      return r.result.value;
+    },
+    setOptFlag(
+      fd: number,
+      level: number,
+      name: number,
+      value: boolean,
+    ): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_SET_OPT }>>({
+        opcode: Opcode.SOCK_SET_OPT,
+        args: { fd, level, name, kind: "flag", value },
+      });
+      return r.result.result;
+    },
+    setOptSize(fd: number, level: number, name: number, value: number): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_SET_OPT }>>({
+        opcode: Opcode.SOCK_SET_OPT,
+        args: { fd, level, name, kind: "size", value },
+      });
+      return r.result.result;
+    },
+    setOptTime(
+      fd: number,
+      level: number,
+      name: number,
+      value: bigint | null,
+    ): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_SET_OPT }>>({
+        opcode: Opcode.SOCK_SET_OPT,
+        args: { fd, level, name, kind: "time", value },
+      });
+      return r.result.result;
+    },
+    addrLocal(fd: number): SockAddr {
+      const r = call<
+        Extract<BridgeResponse, { opcode: Opcode.SOCK_ADDR_LOCAL }>
+      >({ opcode: Opcode.SOCK_ADDR_LOCAL, args: { fd } });
+      return r.result.addr;
+    },
+    addrPeer(fd: number): SockAddr {
+      const r = call<
+        Extract<BridgeResponse, { opcode: Opcode.SOCK_ADDR_PEER }>
+      >({ opcode: Opcode.SOCK_ADDR_PEER, args: { fd } });
+      return r.result.addr;
+    },
+    status(fd: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.SOCK_STATUS }>>({
+        opcode: Opcode.SOCK_STATUS,
+        args: { fd },
+      });
+      return r.result.status;
+    },
   };
+}
+
+function concatBufs(bufs: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const b of bufs) total += b.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const b of bufs) {
+    out.set(b, offset);
+    offset += b.byteLength;
+  }
+  return out;
+}
+
+function scatterIntoIovecs(src: Uint8Array, bufs: Uint8Array[]): number {
+  let written = 0;
+  let cursor = 0;
+  for (const buf of bufs) {
+    if (cursor >= src.byteLength) break;
+    const n = Math.min(src.byteLength - cursor, buf.byteLength);
+    buf.set(src.subarray(cursor, cursor + n));
+    cursor += n;
+    written += n;
+  }
+  return written;
 }
 function stubProcProvider(): ProcProvider {
   return {

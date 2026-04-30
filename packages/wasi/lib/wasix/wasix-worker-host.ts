@@ -338,7 +338,219 @@ export class WASIXWorkerHost {
         });
         return;
       }
+      case Opcode.SOCK_OPEN: {
+        const sockets = this.requireSockets();
+        const fd = await sockets.open(
+          request.args.af,
+          request.args.type,
+          request.args.proto,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_OPEN,
+          result: { fd },
+        });
+        return;
+      }
+      case Opcode.SOCK_BIND: {
+        const sockets = this.requireSockets();
+        const result = await sockets.bind(request.args.fd, request.args.addr);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_BIND,
+          result: { result },
+        });
+        return;
+      }
+      case Opcode.SOCK_CONNECT: {
+        const sockets = this.requireSockets();
+        const result = await sockets.connect(
+          request.args.fd,
+          request.args.addr,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_CONNECT,
+          result: { result },
+        });
+        return;
+      }
+      case Opcode.SOCK_LISTEN: {
+        const sockets = this.requireSockets();
+        const result = await sockets.listen(
+          request.args.fd,
+          request.args.backlog,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_LISTEN,
+          result: { result },
+        });
+        return;
+      }
+      case Opcode.SOCK_ACCEPT: {
+        const sockets = this.requireSockets();
+        const accepted = await sockets.accept(request.args.fd);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_ACCEPT,
+          result: { fd: accepted.fd, addr: accepted.addr },
+        });
+        return;
+      }
+      case Opcode.SOCK_SEND: {
+        const sockets = this.requireSockets();
+        const written = await sockets.send(
+          request.args.fd,
+          [request.args.data],
+          request.args.flags,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_SEND,
+          result: { written },
+        });
+        return;
+      }
+      case Opcode.SOCK_RECV: {
+        const sockets = this.requireSockets();
+        const buf = new Uint8Array(request.args.maxLen);
+        const result = await sockets.recv(
+          request.args.fd,
+          [buf],
+          request.args.flags,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_RECV,
+          result: {
+            data: buf.subarray(0, result.bytesRead),
+            flags: result.flags,
+          },
+        });
+        return;
+      }
+      case Opcode.SOCK_SHUTDOWN: {
+        const sockets = this.requireSockets();
+        const result = await sockets.shutdown(
+          request.args.fd,
+          request.args.how,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_SHUTDOWN,
+          result: { result },
+        });
+        return;
+      }
+      case Opcode.SOCK_ADDR_RESOLVE: {
+        const sockets = this.requireSockets();
+        const all = await sockets.addrResolve(
+          request.args.host,
+          request.args.port,
+          {},
+        );
+        const addrs = all.slice(0, request.args.maxAddrs);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_ADDR_RESOLVE,
+          result: { addrs },
+        });
+        return;
+      }
+      case Opcode.SOCK_ADDR_LOCAL: {
+        const sockets = this.requireSockets();
+        const addr = await sockets.addrLocal(request.args.fd);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_ADDR_LOCAL,
+          result: { addr },
+        });
+        return;
+      }
+      case Opcode.SOCK_ADDR_PEER: {
+        const sockets = this.requireSockets();
+        const addr = await sockets.addrPeer(request.args.fd);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_ADDR_PEER,
+          result: { addr },
+        });
+        return;
+      }
+      case Opcode.SOCK_STATUS: {
+        const sockets = this.requireSockets();
+        const status = await sockets.status(request.args.fd);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_STATUS,
+          result: { status },
+        });
+        return;
+      }
+      case Opcode.SOCK_GET_OPT: {
+        const sockets = this.requireSockets();
+        const { fd, level, name, kind } = request.args;
+        if (kind === "flag") {
+          const value = await sockets.getOptFlag(fd, level, name);
+          writeBridgeResponse(sharedBuffer, {
+            opcode: Opcode.SOCK_GET_OPT,
+            result: { kind: "flag", value },
+          });
+          return;
+        }
+        if (kind === "size") {
+          const value = await sockets.getOptSize(fd, level, name);
+          writeBridgeResponse(sharedBuffer, {
+            opcode: Opcode.SOCK_GET_OPT,
+            result: { kind: "size", value },
+          });
+          return;
+        }
+        const value = await sockets.getOptTime(fd, level, name);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_GET_OPT,
+          result: { kind: "time", value },
+        });
+        return;
+      }
+      case Opcode.SOCK_SET_OPT: {
+        const sockets = this.requireSockets();
+        const { fd, level, name, kind } = request.args;
+        if (kind === "flag") {
+          const result = await sockets.setOptFlag(
+            fd,
+            level,
+            name,
+            request.args.value,
+          );
+          writeBridgeResponse(sharedBuffer, {
+            opcode: Opcode.SOCK_SET_OPT,
+            result: { result },
+          });
+          return;
+        }
+        if (kind === "size") {
+          const result = await sockets.setOptSize(
+            fd,
+            level,
+            name,
+            request.args.value,
+          );
+          writeBridgeResponse(sharedBuffer, {
+            opcode: Opcode.SOCK_SET_OPT,
+            result: { result },
+          });
+          return;
+        }
+        const result = await sockets.setOptTime(
+          fd,
+          level,
+          name,
+          request.args.value,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.SOCK_SET_OPT,
+          result: { result },
+        });
+        return;
+      }
     }
+  }
+
+  private requireSockets(): SocketsProvider | AsyncSocketsProvider {
+    if (!this.options.sockets) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.options.sockets;
   }
 }
 
