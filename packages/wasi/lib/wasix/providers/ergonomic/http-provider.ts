@@ -18,6 +18,7 @@
 
 import type {
   AddrHints,
+  SockAcceptResult,
   SockAddr,
   SockRecvResult,
   SocketsProvider,
@@ -93,7 +94,7 @@ export class HTTPProvider implements SocketsProvider {
     );
   }
 
-  accept(_fd: number): number {
+  accept(_fd: number): SockAcceptResult {
     throw new WASIXError(
       Result.ENOSYS,
       "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
@@ -122,6 +123,84 @@ export class HTTPProvider implements SocketsProvider {
   }
 
   addrResolve(_host: string, _port: number, _hints: AddrHints): SockAddr[] {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  getOptFlag(_fd: number, _level: number, _name: number): boolean {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  getOptSize(_fd: number, _level: number, _name: number): number {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  getOptTime(_fd: number, _level: number, _name: number): bigint | null {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  setOptFlag(
+    _fd: number,
+    _level: number,
+    _name: number,
+    _value: boolean,
+  ): Result {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  setOptSize(
+    _fd: number,
+    _level: number,
+    _name: number,
+    _value: number,
+  ): Result {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  setOptTime(
+    _fd: number,
+    _level: number,
+    _name: number,
+    _value: bigint | null,
+  ): Result {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  addrLocal(_fd: number): SockAddr {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  addrPeer(_fd: number): SockAddr {
+    throw new WASIXError(
+      Result.ENOSYS,
+      "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
+    );
+  }
+
+  status(_fd: number): number {
     throw new WASIXError(
       Result.ENOSYS,
       "HTTPProvider is a skeleton — real implementation lands in Slice 5.",
