@@ -23,22 +23,12 @@ jobs:
       - name: Install root dependencies
         run: npm run bootstrap
 
-      # Cache the vendored wasmer tarball extract + the installed wasix
-      # toolchain (wasix-libc sysroot + wasix-org/wasixcc wrapper). All
-      # caches are keyed on the workflow file so any install-step edit
-      # invalidates them. The built .wasm artifacts under
+      # Cache the vendored wasmer tarball extract. The wasix toolchain
+      # itself is installed by the wasix-org/wasixcc composite action,
+      # which manages its own cache via `actions/cache@v4` keyed on its
+      # pinned versions. The built .wasm artifacts under
       # `public/bin/wasix-tests/` are keyed on the suite constants and
       # the build script, so a vendored-SHA bump forces a rebuild.
-      - name: Cache wasix toolchain
-        id: cache-wasix-libc
-        uses: actions/cache@v4
-        with:
-          path: ~/.wasix
-          key: >-
-            wasix-toolchain-v2-${{ runner.os }}-${{
-              hashFiles('.github/workflows/wasix-suite.yml')
-            }}
-
       - name: Cache vendored wasmer checkout
         uses: actions/cache@v4
         with:
@@ -59,69 +49,26 @@ jobs:
                         '.github/workflows/wasix-suite.yml')
             }}
 
-      - name: Install LLVM (host clang for wasixcc wrapper)
-        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld
-
-      - name: Install wasix-libc sysroot
-        # Pulls the prebuilt wasix-libc sysroot release. The sysroot ships
-        # the `lib/wasm32-wasi/libc.a` + headers that the wasixcc wrapper
-        # consumes via WASIX_SYSROOT.
-        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          WASIX_LIBC_VERSION="v12"
-          WASIX_SDK_URL="https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/wasix-libc-${WASIX_LIBC_VERSION}-linux.tar.gz"
-          INSTALL_DIR="$HOME/.wasix"
-          SYSROOT_DIR="$INSTALL_DIR/sysroot"
-          mkdir -p "$SYSROOT_DIR"
-          curl --fail --location --retry 3 --output /tmp/wasix-libc.tar.gz "$WASIX_SDK_URL"
-          tar -xzf /tmp/wasix-libc.tar.gz -C "$SYSROOT_DIR" --strip-components=1
-
-      - name: Install wasixcc compiler wrapper
-        # `wasixcc` is the clang wrapper from wasix-org/wasixcc. It lives
-        # in a separate repo from wasix-libc — the libc tarball ships the
-        # sysroot only. We shallow-clone the repo, locate the executable
-        # `wasixcc` script (its layout has shifted across upstream
-        # commits, so we discover it rather than hard-coding the path),
-        # and symlink it into `~/.wasix/bin/`.
-        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          INSTALL_DIR="$HOME/.wasix"
-          rm -rf "$INSTALL_DIR/wasixcc"
-          git clone --depth=1 https://github.com/wasix-org/wasixcc.git "$INSTALL_DIR/wasixcc"
-          mkdir -p "$INSTALL_DIR/bin"
-          # Locate any executable file named `wasixcc` / `wasixc++` /
-          # `clang-wasix*` under the cloned repo and symlink each one.
-          while IFS= read -r script; do
-            chmod +x "$script" || true
-            ln -sf "$script" "$INSTALL_DIR/bin/$(basename "$script")"
-          done < <(find "$INSTALL_DIR/wasixcc" -maxdepth 4 -type f \( \
-                     -name wasixcc -o -name 'wasixc++' -o -name 'clang-wasix*' \
-                   \))
-          ls -la "$INSTALL_DIR/bin"
-
-      - name: Expose wasixcc on PATH
-        run: |
-          set -euxo pipefail
-          mkdir -p "$HOME/.wasix/bin"
-          echo "$HOME/.wasix/bin" >> "$GITHUB_PATH"
-          echo "WASIX_SYSROOT=$HOME/.wasix/sysroot" >> "$GITHUB_ENV"
+      - name: Install wasixcc toolchain
+        # Use the upstream composite action from wasix-org/wasixcc. It
+        # pulls a pinned wasixcc binary, the wasix-libc sysroot and the
+        # WASIX-aware LLVM toolchain into a managed cache, then puts
+        # `wasixcc` on PATH for downstream steps. The previous bespoke
+        # tarball-fetch only installed the libc sysroot (no compiler
+        # wrapper), which silently no-op'd the build harness and
+        # greenwashed the job (Issue #4 review).
+        uses: wasix-org/wasixcc@v0.4.3
+        with:
+          version: v0.4.3
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Probe wasixcc
-        # Hard fail: a missing wasixcc used to silently green the job (the
-        # build script no-op'd and Playwright reported one categorised
-        # "no binaries built" skip). That made the entire harness
-        # unverified. Refuse to continue without the compiler.
+        # Hard fail if the action didn't put `wasixcc` on PATH — silent
+        # missing-toolchain runs are the regression Issue #4 calls out.
         run: |
           set -euxo pipefail
           if ! command -v wasixcc >/dev/null 2>&1; then
-            echo "::error::wasixcc not on PATH after install. Listing $HOME/.wasix for triage:"
-            ls -laR "$HOME/.wasix" || true
+            echo "::error::wasixcc not on PATH after install."
             exit 1
           fi
           wasixcc --version || true
