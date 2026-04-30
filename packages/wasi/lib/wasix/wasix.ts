@@ -1,4 +1,5 @@
 import {
+  AddressFamily,
   ClockId,
   DIRENT_SIZE,
   FDSTAT_SIZE,
@@ -7,6 +8,7 @@ import {
   PRESTAT_SIZE,
   PreopenType,
   Result,
+  SockLevel,
   WASIXError,
 } from "./wasix-32v1.js";
 import { WASIXContext, WASIXContextOptions } from "./wasix-context.js";
@@ -24,6 +26,8 @@ import type {
   ClockProvider,
   FileSystemProvider,
   RandomProvider,
+  SockAddr,
+  SocketsProvider,
 } from "./providers.js";
 
 class WASIXExit extends Error {
@@ -296,6 +300,10 @@ export class WASIX {
 
   private get random(): RandomProvider {
     return this.context.random ?? (this._random ??= new SystemRandomProvider());
+  }
+
+  private get sockets(): SocketsProvider | undefined {
+    return this.context.sockets;
   }
 
   private get fs(): FileSystemProvider {
@@ -769,6 +777,290 @@ export class WASIX {
     }
   }
 
+  //
+  // Sockets syscalls (Slice 5).
+  //
+  // The provider sees decoded JS-native shapes; pointer arithmetic stays
+  // here. `requireSockets` returns ENOTSUP — wasix's "no sockets" sentinel —
+  // when no provider is configured. WASIXError → its errno; anything else →
+  // EIO via `mapError`.
+
+  private requireSockets(): SocketsProvider {
+    if (!this.sockets) {
+      throw new WASIXError(Result.ENOTSUP);
+    }
+    return this.sockets;
+  }
+
+  private wasix_sock_open(
+    af: number,
+    type: number,
+    proto: number,
+    retfdPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const fd = provider.open(af, type, proto);
+      new DataView(this.memory.buffer).setUint32(retfdPtr, fd, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_open");
+    }
+  }
+
+  private wasix_sock_bind(fd: number, addrPtr: number): number {
+    try {
+      const provider = this.requireSockets();
+      const addr = readSockAddrPort(this.memory, addrPtr);
+      const result = provider.bind(fd, addr);
+      return result;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_bind");
+    }
+  }
+
+  private wasix_sock_connect(fd: number, addrPtr: number): number {
+    try {
+      const provider = this.requireSockets();
+      const addr = readSockAddrPort(this.memory, addrPtr);
+      const result = provider.connect(fd, addr);
+      return result;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_connect");
+    }
+  }
+
+  private wasix_sock_listen(fd: number, backlog: number): number {
+    try {
+      const provider = this.requireSockets();
+      return provider.listen(fd, backlog);
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_listen");
+    }
+  }
+
+  private wasix_sock_accept(
+    fd: number,
+    _fdflags: number,
+    retfdPtr: number,
+    retaddrPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const { fd: newFd, addr } = provider.accept(fd);
+      const view = new DataView(this.memory.buffer);
+      view.setUint32(retfdPtr, newFd, true);
+      writeSockAddrPort(this.memory, retaddrPtr, addr);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_accept");
+    }
+  }
+
+  private wasix_sock_send(
+    fd: number,
+    siDataPtr: number,
+    siDataLen: number,
+    siFlags: number,
+    retSizePtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, siDataPtr, siDataLen);
+      const written = provider.send(fd, iovs, siFlags);
+      view.setUint32(retSizePtr, written, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_send");
+    }
+  }
+
+  private wasix_sock_recv(
+    fd: number,
+    riDataPtr: number,
+    riDataLen: number,
+    riFlags: number,
+    retSizePtr: number,
+    retFlagsPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, riDataPtr, riDataLen);
+      const result = provider.recv(fd, iovs, riFlags);
+      view.setUint32(retSizePtr, result.bytesRead, true);
+      view.setUint16(retFlagsPtr, result.flags, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_recv");
+    }
+  }
+
+  private wasix_sock_shutdown(fd: number, how: number): number {
+    try {
+      const provider = this.requireSockets();
+      return provider.shutdown(fd, how);
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_shutdown");
+    }
+  }
+
+  private wasix_sock_addr_resolve(
+    hostPtr: number,
+    hostLen: number,
+    port: number,
+    retaddrsPtr: number,
+    naddrsMax: number,
+    retNaddrsPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const host = readString(this.memory, hostPtr, hostLen);
+      const addrs = provider.addrResolve(host, port, {});
+      const view = new DataView(this.memory.buffer);
+      const count = Math.min(addrs.length, naddrsMax);
+      let cursor = retaddrsPtr;
+      for (let i = 0; i < count; i++) {
+        writeSockAddrNoPort(this.memory, cursor, addrs[i]);
+        cursor += SOCK_ADDR_BYTES;
+      }
+      view.setUint32(retNaddrsPtr, count, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_addr_resolve");
+    }
+  }
+
+  private wasix_sock_get_opt_flag(
+    fd: number,
+    name: number,
+    retPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const value = provider.getOptFlag(fd, SockLevel.SOCKET, name);
+      new DataView(this.memory.buffer).setUint8(retPtr, value ? 1 : 0);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_get_opt_flag");
+    }
+  }
+
+  private wasix_sock_set_opt_flag(
+    fd: number,
+    name: number,
+    flag: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      return provider.setOptFlag(fd, SockLevel.SOCKET, name, flag !== 0);
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_set_opt_flag");
+    }
+  }
+
+  private wasix_sock_get_opt_size(
+    fd: number,
+    name: number,
+    retPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const value = provider.getOptSize(fd, SockLevel.SOCKET, name);
+      new DataView(this.memory.buffer).setBigUint64(
+        retPtr,
+        BigInt(value >>> 0),
+        true,
+      );
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_get_opt_size");
+    }
+  }
+
+  private wasix_sock_set_opt_size(
+    fd: number,
+    name: number,
+    size: bigint,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      // size arrives as i64; truncate to 32-bit unsigned for the provider.
+      const sizeNum = Number(size & 0xffffffffn);
+      return provider.setOptSize(fd, SockLevel.SOCKET, name, sizeNum);
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_set_opt_size");
+    }
+  }
+
+  private wasix_sock_get_opt_time(
+    fd: number,
+    name: number,
+    retPtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const value = provider.getOptTime(fd, SockLevel.SOCKET, name);
+      const view = new DataView(this.memory.buffer);
+      // Layout: [tag u8][_pad u8 × 7][value i64 LE]. tag=0 → no timeout.
+      view.setUint8(retPtr, value === null ? 0 : 1);
+      view.setBigInt64(retPtr + 8, value ?? 0n, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_get_opt_time");
+    }
+  }
+
+  private wasix_sock_set_opt_time(
+    fd: number,
+    name: number,
+    timePtr: number,
+  ): number {
+    try {
+      const provider = this.requireSockets();
+      const view = new DataView(this.memory.buffer);
+      const tag = view.getUint8(timePtr);
+      const value = tag === 0 ? null : view.getBigInt64(timePtr + 8, true);
+      return provider.setOptTime(fd, SockLevel.SOCKET, name, value);
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_set_opt_time");
+    }
+  }
+
+  private wasix_sock_addr_local(fd: number, retPtr: number): number {
+    try {
+      const provider = this.requireSockets();
+      const addr = provider.addrLocal(fd);
+      writeSockAddrPort(this.memory, retPtr, addr);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_addr_local");
+    }
+  }
+
+  private wasix_sock_addr_peer(fd: number, retPtr: number): number {
+    try {
+      const provider = this.requireSockets();
+      const addr = provider.addrPeer(fd);
+      writeSockAddrPort(this.memory, retPtr, addr);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_addr_peer");
+    }
+  }
+
+  private wasix_sock_status(fd: number, retPtr: number): number {
+    try {
+      const provider = this.requireSockets();
+      const status = provider.status(fd);
+      new DataView(this.memory.buffer).setUint8(retPtr, status);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "sock_status");
+    }
+  }
+
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
     // proc_exit2 mirrors proc_exit semantics: terminate the run with the
@@ -869,27 +1161,27 @@ export class WASIX {
       sched_yield: enosys,
 
       // Sockets
-      sock_accept: enosys,
-      sock_addr_local: enosys,
-      sock_addr_peer: enosys,
-      sock_addr_resolve: enosys,
-      sock_bind: enosys,
-      sock_connect: enosys,
-      sock_get_opt_flag: enosys,
-      sock_get_opt_size: enosys,
-      sock_get_opt_time: enosys,
-      sock_listen: enosys,
-      sock_open: enosys,
-      sock_recv: enosys,
+      sock_accept: this.wasix_sock_accept.bind(this),
+      sock_addr_local: this.wasix_sock_addr_local.bind(this),
+      sock_addr_peer: this.wasix_sock_addr_peer.bind(this),
+      sock_addr_resolve: this.wasix_sock_addr_resolve.bind(this),
+      sock_bind: this.wasix_sock_bind.bind(this),
+      sock_connect: this.wasix_sock_connect.bind(this),
+      sock_get_opt_flag: this.wasix_sock_get_opt_flag.bind(this),
+      sock_get_opt_size: this.wasix_sock_get_opt_size.bind(this),
+      sock_get_opt_time: this.wasix_sock_get_opt_time.bind(this),
+      sock_listen: this.wasix_sock_listen.bind(this),
+      sock_open: this.wasix_sock_open.bind(this),
+      sock_recv: this.wasix_sock_recv.bind(this),
       sock_recv_from: enosys,
-      sock_send: enosys,
+      sock_send: this.wasix_sock_send.bind(this),
       sock_send_file: enosys,
       sock_send_to: enosys,
-      sock_set_opt_flag: enosys,
-      sock_set_opt_size: enosys,
-      sock_set_opt_time: enosys,
-      sock_shutdown: enosys,
-      sock_status: enosys,
+      sock_set_opt_flag: this.wasix_sock_set_opt_flag.bind(this),
+      sock_set_opt_size: this.wasix_sock_set_opt_size.bind(this),
+      sock_set_opt_time: this.wasix_sock_set_opt_time.bind(this),
+      sock_shutdown: this.wasix_sock_shutdown.bind(this),
+      sock_status: this.wasix_sock_status.bind(this),
 
       // Threads
       thread_exit: enosys,
@@ -1324,3 +1616,139 @@ function encodeDirectoryEntries(
   }
   return out;
 }
+
+// ─── Sockets address marshalling ────────────────────────────────────────────
+//
+// Compact wire layout (slice-internal — see plan § "Risks / judgement
+// calls flagged for review"). The wasix in-memory `__wasi_addr_port_t`
+// struct varies across libc versions; we pick a single layout here and
+// document it so Slice 6/8 can find it. The loopback test harness's WAT
+// guest uses the same layout — when the wasmer suite is rebuilt under
+// wasixcc, this layout may need to track upstream's actual struct.
+//
+// __wasi_addr_t (no port) — 20 bytes:
+//   offset 0  : family tag u8 (0=UNSPEC, 1=INET4, 2=INET6, 3=UNIX)
+//   offset 4..: address bytes — 4 for INET4, 16 for INET6, 16 for UNIX
+//
+// __wasi_addr_port_t (with port) — 22 bytes (laid out as 24 with padding):
+//   offset 0  : family tag u8
+//   offset 2  : port u16 LE
+//   offset 4..: address bytes (same as above)
+
+const SOCK_ADDR_BYTES = 20;
+const SOCK_ADDR_PORT_BYTES = 24;
+
+function readSockAddrPort(memory: WebAssembly.Memory, ptr: number): SockAddr {
+  const view = new DataView(memory.buffer);
+  const tag = view.getUint8(ptr);
+  const port = view.getUint16(ptr + 2, true);
+  return readSockAddrBody(memory, ptr + 4, tag, port);
+}
+
+function writeSockAddrPort(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  addr: SockAddr,
+): void {
+  const view = new DataView(memory.buffer);
+  const buf = new Uint8Array(memory.buffer, ptr, SOCK_ADDR_PORT_BYTES);
+  buf.fill(0);
+  view.setUint8(ptr, familyTag(addr));
+  view.setUint16(ptr + 2, sockAddrPort(addr), true);
+  writeSockAddrBody(memory, ptr + 4, addr);
+}
+
+function writeSockAddrNoPort(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  addr: SockAddr,
+): void {
+  const view = new DataView(memory.buffer);
+  const buf = new Uint8Array(memory.buffer, ptr, SOCK_ADDR_BYTES);
+  buf.fill(0);
+  view.setUint8(ptr, familyTag(addr));
+  writeSockAddrBody(memory, ptr + 4, addr);
+}
+
+function readSockAddrBody(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  tag: number,
+  port: number,
+): SockAddr {
+  if (tag === AddressFamily.INET4) {
+    const buf = new Uint8Array(memory.buffer, ptr, 4);
+    return {
+      family: "inet4",
+      address: `${buf[0]}.${buf[1]}.${buf[2]}.${buf[3]}`,
+      port,
+    };
+  }
+  if (tag === AddressFamily.INET6) {
+    const buf = new Uint8Array(memory.buffer, ptr, 16);
+    const parts: string[] = [];
+    for (let i = 0; i < 16; i += 2) {
+      parts.push(((buf[i] << 8) | buf[i + 1]).toString(16));
+    }
+    return { family: "inet6", address: parts.join(":"), port };
+  }
+  if (tag === AddressFamily.UNIX) {
+    const buf = new Uint8Array(memory.buffer, ptr, 16);
+    let len = 0;
+    while (len < buf.byteLength && buf[len] !== 0) len++;
+    return {
+      family: "unix",
+      path: new TextDecoder().decode(buf.subarray(0, len)),
+    };
+  }
+  throw new WASIXError(Result.EAFNOSUPPORT);
+}
+
+function writeSockAddrBody(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  addr: SockAddr,
+): void {
+  if (addr.family === "inet4") {
+    const buf = new Uint8Array(memory.buffer, ptr, 4);
+    const parts = addr.address.split(".").map((s) => Number.parseInt(s, 10));
+    for (let i = 0; i < 4; i++) buf[i] = parts[i] ?? 0;
+    return;
+  }
+  if (addr.family === "inet6") {
+    const buf = new Uint8Array(memory.buffer, ptr, 16);
+    const groups = expandIPv6(addr.address);
+    for (let i = 0; i < 8; i++) {
+      buf[i * 2] = (groups[i] >> 8) & 0xff;
+      buf[i * 2 + 1] = groups[i] & 0xff;
+    }
+    return;
+  }
+  // unix
+  const buf = new Uint8Array(memory.buffer, ptr, 16);
+  const bytes = new TextEncoder().encode(addr.path);
+  buf.set(bytes.subarray(0, Math.min(bytes.byteLength, 16)));
+}
+
+function familyTag(addr: SockAddr): number {
+  if (addr.family === "inet4") return AddressFamily.INET4;
+  if (addr.family === "inet6") return AddressFamily.INET6;
+  return AddressFamily.UNIX;
+}
+
+function sockAddrPort(addr: SockAddr): number {
+  return addr.family === "unix" ? 0 : addr.port;
+}
+
+function expandIPv6(address: string): number[] {
+  // Minimal IPv6 expander — enough for the synthesised "::1" / "fe80::1"
+  // shapes the loopback fabric emits. Not a full RFC 4291 implementation.
+  const halves = address.split("::");
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length > 1 && halves[1] ? halves[1].split(":") : [];
+  const fillCount = 8 - head.length - tail.length;
+  const middle = new Array<string>(fillCount).fill("0");
+  const all = [...head, ...middle, ...tail].slice(0, 8);
+  return all.map((g) => Number.parseInt(g || "0", 16));
+}
+
