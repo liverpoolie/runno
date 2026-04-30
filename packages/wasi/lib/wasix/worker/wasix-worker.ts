@@ -325,6 +325,15 @@ function stubSocketsProvider(): SocketsProvider {
     recv: () => throwEnosys(),
     shutdown: () => throwEnosys(),
     addrResolve: () => throwEnosys(),
+    getOptFlag: () => throwEnosys(),
+    getOptSize: () => throwEnosys(),
+    getOptTime: () => throwEnosys(),
+    setOptFlag: () => throwEnosys(),
+    setOptSize: () => throwEnosys(),
+    setOptTime: () => throwEnosys(),
+    addrLocal: () => throwEnosys(),
+    addrPeer: () => throwEnosys(),
+    status: () => throwEnosys(),
   };
 }
 function stubProcProvider(): ProcProvider {
