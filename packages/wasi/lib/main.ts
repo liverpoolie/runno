@@ -27,6 +27,20 @@ export {
 export { CooperativeThreadsProvider } from "./wasix/providers/cooperative-threads.js";
 export { SimulatedFutexProvider } from "./wasix/providers/simulated-futex.js";
 export { SelfSignalProvider } from "./wasix/providers/self-signal.js";
+export { InProcessProcProvider } from "./wasix/providers/in-process-proc.js";
+export type {
+  ChildRunner,
+  ExecRunner,
+  InProcessProcProviderOptions,
+  ModuleResolver,
+} from "./wasix/providers/in-process-proc.js";
+export {
+  PipeReadEnd,
+  PipeWriteEnd,
+  PipeRingBuffer,
+  createPipe,
+} from "./wasix/providers/pipes.js";
+export type { PipeEnd } from "./wasix/providers/pipes.js";
 export { startThread } from "./wasix/thread-start.js";
 export type { ThreadStartResult } from "./wasix/thread-start.js";
 export type {
