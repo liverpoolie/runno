@@ -49,6 +49,8 @@ export type {
   ProcSpawnRequest,
   ProcExecRequest,
   ProcExitInfo,
+  ProcFdTableEntry,
+  ProcFdTableSlot,
   Filestat,
   Fdstat,
   FsTimestamps,
