@@ -3,6 +3,7 @@ import { test, expect } from "@playwright/test";
 import type {
   WASIX,
   WASIXContext,
+  WASIDriveFileSystemProvider,
   FixedClockProvider,
   SeededRandomProvider,
 } from "../lib/main";
@@ -22,6 +23,9 @@ test("wasix-clock-random: monotonic delta > 0 and non-zero random bytes", async 
 
     const W: typeof WASIX = (window as any)["WASIX"];
     const WC: typeof WASIXContext = (window as any)["WASIXContext"];
+    const WD: typeof WASIDriveFileSystemProvider = (window as any)[
+      "WASIDriveFileSystemProvider"
+    ];
 
     const wasiResult = await W.start(
       fetch("/bin/tests/wasix-clock-random.wasm"),
@@ -30,7 +34,7 @@ test("wasix-clock-random: monotonic delta > 0 and non-zero random bytes", async 
         stdout: () => {},
         stderr: () => {},
         stdin: () => null,
-        fs: {},
+        fs: new WD({}),
       }),
     );
 
@@ -50,6 +54,9 @@ test("wasix-deterministic: byte-identical stdout across two runs with fixed prov
 
     const W: typeof WASIX = (window as any)["WASIX"];
     const WC: typeof WASIXContext = (window as any)["WASIXContext"];
+    const WD: typeof WASIDriveFileSystemProvider = (window as any)[
+      "WASIDriveFileSystemProvider"
+    ];
     const FC: typeof FixedClockProvider = (window as any)["FixedClockProvider"];
     const SR: typeof SeededRandomProvider = (window as any)[
       "SeededRandomProvider"
@@ -68,7 +75,7 @@ test("wasix-deterministic: byte-identical stdout across two runs with fixed prov
           },
           stderr: () => {},
           stdin: () => null,
-          fs: {},
+          fs: new WD({}),
         }),
       );
       return { exitCode: wasiResult.exitCode, stdout: chunks.join("") };

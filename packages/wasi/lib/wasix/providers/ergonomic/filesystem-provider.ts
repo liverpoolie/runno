@@ -1,12 +1,12 @@
 // WASIDriveFileSystemProvider
 //
-// First of the "ergonomic" providers bundled with @runno/wasi.
-// Wraps the existing preview1 WASIDrive in the raw FileSystemProvider
-// interface so WASIX can serve filesystem syscalls through the same
-// provider substrate as clock / random / etc.
+// One of the "ergonomic" providers bundled with @runno/wasi. Wraps the
+// existing preview1 WASIDrive in the FileSystemProvider interface so
+// WASIX can serve filesystem syscalls through the same provider
+// substrate as clock / random / etc.
 //
-// Sync throughout. An AsyncFileSystemProvider variant (for IndexedDB /
-// server-backed filesystems) ships in a later slice.
+// Sync throughout. An async variant (for IndexedDB / server-backed
+// filesystems) is layered separately.
 
 import { WASIFS } from "../../../types.js";
 import { WASIDrive } from "../../../wasi/wasi-drive.js";
@@ -68,13 +68,8 @@ function toWasixResult(err: Preview1Result): Result {
 
 /**
  * Ergonomic filesystem provider that delegates to the existing in-memory
- * `WASIDrive`. Hosts pass a `WASIFS` (or this provider directly) into
- * `WASIXContext.fs`; the runtime auto-wraps raw `WASIFS` values in this
- * class.
- *
- * This is a single-slice wrapper. Slice 9 extracts the common pieces
- * shared with preview1 into a common base; until then the drive stays
- * untouched and we translate at the boundary.
+ * `WASIDrive`. Hosts construct one with a `WASIFS` (or an existing drive)
+ * and pass it as `WASIXContext.fs`.
  */
 export class WASIDriveFileSystemProvider implements FileSystemProvider {
   readonly drive: WASIDrive;
@@ -267,9 +262,8 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
     //
     // `WASIDrive.unlink` happily removes both files and non-empty
     // directories (it just prefix-walks the flat path map). Guard the
-    // two error cases here so slice-4+ tests that exercise directory
-    // semantics see the right errno. Slice 9 lifts these checks into
-    // the extracted drive.
+    // two error cases here so callers that exercise directory
+    // semantics see the right errno.
     const [statErr, stat] = this.drive.pathStat(fdDir, path);
     if (statErr !== Preview1Result.SUCCESS) {
       throw new WASIXError(toWasixResult(statErr));

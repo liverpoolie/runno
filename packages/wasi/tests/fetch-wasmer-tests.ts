@@ -11,9 +11,8 @@
 //     `.pinned-sha` matching `WASMER_SHA`, skip the fetch entirely.
 //   - Writes `.pinned-sha` alongside the extracted tree so re-runs
 //     after a bump repopulate deterministically.
-//   - Exits 0 on network failure with a diagnostic — CI controls
-//     whether that's fatal by branching on `test:prepare:wasix-suite`
-//     separately.
+//   - Hard fails on any download / extraction error so callers can't
+//     silently end up with a missing vendor dir.
 
 import {
   createWriteStream,
@@ -29,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { pipeline } from "node:stream/promises";
 
-import { WASMER_SHA, WASIX_VENDOR_DIR } from "./wasix-suite.constants.mjs";
+import { WASMER_SHA, WASIX_VENDOR_DIR } from "./wasix-suite.constants.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkgDir = resolve(__dirname, "..");
@@ -61,10 +60,10 @@ const tmpFile = join(
 try {
   await downloadTarball(url, tmpFile);
 } catch (err) {
-  console.warn(
+  console.error(
     `[fetch-wasmer-tests] failed to download ${url}: ${err instanceof Error ? err.message : String(err)}`,
   );
-  process.exit(0);
+  process.exit(1);
 }
 
 // Extract only `wasmer-<sha>/tests/wasix/`, stripping the leading
@@ -84,7 +83,6 @@ const extract = spawnSync("tar", extractArgs, {
   stdio: ["ignore", "inherit", "inherit"],
 });
 
-// Always clean up the tarball.
 try {
   rmSync(tmpFile, { force: true });
 } catch {
@@ -92,10 +90,10 @@ try {
 }
 
 if (extract.status !== 0) {
-  console.warn(
+  console.error(
     `[fetch-wasmer-tests] tar extraction failed (exit ${extract.status}).`,
   );
-  process.exit(0);
+  process.exit(1);
 }
 
 writeFileSync(pinnedShaFile, `${WASMER_SHA}\n`);
@@ -103,8 +101,7 @@ console.log(
   `[fetch-wasmer-tests] extracted tests/wasix/ at ${WASMER_SHA} into ${vendorRoot}.`,
 );
 
-/** Download `url` to `dest` via native fetch streaming. */
-async function downloadTarball(url, dest) {
+async function downloadTarball(url: string, dest: string): Promise<void> {
   const res = await fetch(url, {
     redirect: "follow",
     headers: { "User-Agent": "runno-wasix-suite-fetch" },

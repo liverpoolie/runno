@@ -3,24 +3,68 @@ name: Run Tests on PR
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: 1.69.0
           override: true
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
       - name: Install wabt (wat2wasm)
-        # `packages/wasi`'s `build:tests:wat` step needs wat2wasm to compile
-        # the hand-written WAT smoke binaries (added in Slice 2) and the
-        # Slice 4 bridge unit-test binary into wasm before Playwright runs.
+        # `packages/wasi`'s `build:tests` step needs wat2wasm to compile
+        # the hand-written WAT smoke binaries (the wasix clock/random ones
+        # and the bridge unit-test binary) into wasm before Playwright
+        # runs.
         run: sudo apt-get update && sudo apt-get install -y wabt
       - name: Install dependencies
         run: npm run bootstrap
       - name: Build Runno
         run: npm run build
+
+      # ──────────────────────────────────────────────────────────────
+      # WASIX integration suite preparation
+      # ──────────────────────────────────────────────────────────────
+      - name: Cache vendored wasmer checkout
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/tests/wasix-vendor
+          key: >-
+            wasmer-vendor-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts')
+            }}
+      - name: Cache built wasix-suite binaries
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/public/bin/wasix-tests
+          key: >-
+            wasix-bins-${{ runner.os }}-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts',
+                        'packages/wasi/tests/build-wasix-suite.ts',
+                        '.github/workflows/test-on-pull-request.yml')
+            }}
+      - name: Install wasixcc toolchain
+        # Pulls a pinned wasixcc binary, the wasix-libc sysroot and the
+        # WASIX-aware LLVM toolchain into a managed cache, then puts
+        # `wasixcc` on PATH for downstream steps.
+        uses: wasix-org/wasixcc@v0.4.3
+        with:
+          version: v0.4.3
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Probe wasixcc
+        run: |
+          set -euxo pipefail
+          if ! command -v wasixcc >/dev/null 2>&1; then
+            echo "::error::wasixcc not on PATH after install."
+            exit 1
+          fi
+          wasixcc --version || true
+      - name: Fetch + build wasix suite binaries
+        working-directory: packages/wasi
+        run: npm run test:prepare:wasix-suite
+
       - name: Install Playwright
         run: npx playwright install --with-deps
       - name: Run your tests - this might fail if playwright version is outdated

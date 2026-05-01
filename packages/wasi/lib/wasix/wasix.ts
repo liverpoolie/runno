@@ -16,10 +16,9 @@ import {
   InitializationError,
 } from "../wasi/wasi.js";
 import { WASIContextOptions } from "../wasi/wasi-context.js";
-import { WASIXExecutionResult, WASIFS } from "../types.js";
+import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
-import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
 import type {
   ClockProvider,
   FileSystemProvider,
@@ -37,11 +36,11 @@ class WASIXExit extends Error {
 /**
  * WASIX runtime for the browser.
  *
- * Sibling of WASI (not a subclass). Composes a WASI instance internally to
- * service wasi_snapshot_preview1 and wasi_unstable imports. Slice 3 wires
- * filesystem syscalls through a `FileSystemProvider`; clock / random
- * landed in Slice 2. Memory marshalling lives in this class — providers
- * only ever see decoded JS-native values.
+ * Sibling of WASI (not a subclass). Composes a WASI instance internally
+ * to service wasi_snapshot_preview1 and wasi_unstable imports.
+ * Filesystem syscalls route through a `FileSystemProvider`; clock and
+ * random go through their respective providers. Memory marshalling lives
+ * in this class — providers only ever see decoded JS-native values.
  *
  * Usage mirrors WASI.start():
  *
@@ -57,7 +56,6 @@ export class WASIX {
   private wasi: WASI;
   private _clock?: ClockProvider;
   private _random?: RandomProvider;
-  private _fs?: FileSystemProvider;
 
   /**
    * Start a WASIX command.
@@ -76,10 +74,10 @@ export class WASIX {
 
   constructor(context: Partial<WASIXContextOptions>) {
     this.context = new WASIXContext(context);
-    // Internal WASI shares args / env / stdio with WASIX. When the host
-    // supplies a raw FileSystemProvider via `fs`, the internal WASI is
-    // constructed with an empty fs — preview1 filesystem imports are not
-    // backed by the provider this slice. Slice 9 unifies the drive.
+    // The internal WASI shares args / env / stdio with WASIX. The WASIX
+    // filesystem surface routes through `context.fs` (a FileSystemProvider),
+    // so the internal WASI's preview1 fs is intentionally empty — guests
+    // built against wasix_32v1 should not be reaching for preview1 fs.
     const wasiContext: Partial<WASIContextOptions> = {
       args: context.args,
       env: context.env,
@@ -88,9 +86,7 @@ export class WASIX {
       stderr: context.stderr,
       isTTY: context.isTTY,
       debug: context.debug,
-      fs: isFileSystemProvider(context.fs)
-        ? {}
-        : ((context.fs ?? {}) as WASIFS),
+      fs: {},
     };
     this.wasi = new WASI(wasiContext);
   }
@@ -136,7 +132,7 @@ export class WASIX {
       options.memory ?? (this.instance.exports.memory as WebAssembly.Memory);
 
     // Wire the internal WASI instance to the same wasm instance + memory
-    // so that preview1/unstable syscalls can access guest memory and the drive.
+    // so that preview1/unstable syscalls can access guest memory.
     this.wasi.instance = wasm.instance;
     this.wasi.module = wasm.module;
     this.wasi.memory = this.memory;
@@ -159,24 +155,15 @@ export class WASIX {
       entrypoint();
     } catch (e) {
       if (e instanceof WASIXExit) {
-        return {
-          exitCode: e.code,
-          fs: this.resultFs(),
-        };
+        return { exitCode: e.code };
       } else if (e instanceof WebAssembly.RuntimeError) {
-        return {
-          exitCode: 134,
-          fs: this.resultFs(),
-        };
+        return { exitCode: 134 };
       } else {
         throw e;
       }
     }
 
-    return {
-      exitCode: 0,
-      fs: this.resultFs(),
-    };
+    return { exitCode: 0 };
   }
 
   //
@@ -191,40 +178,8 @@ export class WASIX {
     return this.context.random ?? (this._random ??= new SystemRandomProvider());
   }
 
-  /**
-   * Resolve the filesystem provider.
-   *
-   * - If the host supplied a `FileSystemProvider`, use it directly.
-   * - If the host supplied a `WASIFS`, lazy-wrap it in
-   *   `WASIDriveFileSystemProvider` so the WASIX filesystem surface shares
-   *   state with the internal WASI's preview1 drive. The internal WASI
-   *   owns that drive; we mirror it here so mutations through either
-   *   namespace are visible to both.
-   * - Otherwise construct an empty drive.
-   */
   private get fs(): FileSystemProvider {
-    if (this._fs) return this._fs;
-    const raw = this.context.fs;
-    if (isFileSystemProvider(raw)) {
-      this._fs = raw;
-    } else {
-      // Share the internal WASI's drive so preview1 and WASIX agree on fs state.
-      this._fs = new WASIDriveFileSystemProvider(this.wasi.drive);
-    }
-    return this._fs;
-  }
-
-  private resultFs(): WASIFS {
-    // Prefer the internal WASI drive's `fs` view (preserves existing
-    // behaviour for hosts that passed a WASIFS). When the host supplied
-    // a raw provider and it exposes a `drive`, return its `fs`; otherwise
-    // fall back to an empty snapshot — the host owns the fs state in that
-    // case.
-    const provider = this.fs;
-    if (provider instanceof WASIDriveFileSystemProvider) {
-      return provider.drive.fs;
-    }
-    return this.wasi.drive.fs;
+    return this.context.fs;
   }
 
   //
@@ -551,11 +506,13 @@ export class WASIX {
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
     return {
-      // Args / environ
-      args_get: enosys,
-      args_sizes_get: enosys,
-      environ_get: enosys,
-      environ_sizes_get: enosys,
+      // Args / environ — share the internal WASI's preview1 implementations
+      // so wasix-libc's argv/environ setup sees the values that were passed
+      // to the WASIXContext.
+      args_get: this.wasi.args_get.bind(this.wasi),
+      args_sizes_get: this.wasi.args_sizes_get.bind(this.wasi),
+      environ_get: this.wasi.environ_get.bind(this.wasi),
+      environ_sizes_get: this.wasi.environ_sizes_get.bind(this.wasi),
 
       // Clock
       clock_res_get: this.wasix_clock_res_get.bind(this),
@@ -580,8 +537,6 @@ export class WASIX {
       fd_pwrite: enosys,
       fd_read: this.wasix_fd_read.bind(this),
       fd_readdir: this.wasix_fd_readdir.bind(this),
-      // Stubbed ENOSYS in slice 3 — un-skips `dup` / `close-preopen` in
-      // wasix-suite.skip.ts when slice 9 extracts WASIDrive's fd table.
       fd_renumber: enosys,
       fd_seek: this.wasix_fd_seek.bind(this),
       fd_sync: enosys,
@@ -711,16 +666,6 @@ export class WASIX {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-function isFileSystemProvider(
-  fs: WASIFS | FileSystemProvider | undefined,
-): fs is FileSystemProvider {
-  if (fs === undefined || fs === null) return false;
-  // WASIFS is a plain object; FileSystemProvider has methods. We match by
-  // the presence of a signature function rather than relying on `instanceof`
-  // (hosts may subclass).
-  return typeof (fs as FileSystemProvider).fdRead === "function";
-}
 
 function readString(
   memory: WebAssembly.Memory,

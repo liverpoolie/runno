@@ -1,6 +1,10 @@
 import { test, expect } from "@playwright/test";
 
-import type { WASIX, WASIXContext } from "../lib/main";
+import type {
+  WASIX,
+  WASIXContext,
+  WASIDriveFileSystemProvider,
+} from "../lib/main";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("http://localhost:5173");
@@ -17,6 +21,9 @@ test("WASIX runs a WASI preview1 hello-world: exits 0, prints to stdout", async 
 
     const W: typeof WASIX = (window as any)["WASIX"];
     const WC: typeof WASIXContext = (window as any)["WASIXContext"];
+    const WD: typeof WASIDriveFileSystemProvider = (window as any)[
+      "WASIDriveFileSystemProvider"
+    ];
 
     let stdout = "";
 
@@ -29,7 +36,7 @@ test("WASIX runs a WASI preview1 hello-world: exits 0, prints to stdout", async 
         },
         stderr: () => {},
         stdin: () => null,
-        fs: {},
+        fs: new WD({}),
       }),
     );
 

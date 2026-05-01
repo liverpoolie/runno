@@ -6,12 +6,9 @@
 //
 // Tests listed in `WASIX_SUITE_SKIPS` are marked `test.fixme()` with the
 // structured reason token — they still show up in the Playwright report
-// so triage can see the categorised skip distribution. Tests that failed
-// to build under wasixcc are auto-tagged `requires-wasixcc-build-fix` by
-// reading the sidecar `wasix-suite.build-skip.json` the build script
-// emits.
+// so triage can see the categorised skip distribution.
 //
-// Per-test wiring (Issue #4):
+// Per-test wiring:
 //   - Each wasmer test directory ships a `run.sh` of the form:
 //       `$WASMER_RUN main.wasm --volume . -- <subcommand tokens>`
 //     The tokens after `--` are the guest `args`. The harness parses
@@ -27,8 +24,13 @@ import { join } from "node:path";
 
 import { test, expect } from "@playwright/test";
 
-import type { WASIX, WASIXContext, WASIFS } from "../lib/main";
-import { WASIX_SUITE_BIN_DIR, WASIX_VENDOR_DIR } from "./wasix-suite.config";
+import type {
+  WASIX,
+  WASIXContext,
+  WASIDriveFileSystemProvider,
+  WASIFS,
+} from "../lib/main";
+import { WASIX_SUITE_BIN_DIR, WASIX_VENDOR_DIR } from "./wasix-suite.constants";
 import type { SkipEntry } from "./wasix-suite.skip";
 import { WASIX_SUITE_SKIPS } from "./wasix-suite.skip";
 
@@ -41,7 +43,6 @@ const wasixTestsDir = join(
   "tests",
   "wasix",
 );
-const buildSkipPath = join(pkgDir, "tests", "wasix-suite.build-skip.json");
 
 // Files present in every wasmer test directory that are never part of
 // the preopened input mapping.
@@ -191,16 +192,6 @@ function collectInputs(dir: string): TestInput[] {
   return out;
 }
 
-function readBuildSkipTests(): Set<string> {
-  try {
-    const raw = readFileSync(buildSkipPath, "utf8");
-    const parsed = JSON.parse(raw) as { tests?: string[] };
-    return new Set(parsed.tests ?? []);
-  } catch {
-    return new Set();
-  }
-}
-
 function planForTest(name: string): TestPlan {
   const srcDir = join(wasixTestsDir, name);
   const runShPath = join(srcDir, "run.sh");
@@ -221,18 +212,17 @@ function planForTest(name: string): TestPlan {
 }
 
 const binaries = listWasmBinaries();
-const buildFailures = readBuildSkipTests();
 
 test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
+  test("at least one wasix-suite binary was built", () => {
+    expect(
+      binaries.length,
+      "public/bin/wasix-tests/ is empty — run `npm run test:prepare:wasix-suite` " +
+        "(install wasixcc via `npm run wasix:install-tools` first).",
+    ).toBeGreaterThan(0);
+  });
+
   if (binaries.length === 0) {
-    test("no wasix suite binaries built", () => {
-      test.info().annotations.push({
-        type: "skip-reason",
-        description:
-          "public/bin/wasix-tests/ is empty — run `npm run test:prepare:wasix-suite` with wasixcc installed to populate it.",
-      });
-      test.skip();
-    });
     return;
   }
 
@@ -243,15 +233,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
 
   for (const file of binaries) {
     const name = file.replace(/\.wasm$/, "");
-    const handAuthoredSkip: SkipEntry | undefined = WASIX_SUITE_SKIPS[name];
-    const skip: SkipEntry | undefined = buildFailures.has(name)
-      ? {
-          reason: "requires-wasixcc-build-fix",
-          note:
-            handAuthoredSkip?.note ??
-            "wasixcc failed to build this test during prepare step.",
-        }
-      : handAuthoredSkip;
+    const skip: SkipEntry | undefined = WASIX_SUITE_SKIPS[name];
 
     const plan = planForTest(name);
 
@@ -276,9 +258,11 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
         const w = window as unknown as {
           WASIX: typeof WASIX;
           WASIXContext: typeof WASIXContext;
+          WASIDriveFileSystemProvider: typeof WASIDriveFileSystemProvider;
         };
         const W = w.WASIX;
         const WC = w.WASIXContext;
+        const WD = w.WASIDriveFileSystemProvider;
 
         // Seed a fresh WASIFS for this run from the per-test inputs.
         // Paths are rooted at `/` so they resolve through the single
@@ -309,7 +293,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               stderr += err;
             },
             stdin: () => null,
-            fs,
+            fs: new WD(fs),
           }),
         );
 
