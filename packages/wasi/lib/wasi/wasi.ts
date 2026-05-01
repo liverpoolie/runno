@@ -20,10 +20,15 @@ import { WASIExecutionResult } from "../types.js";
 import { WASIContext, WASIContextOptions } from "./wasi-context.js";
 import { DriveStat, WASIDrive } from "./wasi-drive.js";
 import { readIOVectors, readString } from "../wasi-shared/memory.js";
-import type { ClockProvider, RandomProvider } from "../wasix/providers.js";
+import type {
+  ClockProvider,
+  FileSystemProvider,
+  RandomProvider,
+} from "../wasix/providers.js";
 import { SystemClockProvider } from "../wasix/providers/system-clock.js";
 import { SystemRandomProvider } from "../wasix/providers/system-random.js";
-import { ClockId } from "../wasix/wasix-32v1.js";
+import { WASIDriveFileSystemProvider } from "../wasix/providers/ergonomic/filesystem-provider.js";
+import { ClockId, WASIXError } from "../wasix/wasix-32v1.js";
 
 /** Injects a function between implementation and return for debugging */
 export type DebugFn = (
@@ -64,6 +69,7 @@ export class WASI implements SnapshotPreview1 {
   memory!: WebAssembly.Memory;
   context: WASIContext;
   drive: WASIDrive;
+  fs: FileSystemProvider;
   clock: ClockProvider;
   random: RandomProvider;
   hasBeenInitialized: boolean = false;
@@ -105,6 +111,8 @@ export class WASI implements SnapshotPreview1 {
   constructor(context: Partial<WASIContextOptions>) {
     this.context = new WASIContext(context);
     this.drive = new WASIDrive(this.context.fs);
+    this.fs =
+      this.context.fsProvider ?? new WASIDriveFileSystemProvider(this.drive);
     this.clock = this.context.clock ?? new SystemClockProvider();
     this.random = this.context.random ?? new SystemRandomProvider();
   }
@@ -317,6 +325,17 @@ export class WASI implements SnapshotPreview1 {
     );
   }
 
+  /**
+   * Translate a provider-thrown value into a preview1 errno. WASIX uses
+   * the same numeric Result values as preview1, so a `WASIXError` round-
+   * trips through `as unknown as Result`. Any other thrown value becomes
+   * `EIO` (matches the WASIX `mapError` boundary).
+   */
+  private toErrno(e: unknown): Result {
+    if (e instanceof WASIXError) return e.result as unknown as Result;
+    return Result.EIO;
+  }
+
   //
   // WASI Implementation
   //
@@ -500,8 +519,6 @@ export class WASI implements SnapshotPreview1 {
     let result: Result = Result.SUCCESS;
 
     for (const iov of iovs) {
-      let data: Uint8Array;
-
       // Read from STDIN
       if (fd === 0) {
         // Using callbacks for a blocking call
@@ -510,21 +527,20 @@ export class WASI implements SnapshotPreview1 {
           break;
         }
 
-        data = encoder.encode(input);
+        const data = encoder.encode(input);
+        const bytes = Math.min(iov.byteLength, data.byteLength);
+        iov.set(data.subarray(0, bytes));
+        bytesRead += bytes;
       } else {
-        const [error, readData] = this.drive.read(fd, iov.byteLength);
-        if (error) {
-          result = error;
+        try {
+          const got = this.fs.fdRead(fd, [iov]);
+          bytesRead += got;
+          if (got < iov.byteLength) break;
+        } catch (e) {
+          result = this.toErrno(e);
           break;
-        } else {
-          data = readData;
         }
       }
-
-      const bytes = Math.min(iov.byteLength, data.byteLength);
-      iov.set(data.subarray(0, bytes));
-
-      bytesRead += bytes;
     }
 
     pushDebugData({ bytesRead });
@@ -570,14 +586,16 @@ export class WASI implements SnapshotPreview1 {
         stdfn(output);
 
         pushDebugData({ output });
+        bytesWritten += iov.byteLength;
       } else {
-        result = this.drive.write(fd, iov);
-        if (result != Result.SUCCESS) {
+        try {
+          const got = this.fs.fdWrite(fd, [iov]);
+          bytesWritten += got;
+        } catch (e) {
+          result = this.toErrno(e);
           break;
         }
       }
-
-      bytesWritten += iov.byteLength;
     }
 
     view.setUint32(retptr0, bytesWritten, true);
@@ -612,7 +630,12 @@ export class WASI implements SnapshotPreview1 {
    * @param fd
    */
   fd_close(fd: number) {
-    return this.drive.close(fd);
+    try {
+      this.fs.fdClose(fd);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
@@ -656,13 +679,13 @@ export class WASI implements SnapshotPreview1 {
       return Result.SUCCESS;
     }
 
-    if (!this.drive.exists(fd)) {
-      return Result.EBADF;
+    let buffer: Uint8Array;
+    try {
+      const stat = this.fs.fdFdstatGet(fd);
+      buffer = createFdStat(stat.filetype as unknown as FileType, stat.fsFlags);
+    } catch (e) {
+      return this.toErrno(e);
     }
-
-    const type = this.drive.fileType(fd);
-    const fdflags = this.drive.fileFdflags(fd);
-    const buffer = createFdStat(type, fdflags);
     const retBuffer = new Uint8Array(
       this.memory.buffer,
       retptr0,
@@ -678,7 +701,12 @@ export class WASI implements SnapshotPreview1 {
    * Note: This is similar to fcntl(fd, F_SETFL, flags) in POSIX.
    */
   fd_fdstat_set_flags(fd: number, flags: number): number {
-    return this.drive.setFlags(fd, flags);
+    try {
+      this.fs.fdFdstatSetFlags(fd, flags);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
@@ -966,25 +994,31 @@ export class WASI implements SnapshotPreview1 {
     cookie: bigint,
     retptr0: number,
   ): number {
-    const [result, list] = this.drive.list(fd);
-    if (result != Result.SUCCESS) {
-      return result;
+    let dirEntries;
+    try {
+      dirEntries = this.fs.fdReaddir(fd, cookie);
+    } catch (e) {
+      return this.toErrno(e);
     }
 
-    let entries: Array<Uint8Array> = [];
-    let index = 0;
-    for (const { name, type } of list) {
-      const entry = createDirectoryEntry(name, type, index);
-      entries.push(entry);
-      index++;
-    }
-    entries = entries.slice(Number(cookie));
+    const encoder = new TextEncoder();
+    const encoded: Array<Uint8Array> = dirEntries.map((e) => {
+      const nameBytes = encoder.encode(e.name);
+      const buffer = new Uint8Array(24 + nameBytes.byteLength);
+      const view = new DataView(buffer.buffer);
+      view.setBigUint64(0, e.next, true);
+      view.setBigUint64(8, e.ino, true);
+      view.setUint32(16, nameBytes.length, true);
+      view.setUint8(20, e.filetype);
+      buffer.set(nameBytes, 24);
+      return buffer;
+    });
 
-    const byteSize = entries.reduce((p, c) => p + c.byteLength, 0);
+    const byteSize = encoded.reduce((p, c) => p + c.byteLength, 0);
 
     const allEntries = new Uint8Array(byteSize);
     let offset = 0;
-    for (const entry of entries) {
+    for (const entry of encoded) {
       allEntries.set(entry, offset);
       offset += entry.byteLength;
     }
@@ -1023,14 +1057,16 @@ export class WASI implements SnapshotPreview1 {
    * bigint in JavaScript.
    */
   fd_seek(fd: number, offset: bigint, whence: number, retptr0: number) {
-    const [result, newOffset] = this.drive.seek(fd, offset, whence);
-    if (result !== Result.SUCCESS) {
-      return result;
+    let newOffset: bigint;
+    try {
+      newOffset = this.fs.fdSeek(fd, offset, whence);
+    } catch (e) {
+      return this.toErrno(e);
     }
     pushDebugData({ newOffset: newOffset.toString() });
     const view = new DataView(this.memory.buffer);
     view.setBigUint64(retptr0, newOffset, true);
-    return result;
+    return Result.SUCCESS;
   }
 
   unstable_fd_seek(
@@ -1222,13 +1258,11 @@ export class WASI implements SnapshotPreview1 {
    */
   path_open(
     fd: number,
-    _: number,
+    dirflags: number,
     path_ptr: number,
     path_len: number,
     oflags: number,
-    // @ts-expect-error - unused, Runno just gives everything full rights
     rights_base: bigint,
-    // @ts-expect-error - same as above
     rights_inheriting: bigint,
     fdflags: number,
     retptr0: number,
@@ -1263,14 +1297,23 @@ export class WASI implements SnapshotPreview1 {
       },
     });
 
-    const [result, newFd] = this.drive.open(fd, path, oflags, fdflags);
-    if (result) {
-      // Error
-      return result;
+    let newFd: number;
+    try {
+      newFd = this.fs.pathOpen(
+        fd,
+        dirflags,
+        path,
+        oflags,
+        rights_base,
+        rights_inheriting,
+        fdflags,
+      );
+    } catch (e) {
+      return this.toErrno(e);
     }
 
     view.setUint32(retptr0, newFd, true);
-    return result;
+    return Result.SUCCESS;
   }
 
   /**
@@ -1289,7 +1332,12 @@ export class WASI implements SnapshotPreview1 {
 
     pushDebugData({ oldPath, newPath });
 
-    return this.drive.rename(old_fd_dir, oldPath, new_fd_dir, newPath);
+    try {
+      this.fs.pathRename(old_fd_dir, oldPath, new_fd_dir, newPath);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
@@ -1300,7 +1348,12 @@ export class WASI implements SnapshotPreview1 {
     const path = readString(this.memory, path_ptr, path_len);
     pushDebugData({ path });
 
-    return this.drive.unlink(fd, path);
+    try {
+      this.fs.pathUnlinkFile(fd, path);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
@@ -1409,7 +1462,12 @@ export class WASI implements SnapshotPreview1 {
     path_len: number,
   ): number {
     const path = readString(this.memory, path_ptr, path_len);
-    return this.drive.pathCreateDir(fd, path);
+    try {
+      this.fs.pathCreateDirectory(fd, path);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   //
@@ -1726,44 +1784,6 @@ function createFdStat(
   view.setUint32(2, fdflags, true);
   view.setBigUint64(8, rightsBase, true);
   view.setBigUint64(16, rightsInheriting, true);
-  return buffer;
-}
-
-/**
- * Creates a dirent (directory entry) Record as bytes
- * Size: 24
- * Alignment: 8
- * Record members
- * d_next (offset: 0, size: 8): <dircookie> The offset of the next directory entry stored
- *                     in this directory.
- * d_ino (offset: 8, size: 8): <inode> The serial number of the file referred to by this
- *                    directory entry.
- * d_namlen (offset: 16, size: 4): <dirnamlen> The length of the name of the directory
- *                        entry.
- * d_type (offset: 20, size: 1): <filetype> The type of the file referred to by this
- *                      directory entry.
- */
-function createDirectoryEntry(
-  name: string,
-  type: FileType,
-  currentIndex: number,
-): Uint8Array {
-  // Each entry is made up of:
-  // 0 - d_next = dircookie (size: 8) the offset of the next directory entry
-  // 8 - d_ino = inode (size: 8) - the serial number of the file
-  // 16 - d_namlen = dirnamlen (size: 4) - the length of the name of the entry
-  // 20 - d_type = filetype (size: 1) - the type of the file returned by this entry
-  // [24:24+d_namlen] = string (size: dnamlen) - the name of the directory
-
-  const nameBytes = new TextEncoder().encode(name);
-  const entryLength = 24 + nameBytes.byteLength;
-  const buffer = new Uint8Array(entryLength);
-  const view = new DataView(buffer.buffer);
-  view.setBigUint64(0, BigInt(currentIndex + 1), true);
-  view.setBigUint64(8, BigInt(cyrb53(name)), true);
-  view.setUint32(16, nameBytes.length, true);
-  view.setUint8(20, type);
-  buffer.set(nameBytes, 24);
   return buffer;
 }
 

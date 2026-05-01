@@ -1,6 +1,10 @@
 import { WASIFS } from "../types.js";
 import { DebugFn } from "./wasi.js";
-import type { ClockProvider, RandomProvider } from "../wasix/providers.js";
+import type {
+  ClockProvider,
+  FileSystemProvider,
+  RandomProvider,
+} from "../wasix/providers.js";
 
 export type WASIContextOptions = {
   fs: WASIFS;
@@ -13,6 +17,7 @@ export type WASIContextOptions = {
   isTTY: boolean;
   clock: ClockProvider;
   random: RandomProvider;
+  fsProvider: FileSystemProvider;
 };
 
 /**
@@ -42,6 +47,7 @@ export class WASIContext {
   isTTY: WASIContextOptions["isTTY"];
   clock?: ClockProvider;
   random?: RandomProvider;
+  fsProvider?: FileSystemProvider;
 
   constructor(options?: Partial<WASIContextOptions>) {
     this.fs = options?.fs ?? {};
@@ -55,5 +61,6 @@ export class WASIContext {
     this.isTTY = !!options?.isTTY;
     this.clock = options?.clock;
     this.random = options?.random;
+    this.fsProvider = options?.fsProvider;
   }
 }
