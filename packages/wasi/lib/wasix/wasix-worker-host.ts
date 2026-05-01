@@ -338,6 +338,94 @@ export class WASIXWorkerHost {
         });
         return;
       }
+      case Opcode.THREAD_SPAWN: {
+        const threads = this.requireThreads();
+        const tid = await threads.spawn(request.args.startArg);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_SPAWN,
+          result: { tid },
+        });
+        return;
+      }
+      case Opcode.THREAD_JOIN: {
+        const threads = this.requireThreads();
+        const exitCode = await threads.join(request.args.tid);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_JOIN,
+          result: { exitCode },
+        });
+        return;
+      }
+      case Opcode.THREAD_EXIT: {
+        const threads = this.requireThreads();
+        await threads.exit(request.args.code);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_EXIT,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.THREAD_SLEEP: {
+        const threads = this.requireThreads();
+        await threads.sleep(request.args.durationNs);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_SLEEP,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.THREAD_ID: {
+        const threads = this.requireThreads();
+        const tid = await threads.id();
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_ID,
+          result: { tid },
+        });
+        return;
+      }
+      case Opcode.THREAD_PARALLELISM: {
+        const threads = this.requireThreads();
+        const value = await threads.parallelism();
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_PARALLELISM,
+          result: { value },
+        });
+        return;
+      }
+      case Opcode.THREAD_SIGNAL: {
+        const threads = this.requireThreads();
+        const result = await threads.signal(
+          request.args.tid,
+          request.args.signo,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.THREAD_SIGNAL,
+          result: { result },
+        });
+        return;
+      }
+      case Opcode.FUTEX_WAIT: {
+        const futex = this.requireFutex();
+        const value = await futex.wait(
+          request.args.addr,
+          request.args.expected,
+          request.args.timeoutNs,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FUTEX_WAIT,
+          result: { value },
+        });
+        return;
+      }
+      case Opcode.FUTEX_WAKE: {
+        const futex = this.requireFutex();
+        const woken = await futex.wake(request.args.addr, request.args.count);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FUTEX_WAKE,
+          result: { woken },
+        });
+        return;
+      }
       case Opcode.SOCK_OPEN: {
         const sockets = this.requireSockets();
         const fd = await sockets.open(
@@ -551,6 +639,20 @@ export class WASIXWorkerHost {
       throw new WASIXError(Result.ENOSYS);
     }
     return this.options.sockets;
+  }
+
+  private requireThreads(): ThreadsProvider | AsyncThreadsProvider {
+    if (!this.options.threads) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.options.threads;
+  }
+
+  private requireFutex(): FutexProvider | AsyncFutexProvider {
+    if (!this.options.futex) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.options.futex;
   }
 }
 
