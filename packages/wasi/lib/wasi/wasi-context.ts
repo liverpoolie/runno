@@ -5,6 +5,7 @@ import type {
   FileSystemProvider,
   RandomProvider,
   SocketsProvider,
+  TTYProvider,
 } from "../wasix/providers.js";
 
 export type WASIContextOptions = {
@@ -20,6 +21,7 @@ export type WASIContextOptions = {
   random: RandomProvider;
   fsProvider: FileSystemProvider;
   sockets: SocketsProvider;
+  tty: TTYProvider;
 };
 
 /**
@@ -51,6 +53,7 @@ export class WASIContext {
   random?: RandomProvider;
   fsProvider?: FileSystemProvider;
   sockets?: SocketsProvider;
+  tty?: TTYProvider;
 
   constructor(options?: Partial<WASIContextOptions>) {
     this.fs = options?.fs ?? {};
@@ -66,5 +69,6 @@ export class WASIContext {
     this.random = options?.random;
     this.fsProvider = options?.fsProvider;
     this.sockets = options?.sockets;
+    this.tty = options?.tty;
   }
 }
