@@ -23,7 +23,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  resolveWasixIncludeDirs,
+  WASIX_INCLUDE_DIRS,
   WASIX_SUITE_BIN_DIR,
   WASIX_VENDOR_DIR,
 } from "./wasix-suite.constants.ts";
@@ -58,19 +58,24 @@ let built = 0;
 let failed = 0;
 const buildFailures: string[] = [];
 
-const includeDirs = resolveWasixIncludeDirs();
-
-for (const name of includeDirs) {
+for (const name of WASIX_INCLUDE_DIRS) {
   const srcDir = join(vendorRoot, name);
   if (!existsSync(srcDir)) {
-    console.warn(`[build-wasix-suite] skip (missing in vendor): ${name}`);
-    continue;
+    console.error(
+      `[build-wasix-suite] include-list entry missing in vendor: ${name}\n` +
+        "  Update WASIX_INCLUDE_DIRS in wasix-suite.constants.ts or " +
+        "re-run `npm run test:prepare:wasmer`.",
+    );
+    process.exit(1);
   }
 
   const sources = collectSources(srcDir);
   if (sources.length === 0) {
-    console.warn(`[build-wasix-suite] skip (no C sources): ${name}`);
-    continue;
+    console.error(
+      `[build-wasix-suite] include-list entry has no C sources: ${name}\n` +
+        "  Drop it from WASIX_INCLUDE_DIRS or fix the vendored checkout.",
+    );
+    process.exit(1);
   }
 
   const outPath = join(outDir, `${name}.wasm`);

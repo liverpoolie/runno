@@ -1,10 +1,6 @@
 // Constants shared between the build script, the fetch script, and the
-// Playwright spec. Run by Node directly via the built-in TS type-stripping
-// (Node 24+); imported by Playwright's TS pipeline for the spec.
-
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+// Playwright spec. Run by Node directly via `--experimental-strip-types`
+// (Node 22.6+); imported by Playwright's TS pipeline for the spec.
 
 /**
  * Pinned wasmer SHA. To bump:
@@ -27,27 +23,50 @@ export const WASIX_VENDOR_DIR = "tests/wasix-vendor";
  */
 export const WASIX_SUITE_BIN_DIR = "public/bin/wasix-tests";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const pkgDir = resolve(__dirname, "..");
-
 /**
- * Resolve the list of wasmer test directories currently present in the
- * vendored checkout. The fetch script is the source of truth for what
- * exists on disk; this helper reads it back so the build script and the
- * Playwright spec iterate the same set without a hand-maintained list
- * that would drift every time a new test category lands upstream.
+ * Hand-maintained list of `wasmer/tests/wasix/<dir>` test cases the build
+ * harness will compile and the Playwright spec will run.
+ *
+ * The set is the intersection of:
+ *   1. Tests in upstream `wasmer/tests/wasix/` at `WASMER_SHA`.
+ *   2. Tests that compile and link against the wasix-libc sysroot
+ *      shipped by `wasix-org/wasixcc@v0.4.3`. Tests that need
+ *      `fork` / `pthread_create` / `dlopen` / `<dlfcn.h>` are excluded
+ *      because the linkable symbols aren't present in this toolchain
+ *      release. They re-enter the set when the toolchain (or a
+ *      provider) makes them buildable.
+ *
+ * The runtime skip map in `wasix-suite.skip.ts` covers tests that
+ * *do* build but exercise capabilities not yet wired into WASIX
+ * (sockets, signals, etc.).
+ *
+ * Keep alphabetised.
  */
-export function resolveWasixIncludeDirs(): string[] {
-  const root = join(pkgDir, WASIX_VENDOR_DIR, "wasmer", "tests", "wasix");
-  if (!existsSync(root)) return [];
-  const entries: string[] = [];
-  for (const name of readdirSync(root)) {
-    const abs = join(root, name);
-    try {
-      if (statSync(abs).isDirectory()) entries.push(name);
-    } catch {
-      // best effort — skip anything we can't stat
-    }
-  }
-  return entries.sort();
-}
+export const WASIX_INCLUDE_DIRS: readonly string[] = [
+  "closing-pre-opened-dirs",
+  "create-and-remove-dirs",
+  "create-dir-at-cwd",
+  "create-dir-at-cwd-with-chdir",
+  "cross-fs-rename",
+  "cwd-to-home",
+  "distinct-inodes-same-basename",
+  "exception",
+  "fd-close",
+  "fs-mount",
+  "fstatat-with-chdir",
+  "mount-tmp-locally",
+  "msync-end-of-file",
+  "msync-middle-of-file",
+  "msync-start-of-file",
+  "munmap-sync-end-of-file",
+  "munmap-sync-middle-of-file",
+  "munmap-sync-start-of-file",
+  "open-under-file",
+  "popen",
+  "posix_spawn",
+  "pwrite-and-size",
+  "read-after-munmap",
+  "symlink-open-read-write",
+  "udp",
+  "vfork",
+];
