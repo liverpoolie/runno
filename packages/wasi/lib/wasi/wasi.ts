@@ -24,6 +24,7 @@ import type {
   ClockProvider,
   FileSystemProvider,
   RandomProvider,
+  SocketsProvider,
 } from "../wasix/providers.js";
 import { SystemClockProvider } from "../wasix/providers/system-clock.js";
 import { SystemRandomProvider } from "../wasix/providers/system-random.js";
@@ -72,6 +73,7 @@ export class WASI implements SnapshotPreview1 {
   fs: FileSystemProvider;
   clock: ClockProvider;
   random: RandomProvider;
+  sockets?: SocketsProvider;
   hasBeenInitialized: boolean = false;
 
   /**
@@ -115,6 +117,7 @@ export class WASI implements SnapshotPreview1 {
       this.context.fsProvider ?? new WASIDriveFileSystemProvider(this.drive);
     this.clock = this.context.clock ?? new SystemClockProvider();
     this.random = this.context.random ?? new SystemRandomProvider();
+    this.sockets = this.context.sockets;
   }
 
   getImportObject() {
@@ -1514,6 +1517,10 @@ export class WASI implements SnapshotPreview1 {
 
   /**
    * Accept a new incoming connection. Note: This is similar to accept in POSIX.
+   *
+   * Preview1's sock_accept witx returns the new fd via a multi-value tuple
+   * the SnapshotPreview1 interface in this codebase doesn't expose; without
+   * a configured `SocketsProvider` we keep the historical ENOSYS.
    */
   sock_accept(): number {
     return Result.ENOSYS;
@@ -1524,8 +1531,25 @@ export class WASI implements SnapshotPreview1 {
    * though it also supports reading the data into multiple buffers in the
    * manner of readv.
    */
-  sock_recv(): number {
-    return Result.ENOSYS;
+  sock_recv(
+    fd: number,
+    ri_data_ptr: number,
+    ri_data_len: number,
+    ri_flags: number,
+    retptr0: number,
+    retptr1: number,
+  ): number {
+    if (!this.sockets) return Result.ENOSYS;
+    try {
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, ri_data_ptr, ri_data_len);
+      const result = this.sockets.recv(fd, iovs, ri_flags);
+      view.setUint32(retptr0, result.bytesRead, true);
+      view.setUint16(retptr1, result.flags, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
@@ -1533,16 +1557,36 @@ export class WASI implements SnapshotPreview1 {
    * it also supports writing the data from multiple buffers in the manner of
    * writev.
    */
-  sock_send(): number {
-    return Result.ENOSYS;
+  sock_send(
+    fd: number,
+    si_data_ptr: number,
+    si_data_len: number,
+    si_flags: number,
+    retptr0: number,
+  ): number {
+    if (!this.sockets) return Result.ENOSYS;
+    try {
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, si_data_ptr, si_data_len);
+      const written = this.sockets.send(fd, iovs, si_flags);
+      view.setUint32(retptr0, written, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   /**
    * Shut down socket send and receive channels. Note: This is similar to
    * shutdown in POSIX.
    */
-  sock_shutdown(): number {
-    return Result.ENOSYS;
+  sock_shutdown(fd: number, how: number): number {
+    if (!this.sockets) return Result.ENOSYS;
+    try {
+      return this.sockets.shutdown(fd, how);
+    } catch (e) {
+      return this.toErrno(e);
+    }
   }
 
   //
