@@ -12,6 +12,7 @@ import {
   WASIDriveFileSystemProvider,
   HTTPProvider,
   WASIX32v1,
+  LoopbackFabric,
   LoopbackSocketsProvider,
 } from "../lib/main.js";
 import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
@@ -27,6 +28,7 @@ import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
 (window as any)["SeededRandomProvider"] = SeededRandomProvider;
 (window as any)["WASIDriveFileSystemProvider"] = WASIDriveFileSystemProvider;
 (window as any)["HTTPProvider"] = HTTPProvider;
+(window as any)["LoopbackFabric"] = LoopbackFabric;
 (window as any)["LoopbackSocketsProvider"] = LoopbackSocketsProvider;
 
 // Test-only: expose the bridge protocol primitives and `Result` / `WASIXError`
