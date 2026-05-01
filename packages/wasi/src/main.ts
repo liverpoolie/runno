@@ -11,6 +11,7 @@ import {
   SeededRandomProvider,
   WASIDriveFileSystemProvider,
   HTTPProvider,
+  LoopbackFabric,
   LoopbackSocketsProvider,
 } from "../lib/main.js";
 
@@ -25,6 +26,7 @@ import {
 (window as any)["SeededRandomProvider"] = SeededRandomProvider;
 (window as any)["WASIDriveFileSystemProvider"] = WASIDriveFileSystemProvider;
 (window as any)["HTTPProvider"] = HTTPProvider;
+(window as any)["LoopbackFabric"] = LoopbackFabric;
 (window as any)["LoopbackSocketsProvider"] = LoopbackSocketsProvider;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;

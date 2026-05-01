@@ -59,10 +59,15 @@ type ConnectionState = {
   responseDrained: boolean;
   /** True after `shutdown(WR)` — guest will not send more bytes. */
   guestWriteShut: boolean;
-  /** Resolves the next time `outbound` grows or transitions to drained. */
-  outboundChanged: Promise<void>;
-  /** Notify hooks that a new chunk was appended to `outbound`. */
-  notifyOutboundChange: () => void;
+  /** Monotonic counter — bumped every time `outbound` grows or
+   *  transitions to drained. Awaiters in `recv` snapshot this and re-loop
+   *  when the counter advances. Replaces the previous swap-promise design
+   *  which dropped wakeups for any awaiter parked before the swap. */
+  outboundVersion: number;
+  /** Currently-parked `recv` resolvers; `notifyOutboundChange` drains and
+   *  invokes them. Multiple awaiters are supported (cf. streaming
+   *  responses where the host appends chunks across multiple recv calls). */
+  outboundWaiters: Array<() => void>;
   /** Target host, recorded at `connect` time so `send`-time URL building works. */
   targetHost: string;
   /** Target port, recorded at `connect` time. */
@@ -72,6 +77,19 @@ type ConnectionState = {
   /** Peer address — outgoing: the connect target. Incoming-conn: the requester. */
   peer: SockAddr;
 };
+
+function notifyOutboundChange(conn: ConnectionState): void {
+  conn.outboundVersion += 1;
+  const waiters = conn.outboundWaiters;
+  conn.outboundWaiters = [];
+  for (const wake of waiters) wake();
+}
+
+function awaitOutboundChange(conn: ConnectionState): Promise<void> {
+  return new Promise<void>((resolve) => {
+    conn.outboundWaiters.push(resolve);
+  });
+}
 
 export class HTTPProvider implements AsyncSocketsProvider {
   readonly outgoing?: OutgoingHandler;
@@ -186,7 +204,7 @@ export class HTTPProvider implements AsyncSocketsProvider {
         const bytes = await serialiseResponse(response);
         appendOutbound(conn, bytes);
         conn.responseReady = true;
-        conn.notifyOutboundChange();
+        notifyOutboundChange(conn);
       }
     }
 
@@ -210,7 +228,7 @@ export class HTTPProvider implements AsyncSocketsProvider {
         conn.responseDrained = true;
         break;
       }
-      await conn.outboundChanged;
+      await awaitOutboundChange(conn);
     }
     if (conn.outbound.byteLength === 0) {
       return { bytesRead: 0, flags: 0 };
@@ -423,10 +441,6 @@ function makeBlankConnection(fd: number): ConnectionState {
     address: HTTP_LOOPBACK_ADDRESS,
     port: 0,
   };
-  let notifyOutboundChange = () => {};
-  const outboundChanged = new Promise<void>((resolve) => {
-    notifyOutboundChange = resolve;
-  });
   return {
     fd,
     kind: "outgoing-pending",
@@ -435,8 +449,8 @@ function makeBlankConnection(fd: number): ConnectionState {
     responseReady: false,
     responseDrained: false,
     guestWriteShut: false,
-    outboundChanged,
-    notifyOutboundChange,
+    outboundVersion: 0,
+    outboundWaiters: [],
     targetHost: "localhost",
     targetPort: 0,
     local,
@@ -465,14 +479,7 @@ function appendOutbound(conn: ConnectionState, data: Uint8Array): void {
   next.set(conn.outbound, 0);
   next.set(data, conn.outbound.byteLength);
   conn.outbound = next;
-  // Refresh the wakeup latch so a follow-up `recv` after this point can
-  // also block until the next change. The first awaiter is unblocked via
-  // the previous notify.
-  let nextNotify = () => {};
-  conn.outboundChanged = new Promise<void>((resolve) => {
-    nextNotify = resolve;
-  });
-  conn.notifyOutboundChange = nextNotify;
+  notifyOutboundChange(conn);
 }
 
 function scatter(src: Uint8Array, bufs: Uint8Array[]): number {

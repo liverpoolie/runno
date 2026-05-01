@@ -906,6 +906,14 @@ export class WASIX {
     }
   }
 
+  // ABI: 6 i32 args, no `hints_ptr`. Confirmed against wasix-libc's
+  // generated import (`__imported_wasix_32v1_resolve` in
+  // `libc-bottom-half/sources/__wasixlibc_real.c`) and the wasmer host
+  // signature (`lib/wasix/src/syscalls/wasix/resolve.rs`); both expose
+  // (host_ptr, host_len, port, retaddrs_ptr, naddrs_max, retnaddrs_ptr).
+  // The earlier draft of WASIX-PLAN.md listing 7 args with a `hints_ptr`
+  // was wrong. Hints are accepted by the provider for API symmetry but
+  // never reach the wasm boundary in this revision of the spec.
   private wasix_sock_addr_resolve(
     hostPtr: number,
     hostLen: number,

@@ -53,7 +53,10 @@ export type SkipEntry = {
  *     Asyncify, which is the harder blocker so it picks
  *     `requires-asyncify` instead.
  *   - `multi-threading` → `requires-provider-threads`.
- *   - `socket-*`, `sockets` → `requires-provider-sockets`.
+ *   - `socket-*`, `sockets` → `requires-provider-sockets`. As of Slice 5
+ *     these may be drivable by `LoopbackSocketsProvider` in-process;
+ *     the first CI run that builds them with wasixcc should try
+ *     removing those entries to confirm.
  *   - `signals`, `fork-signals` → `requires-provider-signals`.
  *   - `epoll` / `eventfd` / `poll` / `poll-fifo` → poll surface
  *     (`requires-future-feature`).
@@ -254,9 +257,27 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     note: "POSIX shared memory — deferred alongside drive extraction.",
   },
   signals: { reason: "requires-provider-signals" },
-  "socket-tcp": { reason: "requires-provider-sockets" },
-  "socket-udp": { reason: "requires-provider-sockets" },
-  sockets: { reason: "requires-provider-sockets" },
+  "socket-tcp": {
+    reason: "requires-provider-sockets",
+    note:
+      "Slice 5 status: drivable by LoopbackSocketsProvider; remove this " +
+      "entry once a wasixcc-built run confirms it passes. This token is " +
+      "expected to be obsolete for socket-tcp.",
+  },
+  "socket-udp": {
+    reason: "requires-provider-sockets",
+    note:
+      "Slice 5 status: drivable by LoopbackSocketsProvider (DGRAM path); " +
+      "remove this entry once a wasixcc-built run confirms it passes. " +
+      "This token is expected to be obsolete for socket-udp.",
+  },
+  sockets: {
+    reason: "requires-provider-sockets",
+    note:
+      "Slice 5 status: drivable by LoopbackSocketsProvider; remove this " +
+      "entry once a wasixcc-built run confirms it passes. This token is " +
+      "expected to be obsolete for the catch-all `sockets` test.",
+  },
   spawn: { reason: "requires-provider-proc" },
   symlink: {
     reason: "requires-future-feature",
