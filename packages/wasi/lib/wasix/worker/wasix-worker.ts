@@ -326,6 +326,15 @@ async function runGuest(
   const tty: TTYProvider | undefined = asyncSet.has("tty")
     ? bridgeTTYProvider(msg.sharedBuffer)
     : undefined;
+  const threads: ThreadsProvider | undefined = asyncSet.has("threads")
+    ? bridgeThreadsProvider(msg.sharedBuffer)
+    : undefined;
+  const futex: FutexProvider | undefined = asyncSet.has("futex")
+    ? bridgeFutexProvider(msg.sharedBuffer)
+    : undefined;
+  const signals: SignalsProvider | undefined = asyncSet.has("signals")
+    ? stubSignalsProvider()
+    : undefined;
   const sockets: SocketsProvider | undefined = asyncSet.has("sockets")
     ? bridgeSocketsProvider(msg.sharedBuffer)
     : undefined;
@@ -368,6 +377,9 @@ async function runGuest(
     clock,
     random,
     tty,
+    threads,
+    futex,
+    signals,
     sockets,
   });
 
@@ -395,6 +407,119 @@ async function runGuest(
 
 function sendMessage(message: WASIXWorkerHostMessage): void {
   self.postMessage(message);
+}
+
+// ─── ENOSYS stubs for async slots with no opcode this slice ────────────────
+
+function throwEnosys(): never {
+  // ENOSYS — no bridge opcode wired yet for this slot. The guest sees the
+  // appropriate errno via wasix.ts's WASIXError → Result path.
+  throw new WASIXError(Result.ENOSYS);
+}
+
+function stubRandomProvider(): RandomProvider {
+  return { fill: () => throwEnosys() };
+}
+function stubTTYProvider(): TTYProvider {
+  return { get: () => throwEnosys(), set: () => throwEnosys() };
+}
+/**
+ * Bridge-backed sync `ThreadsProvider`. The host's async-capable
+ * provider is awaited on the main thread; the worker stays sync.
+ *
+ * Note: a host that wires a *real* multi-worker threads provider here
+ * must serialise the `wasi_thread_start` invocation in its own worker
+ * pool — the bridge only routes the syscall arguments, not the wasm
+ * call back into the spawned thread. The cooperative provider lives in
+ * the same realm as the guest and never uses this shim.
+ */
+function bridgeThreadsProvider(
+  sharedBuffer: SharedArrayBuffer,
+): ThreadsProvider {
+  const call = <T extends BridgeResponse>(
+    req: Parameters<typeof callBridgeSync>[1],
+  ) => callBridgeSync(sharedBuffer, req) as T;
+  return {
+    spawn(startArg: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SPAWN }>>({
+        opcode: Opcode.THREAD_SPAWN,
+        args: { startArg },
+      });
+      return r.result.tid;
+    },
+    join(tid: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_JOIN }>>({
+        opcode: Opcode.THREAD_JOIN,
+        args: { tid },
+      });
+      return r.result.exitCode;
+    },
+    exit(code: number): void {
+      call<Extract<BridgeResponse, { opcode: Opcode.THREAD_EXIT }>>({
+        opcode: Opcode.THREAD_EXIT,
+        args: { code },
+      });
+    },
+    sleep(durationNs: bigint): void {
+      call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SLEEP }>>({
+        opcode: Opcode.THREAD_SLEEP,
+        args: { durationNs },
+      });
+    },
+    id(): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_ID }>>({
+        opcode: Opcode.THREAD_ID,
+        args: {},
+      });
+      return r.result.tid;
+    },
+    parallelism(): number {
+      const r = call<
+        Extract<BridgeResponse, { opcode: Opcode.THREAD_PARALLELISM }>
+      >({
+        opcode: Opcode.THREAD_PARALLELISM,
+        args: {},
+      });
+      return r.result.value;
+    },
+    signal(tid: number, signo: number): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SIGNAL }>>(
+        {
+          opcode: Opcode.THREAD_SIGNAL,
+          args: { tid, signo },
+        },
+      );
+      return r.result.result;
+    },
+  };
+}
+
+function bridgeFutexProvider(sharedBuffer: SharedArrayBuffer): FutexProvider {
+  const call = <T extends BridgeResponse>(
+    req: Parameters<typeof callBridgeSync>[1],
+  ) => callBridgeSync(sharedBuffer, req) as T;
+  return {
+    wait(addr: number, expected: number, timeoutNs: bigint | null): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.FUTEX_WAIT }>>({
+        opcode: Opcode.FUTEX_WAIT,
+        args: { addr, expected, timeoutNs },
+      });
+      return r.result.value;
+    },
+    wake(addr: number, count: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.FUTEX_WAKE }>>({
+        opcode: Opcode.FUTEX_WAKE,
+        args: { addr, count },
+      });
+      return r.result.woken;
+    },
+  };
+}
+function stubSignalsProvider(): SignalsProvider {
+  return {
+    register: () => throwEnosys(),
+    raiseInterval: () => throwEnosys(),
+  };
 }
 
 /**
