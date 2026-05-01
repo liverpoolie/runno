@@ -1,30 +1,64 @@
 // Skip map for the wasmer/tests/wasix integration suite.
 //
-// Each entry is keyed by the test directory name (matching the `.wasm`
-// stem under `public/bin/wasix-tests/`). Tests listed here are marked
+// Each entry keyed by the test directory name (matching the `.wasm` stem
+// under `public/bin/wasix-tests/`). Tests listed here are marked
 // `test.fixme()` by the Playwright spec with a structured reason token.
 //
-// Reason tokens are drawn from the fixed union below. The token names are
-// a grep contract: `grep requires-provider-sockets` is meant to return
-// every test blocked on that capability so a later change can flip the
-// entries atomically when the provider lands.
+// **Token-discipline rule.** An entry whose reason token does not match
+// its actual blocker is a bug. Fix the token or the underlying provider;
+// don't paper over it. The vocabulary is fixed (see `SkipReason` below);
+// don't invent ad-hoc tokens — if no canonical token fits, the test
+// shouldn't be on this list and the underlying gap deserves its own
+// follow-up issue.
+//
+// The notes are part of the contract too: keep them to a single sentence
+// that names the concrete blocker (e.g. "wasix-libc fork() needs
+// post-fork stack reification, which requires Asyncify"), not a vague
+// "signals don't work".
 
 /**
- * Fixed reason vocabulary. Pick the most specific match. Do **not**
- * extend this union without matching plan + issue discussion — the
- * tokens are shared across the whole suite.
+ * Canonical reason vocabulary. Pick the most specific match.
  *
- * - `requires-asyncify`            — needs Asyncify (e.g. post-fork longjmp).
- * - `requires-provider-sockets`    — needs SocketProvider.
- * - `requires-provider-threads`    — needs ThreadsProvider.
- * - `requires-provider-futex`      — needs FutexProvider.
- * - `requires-provider-signals`    — needs SignalProvider.
- * - `requires-provider-proc`       — needs ProcessProvider / proc_fork /
- *                                    proc_exec / proc_spawn.
- * - `requires-future-feature`      — capability scheduled for a later
- *                                    change where no single provider
- *                                    token fits (e.g. TTY, poll/epoll,
- *                                    drive extraction).
+ * - `requires-asyncify`            — needs Asyncify / JSPI to reify the
+ *                                    guest's call stack from JS
+ *                                    (post-fork resumption, async signal
+ *                                    preemption, cross-frame setjmp/
+ *                                    longjmp). See `WASIX-PLAN.md` §
+ *                                    Future: Asyncify opt-in.
+ * - `requires-provider-sockets`    — needs `SocketsProvider` semantics the
+ *                                    bundled `LoopbackSocketsProvider`
+ *                                    doesn't implement.
+ * - `requires-provider-threads`    — needs `ThreadsProvider` semantics the
+ *                                    bundled `CooperativeThreadsProvider`
+ *                                    doesn't implement.
+ * - `requires-provider-futex`      — needs `FutexProvider` semantics the
+ *                                    bundled `SimulatedFutexProvider`
+ *                                    doesn't implement.
+ * - `requires-provider-signals`    — needs `SignalsProvider` semantics the
+ *                                    bundled `SelfSignalProvider` doesn't
+ *                                    implement.
+ * - `requires-provider-proc`       — needs `ProcProvider` semantics the
+ *                                    bundled `InProcessProcProvider`
+ *                                    doesn't implement.
+ * - `requires-provider-tty`        — needs raw `TTYProvider` ioctl
+ *                                    semantics (pty / line-discipline /
+ *                                    termios) beyond the
+ *                                    `ConsoleTTYProvider` shim.
+ * - `requires-provider-fs`         — needs `FileSystemProvider`
+ *                                    semantics the bundled
+ *                                    `WASIDriveFileSystemProvider`
+ *                                    doesn't implement (hard links,
+ *                                    symlinks, mount tables, /proc, shm).
+ * - `requires-provider-poll`       — needs poll / epoll / eventfd
+ *                                    syscall surface. Not yet wired in
+ *                                    the runtime; an opt-in slot is
+ *                                    likely a future provider extension.
+ * - `requires-wasixcc-build-fix`   — test failed to build under the
+ *                                    pinned wasixcc toolchain. Auto-
+ *                                    populated by `build-wasix-suite.mjs`
+ *                                    at prepare time; do not hand-author
+ *                                    unless triaging a persistent build
+ *                                    failure.
  */
 export type SkipReason =
   | "requires-asyncify"
@@ -33,7 +67,10 @@ export type SkipReason =
   | "requires-provider-futex"
   | "requires-provider-signals"
   | "requires-provider-proc"
-  | "requires-future-feature";
+  | "requires-provider-tty"
+  | "requires-provider-fs"
+  | "requires-provider-poll"
+  | "requires-wasixcc-build-fix";
 
 export type SkipEntry = {
   reason: SkipReason;
@@ -46,293 +83,98 @@ export type SkipEntry = {
  *
  * Keep entries alphabetised; `wasix-suite.spec.ts` reads this map and
  * marks each matching test `test.fixme(true, reason)`.
- *
- * Classification notes:
- *   - `fork*` / `spawn` / `pipe` / `unix-pipe` / `fd-pipe` →
- *     `requires-provider-proc`. `fork-longjmp` additionally needs
- *     Asyncify, which is the harder blocker so it picks
- *     `requires-asyncify` instead.
- *   - `multi-threading` → `requires-provider-threads`.
- *   - `socket-*`, `sockets` → `requires-provider-sockets`. As of Slice 5
- *     these may be drivable by `LoopbackSocketsProvider` in-process;
- *     the first CI run that builds them with wasixcc should try
- *     removing those entries to confirm.
- *   - `signals` — passes under SelfSignalProvider; the entry was
- *     dropped from this map.
- *   - `fork-signals` → `requires-provider-proc` (handlers work
- *     in-process; the test specifically exercises signal delivery
- *     across the fork boundary, which the proc provider lands).
- *   - `epoll` / `eventfd` / `poll` / `poll-fifo` → poll surface
- *     (`requires-future-feature`).
- *   - `tty` / `ptyname` / `ioctl` → TTY work (`requires-future-feature`).
- *   - `link`, `mount`, `readlink`, `symlink`, `shm`, `procfs` → drive
- *     features not yet represented (`requires-future-feature`).
- *   - `close-preopen`, `dup` → fd-table re-binding via `fd_renumber`,
- *     stubbed ENOSYS at the WASIX layer pending the fd-table extraction
- *     (`requires-future-feature`).
  */
-// The remaining FS-category carve-outs hit drive-level limitations that
-// surface only once cwd plumbing lets the binary actually exercise the
-// flat-path WASIDrive (Slice 3.5 added getcwd / chdir / /home preopen,
-// which unblocked the rest of the wasmer cwd tests). The drive will be
-// extracted and grown in a follow-up; until then these stay carved out
-// with the underlying root-cause noted, not the cwd label they used to
-// share.
-const REQUIRES_DRIVE_PATH_NORMALIZATION: SkipEntry = {
-  reason: "requires-future-feature",
-  note:
-    "WASIDrive's flat-path map does not normalise `./` / `/./` segments. " +
-    'wasmer\'s mkdirat(cwd_fd, "./testN") writes /home/./testN/.runno, ' +
-    'which subsequent stat("testN") cannot find. Lifts with the drive ' +
-    "extraction in a later slice.",
-};
-
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
-  // ── Drive-level limitations exposed by cwd plumbing ───────────────
-  "create-dir-at-cwd": REQUIRES_DRIVE_PATH_NORMALIZATION,
-  "create-dir-at-cwd-with-chdir": REQUIRES_DRIVE_PATH_NORMALIZATION,
-  "create-and-remove-dirs": {
-    reason: "requires-future-feature",
-    note:
-      "WASIDrive does not enforce `parent dir must exist` on mkdir — " +
-      'mkdir("test1/test2") succeeds before mkdir("test1"), so the ' +
-      "test fails its first negative assertion. Drive-level fix.",
-  },
-  "closing-pre-opened-dirs": {
-    reason: "requires-future-feature",
-    note:
-      'test closes preopen fds 3-5 then calls opendir("."); wasmer keeps ' +
-      "the cwd preopen accessible via libc-cached state across close, but " +
-      "Runno's drive drops the fd entry on close so the subsequent open " +
-      "fails. Needs the wasmer-style libc preopen retention.",
-  },
-  "open-under-file": {
-    reason: "requires-future-feature",
-    note:
-      'open("parent/child") when `parent` is a regular file should ' +
-      "return ENOTDIR; WASIDrive happily creates the deeper path because " +
-      "the flat-path map does not validate parent type. Drive-level fix.",
-  },
-  "pwrite-and-size": {
-    reason: "requires-future-feature",
-    note:
-      "needs --volume=.:/data preopen mount (the test opens absolute " +
-      "/data/my_file.txt). Single-preopen WASIDrive can't model the " +
-      "wasmer multi-mount layout yet.",
-  },
   "close-preopen": {
-    reason: "requires-future-feature",
-    note:
-      "fd-table re-binding after closing a preopen needs fd_renumber, " +
-      "currently stubbed ENOSYS pending the WASIDrive fd-table extraction.",
+    reason: "requires-provider-fs",
+    note: "fd_renumber across preopened fds needs a mount-table that the bundled WASIDriveFileSystemProvider doesn't model.",
   },
   dup: {
-    reason: "requires-future-feature",
-    note:
-      "dup2 = fd_renumber, deliberately stubbed ENOSYS — fd-table mgmt " +
-      "is co-located with WASIDrive and will lift later.",
-  },
-  "fd-close": {
-    reason: "requires-provider-sockets",
-    note:
-      "test opens a TCP socket via socket(AF_INET, SOCK_STREAM) and " +
-      "expects close(fd) plus EBADF on second close. Needs " +
-      "SocketsProvider + /bin preopen.",
-  },
-  "fs-mount": {
-    reason: "requires-future-feature",
-    note: "mount syscall; Runno has a single preopen root.",
-  },
-  "mount-tmp-locally": {
-    reason: "requires-future-feature",
-    note: "mount syscall; Runno has a single preopen root.",
-  },
-  "msync-end-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
-  },
-  "msync-middle-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
-  },
-  "msync-start-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
-  },
-  "munmap-sync-end-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
-  },
-  "munmap-sync-middle-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
-  },
-  "munmap-sync-start-of-file": {
-    reason: "requires-future-feature",
-    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
-  },
-  popen: {
-    reason: "requires-provider-proc",
-    note: "needs proc_spawn2 + proc_join (proc provider).",
-  },
-  posix_spawn: {
-    reason: "requires-provider-proc",
-    note: "needs proc_spawn2 + proc_join (proc provider).",
-  },
-  "read-after-munmap": {
-    reason: "requires-future-feature",
-    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
-  },
-  "symlink-open-read-write": {
-    reason: "requires-future-feature",
-    note: "symlinks are not represented in WASIDrive.",
-  },
-  udp: {
-    reason: "requires-provider-sockets",
-    note: "raw UDP send/recv — needs SocketsProvider.",
-  },
-  vfork: {
-    reason: "requires-provider-proc",
-    note:
-      "needs proc_fork_env + proc_exec3 (proc provider). Distinct from " +
-      "POSIX vfork — wasix-libc reuses proc_fork semantics.",
+    reason: "requires-provider-fs",
+    note: "fd_renumber / dup2 semantics aren't implemented by the bundled WASIDriveFileSystemProvider.",
   },
   epoll: {
-    reason: "requires-future-feature",
-    note: "epoll surface lands with the poll feature.",
+    reason: "requires-provider-poll",
+    note: "Runtime has no epoll syscall surface; poll/epoll wiring is a future provider extension.",
   },
   eventfd: {
-    reason: "requires-future-feature",
-    note: "eventfd surface lands with the poll feature.",
+    reason: "requires-provider-poll",
+    note: "eventfd is exposed as a poll-eligible fd; runtime has no poll surface yet.",
   },
-  // Slice 8 status: fd-pipe is wired via fd_pipe(__wasi_pipe_t*) and
-  // routes through InProcessProcProvider's pipe broker. Removed from
-  // the skip list — un-skip and let the suite confirm under wasixcc.
   fork: {
-    // proc_fork returns ENOSYS in v1 — the in-process simulation cannot
-    // reify the post-fork call stack from JS. Permanent until Asyncify.
     reason: "requires-asyncify",
-    note:
-      "Slice 8: proc_fork returns ENOSYS (InProcessProcProvider.fork() = " +
-      '{kind: "unsupported"}). Reifying the post-fork call stack from ' +
-      'JS requires Asyncify — see WASIX-PLAN.md § "Why those tests ' +
-      "can't be passed by providers alone\". If this test only checks " +
-      "the ENOSYS return path, it may pass without un-skipping; flag " +
-      "ambiguity on the issue if the wasmer-built binary surfaces a " +
-      "different post-fork pattern.",
+    note: "wasix-libc fork() reifies post-fork guest execution, which JS cannot do without Asyncify (see WASIX-PLAN § Why those tests can't be passed by providers alone).",
   },
   "fork-and-exec": {
-    // fork+exec is the "drop-and-replace" idiom — the post-fork code
-    // does nothing but execve a new image. We could pattern-match this
-    // in a future iteration (issue § Out of scope flags it as
-    // ambiguous); for now, treat as requires-asyncify since the
-    // in-process simulation can't tell ahead of time that the post-
-    // fork path is fork+exec rather than arbitrary post-fork code.
     reason: "requires-asyncify",
-    note:
-      "Slice 8: fork+exec is the drop-and-replace idiom — pattern " +
-      "detection deferred. Today proc_fork returns ENOSYS so this " +
-      "test will fail at the fork() call. Plan-flagged ambiguity " +
-      "noted on the PR.",
+    note: "fork+exec is the drop-and-replace idiom; recognising it before the post-fork code runs would need Asyncify-level introspection.",
   },
   "fork-longjmp": {
-    // Needs both Asyncify (post-fork longjmp) and the process provider.
-    // Asyncify is the harder blocker so it wins the token.
     reason: "requires-asyncify",
-    note: "post-fork longjmp requires Asyncify.",
+    note: "post-fork longjmp requires reifying the guest's call stack, only available under Asyncify.",
   },
   "fork-pipes": {
     reason: "requires-asyncify",
-    note:
-      "Slice 8: relies on post-fork pipe IO. Un-skipping waits on a " +
-      "future Asyncify-backed proc provider that can resume the child " +
-      "post-fork; for now proc_fork = ENOSYS.",
+    note: "post-fork blocking pipe IO requires resuming the child mid-call, which needs Asyncify.",
   },
   "fork-signals": {
     reason: "requires-asyncify",
-    note:
-      "Slice 8: relies on post-fork signal delivery; same Asyncify " +
-      "blocker as the rest of the fork-* family. Cross-pid kill itself " +
-      "is wired (proc_signal -> ProcProvider.kill -> SignalsProvider) " +
-      "and works for spawn-based parents/children that outlive their " +
-      "spawn frame; the fork variant adds the post-fork unwind that " +
-      "remains out-of-reach without Asyncify.",
+    note: "asserts on signal delivery across the post-fork boundary, which needs Asyncify-level resume.",
   },
   ioctl: {
-    reason: "requires-future-feature",
-    note: "TTY ioctls — lands with TTY work.",
+    reason: "requires-provider-tty",
+    note: "TTY ioctls (TIOCGWINSZ / termios) need a raw TTYProvider beyond the ConsoleTTYProvider shim.",
   },
   link: {
-    reason: "requires-future-feature",
-    note: "hard links; WASIDrive has no link table.",
+    reason: "requires-provider-fs",
+    note: "Hard-link bookkeeping isn't modelled by the bundled WASIDriveFileSystemProvider.",
   },
   mount: {
-    reason: "requires-future-feature",
-    note: "mount syscall; Runno has a single preopen root.",
+    reason: "requires-provider-fs",
+    note: "mount syscall needs a multi-volume mount table; the bundled WASIDriveFileSystemProvider exposes a single preopen root.",
   },
-  // multi-threading + condvar removed in Slice 6 — both pass under
-  // CooperativeThreadsProvider + SimulatedFutexProvider.
-  // pipe / unix-pipe / fd-pipe / spawn removed in Slice 8 — the
-  // in-process pipe broker + InProcessProcProvider.spawn() back the
-  // wasix-libc proc/spawn/pipe surface. Tests that depend on
-  // *blocking* pipe IO across the spawn boundary still need the
-  // cooperative-yield path or an async-capable proc provider; flag
-  // those individually if a wasixcc run surfaces failures.
   poll: {
-    reason: "requires-future-feature",
-    note: "poll surface lands with the poll feature.",
+    reason: "requires-provider-poll",
+    note: "Runtime has no poll syscall surface yet.",
   },
   "poll-fifo": {
-    reason: "requires-future-feature",
-    note: "poll surface lands with the poll feature.",
+    reason: "requires-provider-poll",
+    note: "poll-on-fifo path needs the poll syscall surface.",
   },
   procfs: {
-    reason: "requires-future-feature",
-    note: "Wasmer-specific /proc view — deferred alongside drive extraction.",
+    reason: "requires-provider-fs",
+    note: "Wasmer-specific /proc view isn't synthesised by WASIDriveFileSystemProvider.",
   },
   ptyname: {
-    reason: "requires-future-feature",
-    note: "TTY feature — lands with TTY work.",
+    reason: "requires-provider-tty",
+    note: "ptyname() reads /dev/pts entries; needs a raw TTYProvider modelling pty allocation.",
   },
   readlink: {
-    reason: "requires-future-feature",
-    note: "Symlinks are not represented in WASIDrive.",
+    reason: "requires-provider-fs",
+    note: "Symlinks aren't represented by WASIDriveFileSystemProvider.",
   },
   shm: {
-    reason: "requires-future-feature",
-    note: "POSIX shared memory — deferred alongside drive extraction.",
+    reason: "requires-provider-fs",
+    note: "POSIX shared memory needs a /dev/shm-style mount the bundled FS provider doesn't supply.",
   },
-  // signals removed in Slice 7 — handler register + raise + raise_interval
-  // pass under SelfSignalProvider. Sub-tests that require asynchronous
-  // preemption (signal delivered from outside the current syscall frame)
-  // would need Asyncify and remain off-the-table per the plan.
   "socket-tcp": {
     reason: "requires-provider-sockets",
-    note:
-      "Slice 5 status: drivable by LoopbackSocketsProvider; remove this " +
-      "entry once a wasixcc-built run confirms it passes. This token is " +
-      "expected to be obsolete for socket-tcp.",
+    note: "Expected drivable by LoopbackSocketsProvider; if a wasixcc-built run flips it green, drop this entry.",
   },
   "socket-udp": {
     reason: "requires-provider-sockets",
-    note:
-      "Slice 5 status: drivable by LoopbackSocketsProvider (DGRAM path); " +
-      "remove this entry once a wasixcc-built run confirms it passes. " +
-      "This token is expected to be obsolete for socket-udp.",
+    note: "Expected drivable by LoopbackSocketsProvider DGRAM path; if a wasixcc-built run flips it green, drop this entry.",
   },
   sockets: {
     reason: "requires-provider-sockets",
-    note:
-      "Slice 5 status: drivable by LoopbackSocketsProvider; remove this " +
-      "entry once a wasixcc-built run confirms it passes. This token is " +
-      "expected to be obsolete for the catch-all `sockets` test.",
+    note: "Expected drivable by LoopbackSocketsProvider; if a wasixcc-built run flips it green, drop this entry.",
   },
   symlink: {
-    reason: "requires-future-feature",
-    note: "Symlinks are not represented in WASIDrive.",
+    reason: "requires-provider-fs",
+    note: "Symlinks aren't represented by WASIDriveFileSystemProvider.",
   },
   tty: {
-    reason: "requires-future-feature",
-    note: "TTY semantics — lands with TTY work.",
+    reason: "requires-provider-tty",
+    note: "Asserts on TTY mode flags / line-discipline that the ConsoleTTYProvider shim doesn't model.",
   },
 };
