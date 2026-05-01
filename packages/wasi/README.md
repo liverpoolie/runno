@@ -383,9 +383,8 @@ await WASIX.start(
 ```
 
 Both providers are constructor-configurable; everything else about the run is
-already a function of host inputs (args, env, fs, stdin) so swapping clock
-
-- random is sufficient for byte-for-byte reproducibility.
+already a function of host inputs (args, env, fs, stdin) so swapping clock and
+random is sufficient for byte-for-byte reproducibility.
 
 ## wasmer integration suite
 
@@ -399,8 +398,14 @@ report.
 
 <!-- WASIX_SUITE_COUNTS -->
 
-_Run `npm run test:wasix-suite:check-readme` after a wasixcc-built suite run
-to populate this line. CI will print the expected text on first drift._
+0/1 wasmer tests pass, 1 skipped
+
+_The "1 skipped" is the placeholder fixture the spec emits when
+`public/bin/wasix-tests/` is empty. CI currently runs without wasixcc (the
+pinned `wasix-libc` release URL 404s, so the toolchain step warns and exits),
+so the suite has no built binaries. When a wasixcc-built run lands, the drift
+check will fail and force this line to be updated to the real
+`N/M wasmer tests pass, K skipped: <breakdown>` numbers._
 
 <!-- /WASIX_SUITE_COUNTS -->
 

@@ -157,18 +157,6 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-provider-fs",
     note: "POSIX shared memory needs a /dev/shm-style mount the bundled FS provider doesn't supply.",
   },
-  "socket-tcp": {
-    reason: "requires-provider-sockets",
-    note: "Expected drivable by LoopbackSocketsProvider; if a wasixcc-built run flips it green, drop this entry.",
-  },
-  "socket-udp": {
-    reason: "requires-provider-sockets",
-    note: "Expected drivable by LoopbackSocketsProvider DGRAM path; if a wasixcc-built run flips it green, drop this entry.",
-  },
-  sockets: {
-    reason: "requires-provider-sockets",
-    note: "Expected drivable by LoopbackSocketsProvider; if a wasixcc-built run flips it green, drop this entry.",
-  },
   symlink: {
     reason: "requires-provider-fs",
     note: "Symlinks aren't represented by WASIDriveFileSystemProvider.",
