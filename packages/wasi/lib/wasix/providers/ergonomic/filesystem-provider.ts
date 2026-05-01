@@ -1,12 +1,15 @@
-// WASIDriveFileSystemProvider
-//
-// One of the "ergonomic" providers bundled with @runno/wasi. Wraps the
-// existing preview1 WASIDrive in the FileSystemProvider interface so
-// WASIX can serve filesystem syscalls through the same provider
-// substrate as clock / random / etc.
-//
-// Sync throughout. An async variant (for IndexedDB / server-backed
-// filesystems) is layered separately.
+/**
+ * WASIDriveFileSystemProvider — ergonomic FileSystemProvider over WASIDrive.
+ *
+ * Wraps the existing preview1 `WASIDrive` (the in-memory unix-like FS the
+ * WASI surface already exposes) in the raw `FileSystemProvider` interface,
+ * so WASIX can serve filesystem syscalls through the same provider
+ * substrate as clock / random / etc. Use this when the host wants the
+ * default in-memory filesystem under WASIX.
+ *
+ * Sync throughout. Async-capable filesystems (IndexedDB / server-backed)
+ * are out-of-scope here — host implements `FileSystemProvider` directly.
+ */
 
 import { WASIFS } from "../../../types.js";
 import { WASIDrive } from "../../../wasi/wasi-drive.js";
