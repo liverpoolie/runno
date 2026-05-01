@@ -74,7 +74,17 @@ for (const name of includeDirs) {
   }
 
   const outPath = join(outDir, `${name}.wasm`);
-  const args = ["-O2", "-o", outPath, ...sources];
+  // Several upstream wasmer tests call fork() / etc. without including
+  // the right wasix-libc headers. wasixcc's clang (C99+) rejects the
+  // implicit declarations as errors; demote to warnings so the
+  // resulting binaries still link against the wasix-libc symbols.
+  const args = [
+    "-O2",
+    "-Wno-error=implicit-function-declaration",
+    "-o",
+    outPath,
+    ...sources,
+  ];
 
   const result = spawnSync(wasixcc, args, {
     stdio: ["ignore", "inherit", "inherit"],
