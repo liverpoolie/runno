@@ -4,6 +4,7 @@ import type {
   ClockProvider,
   FileSystemProvider,
   RandomProvider,
+  SocketsProvider,
 } from "../wasix/providers.js";
 
 export type WASIContextOptions = {
@@ -18,6 +19,7 @@ export type WASIContextOptions = {
   clock: ClockProvider;
   random: RandomProvider;
   fsProvider: FileSystemProvider;
+  sockets: SocketsProvider;
 };
 
 /**
@@ -48,6 +50,7 @@ export class WASIContext {
   clock?: ClockProvider;
   random?: RandomProvider;
   fsProvider?: FileSystemProvider;
+  sockets?: SocketsProvider;
 
   constructor(options?: Partial<WASIContextOptions>) {
     this.fs = options?.fs ?? {};
@@ -62,5 +65,6 @@ export class WASIContext {
     this.clock = options?.clock;
     this.random = options?.random;
     this.fsProvider = options?.fsProvider;
+    this.sockets = options?.sockets;
   }
 }
