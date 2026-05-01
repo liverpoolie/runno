@@ -1818,9 +1818,22 @@ export class WASIX {
 
   /**
    * `proc_signal` — send a signal to another process. wasix-libc maps
-   * `kill(pid, signo)` here. Self-targeted (`pid === 0` or
-   * `pid === self.id()`) routes through `signals.raise` for in-frame
-   * delivery; cross-pid routes through the proc fabric.
+   * `kill(pid, signo)` here.
+   *
+   * Routing:
+   * - `pid === 0` or `pid === self.id()` — self-kill. Dispatched
+   *   directly through this instance's `signals.raise(signo)` so the
+   *   handler runs **inside** the calling syscall frame (matches the
+   *   Slice 7 in-frame delivery semantics). POSIX would send
+   *   `kill(0, …)` to the whole process group — Runno has no process
+   *   groups, so 0 is treated as "self".
+   * - any other pid — routed through `provider.kill(pid, signo)`. The
+   *   in-process `ProcProvider` resolves `pid → SignalsProvider` from
+   *   the realm-shared proc table, then calls `signalThread(MAIN_TID,
+   *   signo)` on the target's signals provider. This is the **single
+   *   cross-provider interaction** in v1; the coupling is documented
+   *   on `ProcProvider.kill` in `providers.ts`.
+   * - unknown pid — provider returns ESRCH.
    */
   private wasix_proc_signal(pid: number, signo: number): number {
     try {
