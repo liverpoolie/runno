@@ -43,6 +43,7 @@
     "test:prepare:wasmer": "node --experimental-strip-types tests/fetch-wasmer-tests.ts",
     "test:prepare:wasix-suite": "npm run test:prepare:wasmer && node --experimental-strip-types tests/build-wasix-suite.ts",
     "test:prepare": "npm run test:mkdir && npm run test:download && npm run test:cargo && npm run build:tests && npm run test:prepare:wasix-suite",
+    "test:wasix-suite:check-readme": "node tests/check-readme-suite-counts.mjs",
     "wasix:install-tools": "bash tests/install-wasix-tools.sh",
     "test": "playwright test",
     "preview": "vite preview"
