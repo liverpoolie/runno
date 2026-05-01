@@ -14,6 +14,9 @@ import {
   WASIX32v1,
   LoopbackFabric,
   LoopbackSocketsProvider,
+  CooperativeThreadsProvider,
+  SimulatedFutexProvider,
+  startThread,
 } from "../lib/main.js";
 import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
 
@@ -30,6 +33,9 @@ import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
 (window as any)["HTTPProvider"] = HTTPProvider;
 (window as any)["LoopbackFabric"] = LoopbackFabric;
 (window as any)["LoopbackSocketsProvider"] = LoopbackSocketsProvider;
+(window as any)["CooperativeThreadsProvider"] = CooperativeThreadsProvider;
+(window as any)["SimulatedFutexProvider"] = SimulatedFutexProvider;
+(window as any)["startThread"] = startThread;
 
 // Test-only: expose the bridge protocol primitives and `Result` / `WASIXError`
 // for the targeted bridge spec. `src/main.ts` is dev-server-only (not part of
