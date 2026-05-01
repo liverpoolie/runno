@@ -2,7 +2,7 @@
 
 There are a bunch of different WASI runners out there, some of them even work in
 the browser. This one is focused on sandboxed emulation. Not system integration.
-It has been developed for the particular requirements of [Runno](runno.dev),
+It has been developed for the particular requirements of [Runno](https://runno.dev),
 but you may find it useful as well.
 
 This package allows you to run WASI binaries on the web with an emulated
