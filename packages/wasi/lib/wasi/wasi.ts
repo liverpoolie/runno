@@ -19,6 +19,7 @@ import { Whence as UnstableWhence } from "./unstable.js";
 import { WASIExecutionResult } from "../types.js";
 import { WASIContext, WASIContextOptions } from "./wasi-context.js";
 import { DriveStat, WASIDrive } from "./wasi-drive.js";
+import { readIOVectors, readString } from "../wasi-shared/memory.js";
 
 /** Injects a function between implementation and return for debugging */
 export type DebugFn = (
@@ -1104,9 +1105,7 @@ export class WASI implements SnapshotPreview1 {
     const createFilestatFn =
       version === "unstable" ? createUnstableFilestat : createFilestat;
 
-    const path = new TextDecoder().decode(
-      new Uint8Array(this.memory.buffer, path_ptr, path_len).slice(),
-    );
+    const path = readString(this.memory, path_ptr, path_len);
 
     pushDebugData({ path });
 
@@ -1155,9 +1154,7 @@ export class WASI implements SnapshotPreview1 {
       modificationTime = new Date();
     }
 
-    const path = new TextDecoder().decode(
-      new Uint8Array(this.memory.buffer, path_ptr, path_len).slice(),
-    );
+    const path = readString(this.memory, path_ptr, path_len);
 
     if (accessTime) {
       const result = this.drive.pathSetAccessTime(fd, path, accessTime);
@@ -1545,51 +1542,6 @@ class WASIExit extends Error {
 
     this.code = code;
   }
-}
-
-/**
- * Reads a string from WASM memory.
- *
- * @param memory WebAssembly Memory
- * @param ptr the offset in the memory where the string starts
- * @param len the length of the string
- * @returns the string at that address
- */
-function readString(memory: WebAssembly.Memory, ptr: number, len: number) {
-  // Copy before decoding so callers with a SharedArrayBuffer-backed
-  // memory (WASIX guests) don't trip TextDecoder's "shared view"
-  // rejection. Cheap for typical preview1 paths (single short read).
-  return new TextDecoder().decode(
-    new Uint8Array(memory.buffer, ptr, len).slice(),
-  );
-}
-
-/**
- * Turns an IO Vectors pointer and length and converts these into Uint8Arrays
- * for convenient read/write.
- *
- * @param view
- * @param iovs_ptr
- * @param iovs_len
- * @returns
- */
-function readIOVectors(
-  view: DataView,
-  iovs_ptr: number,
-  iovs_len: number,
-): Array<Uint8Array> {
-  let result = Array<Uint8Array>(iovs_len);
-
-  for (let i = 0; i < iovs_len; i++) {
-    const bufferPtr = view.getUint32(iovs_ptr, true);
-    iovs_ptr += 4;
-
-    const bufferLen = view.getUint32(iovs_ptr, true);
-    iovs_ptr += 4;
-
-    result[i] = new Uint8Array(view.buffer, bufferPtr, bufferLen);
-  }
-  return result;
 }
 
 type Subscription = {
