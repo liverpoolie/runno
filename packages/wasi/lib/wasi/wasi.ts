@@ -332,10 +332,12 @@ export class WASI implements SnapshotPreview1 {
    * Translate a provider-thrown value into a preview1 errno. WASIX uses
    * the same numeric Result values as preview1, so a `WASIXError` round-
    * trips through `as unknown as Result`. Any other thrown value becomes
-   * `EIO` (matches the WASIX `mapError` boundary).
+   * `EIO` and is forwarded to `context.debug` so unexpected throws
+   * surface in tracing — matching the WASIX `mapError` boundary.
    */
-  private toErrno(e: unknown): Result {
+  private toErrno(e: unknown, name: string = "wasi"): Result {
     if (e instanceof WASIXError) return e.result as unknown as Result;
+    this.context.debug?.(name, [], Result.EIO, [{ error: String(e) }]);
     return Result.EIO;
   }
 
