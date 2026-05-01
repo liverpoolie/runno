@@ -32,6 +32,7 @@ import { test, expect } from "@playwright/test";
 
 import type {
   CooperativeThreadsProvider,
+  InProcessProcProvider,
   SelfSignalProvider,
   SimulatedFutexProvider,
   WASIX,
@@ -241,6 +242,21 @@ const WORKER_MODE_THREADING_SKIPS = new Set<string>([
   "example-multi-threading",
 ]);
 
+/**
+ * Tests that need the `InProcessProcProvider` — pipes / spawn / exec.
+ * Worker mode runs without a proc provider in this slice (the in-
+ * process simulation is realm-local; an async-capable `ProcProvider`
+ * routed through the worker bridge is out-of-scope). These tests are
+ * marked `test.fixme` in worker mode so the suite still surfaces the
+ * pass / fail story for main mode.
+ */
+const WORKER_MODE_PROC_SKIPS = new Set<string>([
+  "fd-pipe",
+  "pipe",
+  "unix-pipe",
+  "spawn",
+]);
+
 test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
   test("at least one wasix-suite binary was built", () => {
     expect(
@@ -291,6 +307,16 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
           });
           test.fixme(true, "wasix-skip:requires-cooperative-realm");
         }
+        if (mode === "worker" && WORKER_MODE_PROC_SKIPS.has(name)) {
+          test.info().annotations.push({
+            type: "wasix-skip",
+            description:
+              "requires-cooperative-realm — InProcessProcProvider is realm-" +
+              "local; worker mode would need an async-capable ProcProvider " +
+              "wired through the bridge.",
+          });
+          test.fixme(true, "wasix-skip:requires-cooperative-realm");
+        }
 
         const result = await page.evaluate(
           async (input: { plan: TestPlan; mode: WASIXSuiteMode }) => {
@@ -309,6 +335,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               CooperativeThreadsProvider: typeof CooperativeThreadsProvider;
               SimulatedFutexProvider: typeof SimulatedFutexProvider;
               SelfSignalProvider: typeof SelfSignalProvider;
+              InProcessProcProvider: typeof InProcessProcProvider;
             };
 
             // Seed a fresh WASIFS under /home for this run — the wasmer
@@ -348,6 +375,14 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
             // `proc_raise_interval`, `thread_signal`). Default-ignored
             // for tests that never register a handler — costs nothing.
             const signals = new w.SelfSignalProvider();
+            // Slice 8: InProcessProcProvider serves proc_id / proc_parent
+            // / proc_spawn / proc_exec / proc_join / fd_pipe and the
+            // cross-pid kill path (proc_signal -> ProcProvider.kill ->
+            // SignalsProvider). Realm-local — children share this JS
+            // realm with the parent. proc_fork stays ENOSYS.
+            const proc = new w.InProcessProcProvider({
+              selfSignals: signals,
+            });
 
             if (input.mode === "main") {
               const wasiResult = await w.WASIX.start(
@@ -366,6 +401,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
                   threads,
                   futex,
                   signals,
+                  proc,
                 }),
               );
               return { exitCode: wasiResult.exitCode, stdout, stderr };
