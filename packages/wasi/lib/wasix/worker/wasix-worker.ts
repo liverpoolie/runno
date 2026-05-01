@@ -737,3 +737,14 @@ function scatterIntoIovecs(src: Uint8Array, bufs: Uint8Array[]): number {
   }
   return written;
 }
+function stubProcProvider(): ProcProvider {
+  return {
+    id: () => throwEnosys(),
+    parentId: () => throwEnosys(),
+    fork: () => throwEnosys(),
+    spawn: () => throwEnosys(),
+    exec: () => throwEnosys(),
+    join: () => throwEnosys(),
+    kill: () => throwEnosys(),
+  };
+}

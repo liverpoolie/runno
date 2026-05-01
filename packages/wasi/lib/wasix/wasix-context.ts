@@ -3,6 +3,7 @@ import {
   ClockProvider,
   FileSystemProvider,
   FutexProvider,
+  ProcFdTableSlot,
   ProcProvider,
   RandomProvider,
   SignalsProvider,
@@ -62,6 +63,19 @@ export type WASIXContextOptions = {
   // runtime constructs new ones to match the import descriptor.
   memory?: WebAssembly.Memory;
   indirectFunctionTable?: WebAssembly.Table;
+
+  /**
+   * fd-table slots inherited from a parent process via `proc_spawn` /
+   * `proc_exec`. Resolved at `WASIX.start()` once the pipe table /
+   * filesystem are wired. Root processes leave this unset.
+   *
+   * Each slot is plain-data — pipe ends are referenced by an opaque
+   * `pipeId` that the runtime resolves through the proc provider's
+   * pipe broker. Slots referencing parent fds beyond stdio (`fs`
+   * action) are honoured only for fds that exist in the shared
+   * filesystem provider; child sees the same fd numbers as the parent.
+   */
+  inheritedFdTable?: ProcFdTableSlot[];
 };
 
 /**
@@ -97,6 +111,8 @@ export class WASIXContext {
   memory?: WebAssembly.Memory;
   indirectFunctionTable?: WebAssembly.Table;
 
+  inheritedFdTable?: ProcFdTableSlot[];
+
   constructor(options?: Partial<WASIXContextOptions>) {
     this.fs = options?.fs ?? new WASIDriveFileSystemProvider({});
     this.args = options?.args ?? [];
@@ -119,5 +135,7 @@ export class WASIXContext {
 
     this.memory = options?.memory;
     this.indirectFunctionTable = options?.indirectFunctionTable;
+
+    this.inheritedFdTable = options?.inheritedFdTable;
   }
 }
