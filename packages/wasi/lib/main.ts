@@ -26,6 +26,7 @@ export {
 } from "./wasix/providers/loopback-sockets.js";
 export { CooperativeThreadsProvider } from "./wasix/providers/cooperative-threads.js";
 export { SimulatedFutexProvider } from "./wasix/providers/simulated-futex.js";
+export { SelfSignalProvider } from "./wasix/providers/self-signal.js";
 export { startThread } from "./wasix/thread-start.js";
 export type { ThreadStartResult } from "./wasix/thread-start.js";
 export type {
@@ -35,6 +36,7 @@ export type {
   ThreadsProvider,
   FutexProvider,
   SignalsProvider,
+  SignalHandler,
   SocketsProvider,
   ProcProvider,
   FileSystemProvider,
