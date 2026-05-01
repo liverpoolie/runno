@@ -223,14 +223,207 @@ provide can be accessed by the WASI binary, with all permissions.
 
 ## Which WASI standards are supported?
 
-Currently `@runno/wasi` supports running only `unstable` and `snapshot-preview1`
-WASI binaries. The `snapshot-preview1` standard is more recent, and preferred.
-Additionally its likely some details of `unstable` have been missed. If you spot
-these, please file a bug.
+Currently `@runno/wasi` supports running `unstable`, `snapshot-preview1`, and
+`wasix_32v1`. The `snapshot-preview1` standard is more recent than `unstable`,
+and preferred. WASIX (`wasix_32v1`) is supported via the provider model
+described in the [WASIX](#wasix) section below; existing preview1 / unstable
+binaries continue to work unchanged.
 
-Other extension standards like WASMEdge, and WASIX are currently not supported,
-but could be. WASI Modules are also not supported, but I'm interested in
-learning more about them.
+Other extension standards like WASMEdge are currently not supported. WASI
+Modules are also not supported, but I'm interested in learning more about
+them.
+
+# WASIX
+
+`@runno/wasi` runs `wasix_32v1` binaries through the same sandbox philosophy
+as the existing WASI surface: the runtime marshals between Wasm memory and JS
+plain-data shapes, and the host supplies every syscall semantic via a
+pluggable provider. The runtime never performs a real syscall — there is no
+real socket, no real thread, no real `proc_fork`. Hosts simulate.
+
+Because semantics are entirely host-supplied, swapping the bundled
+`SystemClockProvider` for `FixedClockProvider` (or `SystemRandomProvider` for
+`SeededRandomProvider`) makes a run reproducible without touching the runtime.
+Determinism is a knob, not a build mode.
+
+See [`WASIX-PLAN.md`](./WASIX-PLAN.md) for the full design doc.
+
+## Quickstart — `WASIX.start`
+
+```js
+import { WASIX, WASIXContext } from "@runno/wasi";
+
+const result = await WASIX.start(
+  fetch("/wasix-binary.wasm"),
+  new WASIXContext({
+    args: ["wasix-binary"],
+    env: { LANG: "en_US.UTF-8" },
+    stdout: (out) => console.log(out),
+    stderr: (err) => console.error(err),
+    stdin: () => null,
+    fs: {},
+    // No providers passed → defaults give system clock + system random;
+    // every other syscall slot returns ENOSYS.
+  }),
+);
+```
+
+`WASIX.start(...)` runs on the main thread. Every provider it accepts is
+synchronous — passing an async-capable provider here is a type error. For
+async providers (HTTP, IndexedDB-backed FS), use `WASIXWorkerHost` below.
+
+## Worker mode — `WASIXWorkerHost`
+
+`WASIXWorkerHost` runs the guest in a dedicated worker and bridges syscalls
+back to the main thread, so its provider slots accept async-capable variants
+(e.g. `HTTPProvider`).
+
+```js
+import { WASIXWorkerHost, HTTPProvider } from "@runno/wasi";
+
+const host = new WASIXWorkerHost("/wasix-binary.wasm", {
+  args: ["wasix-binary"],
+  fs: {},
+  stdout: (out) => console.log(out),
+  stderr: (err) => console.error(err),
+  stdin: () => null,
+  sockets: new HTTPProvider({
+    outgoing: (request) => fetch(request),
+  }),
+});
+
+const result = await host.start();
+```
+
+Worker mode requires `SharedArrayBuffer`, which needs the page to be
+[Cross-Origin Isolated](#cross-origin-headers). Async-capable provider
+methods may return either a value or a `Promise`; the bridge awaits the
+Promise and feeds the resolved value into the inner sync runtime.
+
+## Provider model — raw vs ergonomic
+
+Every WASIX syscall family routes through a provider slot on `WASIXContext`.
+The runtime offers two levels of engagement:
+
+- **Raw providers** stay close to the WASIX ABI (fds, `sockaddr`, signo).
+  Implement them when you want deep control — a host that wires real OS
+  sockets, real OS threads, etc.
+- **Ergonomic providers** wrap raw providers in web-native shapes (Fetch
+  Requests / Responses, the existing `WASIDrive`, the legacy stdio
+  callbacks). Drop one in when its assumptions match your host.
+
+Both levels coexist — using `HTTPProvider` for sockets while implementing
+`SocketsProvider` for UDP is normal.
+
+### Raw providers
+
+Each row links to the interface and the bundled simulation that drives the
+wasmer integration suite under `WASIX.start` defaults.
+
+| Interface                                        | Bundled simulation                                                                                                                 |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| [`ClockProvider`](./lib/wasix/providers.ts)      | [`SystemClockProvider`](./lib/wasix/providers/system-clock.ts), [`FixedClockProvider`](./lib/wasix/providers/fixed-clock.ts)       |
+| [`RandomProvider`](./lib/wasix/providers.ts)     | [`SystemRandomProvider`](./lib/wasix/providers/system-random.ts), [`SeededRandomProvider`](./lib/wasix/providers/seeded-random.ts) |
+| [`TTYProvider`](./lib/wasix/providers.ts)        | (no bundled simulation; use `ConsoleTTYProvider`)                                                                                  |
+| [`ThreadsProvider`](./lib/wasix/providers.ts)    | [`CooperativeThreadsProvider`](./lib/wasix/providers/cooperative-threads.ts)                                                       |
+| [`FutexProvider`](./lib/wasix/providers.ts)      | [`SimulatedFutexProvider`](./lib/wasix/providers/simulated-futex.ts)                                                               |
+| [`SignalsProvider`](./lib/wasix/providers.ts)    | [`SelfSignalProvider`](./lib/wasix/providers/self-signal.ts)                                                                       |
+| [`SocketsProvider`](./lib/wasix/providers.ts)    | [`LoopbackSocketsProvider`](./lib/wasix/providers/loopback-sockets.ts)                                                             |
+| [`ProcProvider`](./lib/wasix/providers.ts)       | [`InProcessProcProvider`](./lib/wasix/providers/in-process-proc.ts)                                                                |
+| [`FileSystemProvider`](./lib/wasix/providers.ts) | (drive lives behind `WASIDriveFileSystemProvider`)                                                                                 |
+
+### Ergonomic providers
+
+| Class                                                                                   | Use when                                                                                                                        |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| [`HTTPProvider`](./lib/wasix/providers/ergonomic/http-provider.ts)                      | The host wants to expose HTTP via Fetch — guest socket calls translate to `Request` / `Response` pairs. Worker-only (async).    |
+| [`WASIDriveFileSystemProvider`](./lib/wasix/providers/ergonomic/filesystem-provider.ts) | The host wants the existing in-memory `WASIDrive` (the same FS the WASI surface uses) backing WASIX file syscalls. Sync.        |
+| [`ConsoleTTYProvider`](./lib/wasix/providers/ergonomic/console-tty-provider.ts)         | The host already wires `stdin` / `stdout` / `stderr` / `isTTY` callbacks the WASI way and wants a `TTYProvider` for free. Sync. |
+
+## Bundled simulations
+
+Runno ships the simulation set the wasmer integration suite runs against.
+None of them touch the host OS — they exist to let WASIX binaries make
+forward progress in a sandbox.
+
+| Simulation                                                                   | What it simulates / what it deliberately doesn't                                                                                                                                          |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`SystemClockProvider`](./lib/wasix/providers/system-clock.ts)               | `Date.now()` / `performance.now()`. Does **not** expose finer-grained CPU-time clocks.                                                                                                    |
+| [`SystemRandomProvider`](./lib/wasix/providers/system-random.ts)             | `crypto.getRandomValues()`. Non-deterministic by design.                                                                                                                                  |
+| [`FixedClockProvider`](./lib/wasix/providers/fixed-clock.ts)                 | Pinned epoch + tickable monotonic for replay. Does **not** model wall-clock drift.                                                                                                        |
+| [`SeededRandomProvider`](./lib/wasix/providers/seeded-random.ts)             | SFC32 PRNG keyed by an integer seed. Does **not** provide cryptographic randomness.                                                                                                       |
+| [`CooperativeThreadsProvider`](./lib/wasix/providers/cooperative-threads.ts) | Single-threaded round-robin scheduling. Does **not** preempt; does **not** provide actual parallelism (`parallelism()` returns 1).                                                        |
+| [`SimulatedFutexProvider`](./lib/wasix/providers/simulated-futex.ts)         | In-memory wait queues keyed by `(memory, addr)`. Does **not** wake waiters across worker boundaries.                                                                                      |
+| [`LoopbackSocketsProvider`](./lib/wasix/providers/loopback-sockets.ts)       | In-process TCP/UDP fabric where listeners and connectors registered on the same instance can speak to each other. Does **not** reach off-realm.                                           |
+| [`SelfSignalProvider`](./lib/wasix/providers/self-signal.ts)                 | Synchronous signal handler dispatch driven by the guest's own `proc_raise` / `raise_interval` / `signal_thread` calls. Does **not** preempt running guest code.                           |
+| [`InProcessProcProvider`](./lib/wasix/providers/in-process-proc.ts)          | `proc_spawn` / `proc_exec` / `proc_join` / pipes by running children as fresh `WASIX` instances in the same JS realm. Does **not** support `proc_fork` (returns ENOSYS — needs Asyncify). |
+| [`PipeRingBuffer`, `createPipe`](./lib/wasix/providers/pipes.ts)             | SPSC ring buffers for the in-process proc simulation. Does **not** block — empty reads with the writer open throw `EAGAIN`.                                                               |
+
+## Determinism
+
+The default providers (`SystemClockProvider`, `SystemRandomProvider`) are
+non-deterministic. To pin a run, swap them in `WASIXContext`:
+
+```js
+import {
+  WASIX,
+  WASIXContext,
+  FixedClockProvider,
+  SeededRandomProvider,
+} from "@runno/wasi";
+
+await WASIX.start(
+  fetch("/wasix-binary.wasm"),
+  new WASIXContext({
+    // ...
+    clock: new FixedClockProvider(0n),
+    random: new SeededRandomProvider(42),
+  }),
+);
+```
+
+Both providers are constructor-configurable; everything else about the run is
+already a function of host inputs (args, env, fs, stdin) so swapping clock
+
+- random is sufficient for byte-for-byte reproducibility.
+
+## wasmer integration suite
+
+WASIX is validated against
+[`wasmerio/wasix-integration-tests`](https://github.com/wasmerio/wasix-integration-tests),
+a pinned upstream suite. CI runs it under the bundled simulation set in both
+main and worker mode; the table below tracks the latest counts. The
+[`tests/check-readme-suite-counts.mjs`](./tests/check-readme-suite-counts.mjs)
+script (run in CI) fails the build if this line drifts from the Playwright
+report.
+
+<!-- WASIX_SUITE_COUNTS -->
+
+_Run `npm run test:wasix-suite:check-readme` after a wasixcc-built suite run
+to populate this line. CI will print the expected text on first drift._
+
+<!-- /WASIX_SUITE_COUNTS -->
+
+Skip-reason vocabulary (the tokens after the colon above):
+
+- `requires-asyncify` — needs Asyncify / JSPI to reify the guest's call
+  stack from JS (post-fork resumption, async signal preemption, cross-frame
+  setjmp/longjmp). See `WASIX-PLAN.md` § _Future: Asyncify opt-in_.
+- `requires-provider-*` — host has not wired the named provider; the
+  bundled simulation cannot drive the test.
+- `requires-wasixcc-build-fix` — test failed to build under the pinned
+  wasixcc toolchain; tracked upstream.
+
+## Roadmap
+
+- **Asyncify opt-in** — lift the `requires-asyncify` skips by running the
+  Binaryen pass on the guest at load time. See
+  [`WASIX-PLAN.md` § Future: Asyncify opt-in](./WASIX-PLAN.md#future-asyncify-opt-in).
+- **`wasix_64v1`** — Memory64 / wasm64 variant. Deferred per
+  [`WASIX-PLAN.md` § Non-goals](./WASIX-PLAN.md#scope) until toolchain output
+  drives demand.
+- **Real-world providers** (Node sockets, IndexedDB FS, native threads).
+  Host responsibility — Runno is a sandbox and does not ship them.
 
 # Contributing
 
