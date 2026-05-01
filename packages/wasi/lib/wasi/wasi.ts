@@ -20,6 +20,10 @@ import { WASIExecutionResult } from "../types.js";
 import { WASIContext, WASIContextOptions } from "./wasi-context.js";
 import { DriveStat, WASIDrive } from "./wasi-drive.js";
 import { readIOVectors, readString } from "../wasi-shared/memory.js";
+import type { ClockProvider, RandomProvider } from "../wasix/providers.js";
+import { SystemClockProvider } from "../wasix/providers/system-clock.js";
+import { SystemRandomProvider } from "../wasix/providers/system-random.js";
+import { ClockId } from "../wasix/wasix-32v1.js";
 
 /** Injects a function between implementation and return for debugging */
 export type DebugFn = (
@@ -60,6 +64,8 @@ export class WASI implements SnapshotPreview1 {
   memory!: WebAssembly.Memory;
   context: WASIContext;
   drive: WASIDrive;
+  clock: ClockProvider;
+  random: RandomProvider;
   hasBeenInitialized: boolean = false;
 
   /**
@@ -99,6 +105,8 @@ export class WASI implements SnapshotPreview1 {
   constructor(context: Partial<WASIContextOptions>) {
     this.context = new WASIContext(context);
     this.drive = new WASIDrive(this.context.fs);
+    this.clock = this.context.clock ?? new SystemClockProvider();
+    this.random = this.context.random ?? new SystemRandomProvider();
   }
 
   getImportObject() {
@@ -363,7 +371,11 @@ export class WASI implements SnapshotPreview1 {
       case Clock.PROCESS_CPUTIME_ID:
       case Clock.THREAD_CPUTIME_ID: {
         const view = new DataView(this.memory.buffer);
-        view.setBigUint64(retptr0, BigInt(1e6), true);
+        view.setBigUint64(
+          retptr0,
+          this.clock.resolution(id as unknown as ClockId),
+          true,
+        );
         return Result.SUCCESS;
       }
     }
@@ -381,7 +393,11 @@ export class WASI implements SnapshotPreview1 {
       case Clock.PROCESS_CPUTIME_ID:
       case Clock.THREAD_CPUTIME_ID: {
         const view = new DataView(this.memory.buffer);
-        view.setBigUint64(retptr0, dateToNanoseconds(new Date()), true);
+        view.setBigUint64(
+          retptr0,
+          this.clock.now(id as unknown as ClockId),
+          true,
+        );
         return Result.SUCCESS;
       }
     }
@@ -446,7 +462,7 @@ export class WASI implements SnapshotPreview1 {
    */
   random_get(buffer_ptr: number, buffer_len: number): number {
     const buffer = new Uint8Array(this.memory.buffer, buffer_ptr, buffer_len);
-    globalThis.crypto.getRandomValues(buffer);
+    this.random.fill(buffer);
     return Result.SUCCESS;
   }
 
@@ -718,13 +734,14 @@ export class WASI implements SnapshotPreview1 {
           path = "/dev/undefined";
           break;
       }
+      const now = nanosecondsToDate(this.clock.now(ClockId.REALTIME));
       const buffer = createFilestatFn({
         path,
         byteLength: 0,
         timestamps: {
-          access: new Date(),
-          modification: new Date(),
-          change: new Date(),
+          access: now,
+          modification: now,
+          change: now,
         },
         type: FileType.CHARACTER_DEVICE,
       });
@@ -780,7 +797,7 @@ export class WASI implements SnapshotPreview1 {
       accessTime = nanosecondsToDate(atim);
     }
     if (fst_flags & FileStatTimestampFlags.ATIM_NOW) {
-      accessTime = new Date();
+      accessTime = nanosecondsToDate(this.clock.now(ClockId.REALTIME));
     }
 
     let modificationTime: Date | null = null;
@@ -788,7 +805,7 @@ export class WASI implements SnapshotPreview1 {
       modificationTime = nanosecondsToDate(mtim);
     }
     if (fst_flags & FileStatTimestampFlags.MTIM_NOW) {
-      modificationTime = new Date();
+      modificationTime = nanosecondsToDate(this.clock.now(ClockId.REALTIME));
     }
 
     if (accessTime) {
@@ -1143,7 +1160,7 @@ export class WASI implements SnapshotPreview1 {
       accessTime = nanosecondsToDate(atim);
     }
     if (fst_flags & FileStatTimestampFlags.ATIM_NOW) {
-      accessTime = new Date();
+      accessTime = nanosecondsToDate(this.clock.now(ClockId.REALTIME));
     }
 
     let modificationTime: Date | null = null;
@@ -1151,7 +1168,7 @@ export class WASI implements SnapshotPreview1 {
       modificationTime = nanosecondsToDate(mtim);
     }
     if (fst_flags & FileStatTimestampFlags.MTIM_NOW) {
-      modificationTime = new Date();
+      modificationTime = nanosecondsToDate(this.clock.now(ClockId.REALTIME));
     }
 
     const path = readString(this.memory, path_ptr, path_len);
@@ -1301,7 +1318,7 @@ export class WASI implements SnapshotPreview1 {
         in_ptr + i * SUBSCRIPTION_SIZE,
         SUBSCRIPTION_SIZE,
       );
-      const subscription = readSubscription(subscriptionBuffer);
+      const subscription = readSubscription(subscriptionBuffer, this.clock);
 
       const eventBuffer = new Uint8Array(
         this.memory.buffer,
@@ -1312,7 +1329,10 @@ export class WASI implements SnapshotPreview1 {
       let result: Result = Result.SUCCESS;
       switch (subscription.type) {
         case EventType.CLOCK:
-          while (new Date() < subscription.timeout) {
+          while (
+            nanosecondsToDate(this.clock.now(ClockId.REALTIME)) <
+            subscription.timeout
+          ) {
             // Wait until we hit the event time
           }
           eventBuffer.set(
@@ -1583,7 +1603,10 @@ type FDReadWriteSubscription = {
  *
  * @param buffer
  */
-function readSubscription(buffer: Uint8Array): Subscription {
+function readSubscription(
+  buffer: Uint8Array,
+  clock: ClockProvider,
+): Subscription {
   const userdata = new Uint8Array(8);
   userdata.set(buffer.subarray(0, 8));
 
@@ -1601,7 +1624,7 @@ function readSubscription(buffer: Uint8Array): Subscription {
       };
     case EventType.CLOCK:
       const flags = view.getUint16(24, true);
-      const currentTimeNanos = dateToNanoseconds(new Date());
+      const currentTimeNanos = clock.now(ClockId.REALTIME);
       const timeoutRawNanos = view.getBigUint64(8, true);
       const precisionNanos = view.getBigUint64(16, true);
 
