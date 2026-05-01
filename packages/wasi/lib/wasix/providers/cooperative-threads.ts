@@ -100,6 +100,7 @@ export class CooperativeThreadsProvider implements ThreadsProvider {
   private currentTid: number = MAIN_TID;
   private virtualClockNs: bigint = 0n;
   private threadStart?: (tid: number, startArg: number) => void;
+  private signalDrain?: (tid: number) => void;
 
   constructor() {
     this.records.set(MAIN_TID, {
@@ -117,6 +118,18 @@ export class CooperativeThreadsProvider implements ThreadsProvider {
 
   setThreadStart(fn: (tid: number, startArg: number) => void): void {
     this.threadStart = fn;
+  }
+
+  /**
+   * Register a per-yield-point pending-signal drain callback. Slice 7
+   * wires `SelfSignalProvider.drainPending` here so signals enqueued
+   * via `signalThread` reach the target TID at its next runnable
+   * transition. Calling this is optional — without it, the scheduler
+   * never invokes drain, and `signalThread` simply queues forever
+   * (matches POSIX SIG_IGN semantics for the wasmer suite tests).
+   */
+  setSignalDrain(fn: (tid: number) => void): void {
+    this.signalDrain = fn;
   }
 
   spawn(startArg: number): number {
@@ -319,6 +332,12 @@ export class CooperativeThreadsProvider implements ThreadsProvider {
     if (me && me.status !== "exited") {
       me.status = "running";
     }
+    // Slice 7: drain any pending signals enqueued for the resumed
+    // thread before returning into its syscall site. This is the
+    // mirror of `runThread`'s drain — that path runs for spawned
+    // threads, this one runs when the calling thread wakes from
+    // sleep / futex / join.
+    this.signalDrain?.(savedTid);
   }
 
   private popRunnable(): number | undefined {
@@ -377,6 +396,11 @@ export class CooperativeThreadsProvider implements ThreadsProvider {
     const prev = this.currentTid;
     this.currentTid = tid;
     r.status = "running";
+    // Slice 7: drain any pending signals before handing control back
+    // to this TID's wasm frame. The cooperative scheduler is the
+    // delivery point for `signalThread` and for `raiseInterval`'s
+    // deferred queue.
+    this.signalDrain?.(tid);
     try {
       this.threadStart(tid, r.startArg);
       // Returned normally — the user thread function fell off the end.
