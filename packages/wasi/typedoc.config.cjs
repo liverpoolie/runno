@@ -14,4 +14,13 @@ module.exports = {
     Docs: "/docs",
     GitHub: "https://github.com/taybenlor/runno",
   },
+  // Types referenced from public surface but deliberately kept internal.
+  // Listing them here suppresses the "referenced but not included" warning
+  // without forcing them into the public API.
+  intentionallyNotExported: [
+    "WASIDrive",
+    "WASIWorkerHostContext",
+    "SocketState",
+    "ParkableThreads",
+  ],
 };
