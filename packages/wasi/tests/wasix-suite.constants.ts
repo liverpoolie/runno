@@ -50,7 +50,6 @@ export const WASIX_INCLUDE_DIRS: readonly string[] = [
   "cross-fs-rename",
   "cwd-to-home",
   "distinct-inodes-same-basename",
-  "exception",
   "fd-close",
   "fs-mount",
   "fstatat-with-chdir",
