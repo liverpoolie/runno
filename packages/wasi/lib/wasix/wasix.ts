@@ -35,6 +35,8 @@ import type {
   FileSystemProvider,
   FutexProvider,
   RandomProvider,
+  SignalHandler,
+  SignalsProvider,
   SockAddr,
   SocketsProvider,
   ThreadsProvider,
@@ -281,6 +283,13 @@ export class WASIX {
       | undefined;
     if (typeof threadStart === "function") {
       maybeSetThreadStart(this.context.threads, threadStart);
+    }
+    // Slice 7: if both a threads provider and a signals provider are
+    // wired, hook the cooperative scheduler's `setSignalDrain` so
+    // `signalThread`-queued deliveries land at TID yield points.
+    // Providers that don't expose either hook are silently skipped.
+    if (this.context.threads && this.context.signals) {
+      maybeSetSignalDrain(this.context.threads, this.context.signals);
     }
 
     if ("_initialize" in this.instance.exports) {
@@ -1190,6 +1199,13 @@ export class WASIX {
 
   private wasix_thread_signal(tid: number, signo: number): number {
     try {
+      // Slice 7 finalisation: signal delivery routes through the
+      // signals provider. The Slice 6 stub on `ThreadsProvider.signal`
+      // remains for hosts that wired only a `ThreadsProvider`; the
+      // signals provider takes precedence when configured.
+      if (this.signals) {
+        return this.signals.signalThread(tid >>> 0, signo | 0);
+      }
       return this.requireThreads().signal(tid >>> 0, signo | 0);
     } catch (e) {
       return mapError(e, this.context.debug, "thread_signal");
@@ -1258,6 +1274,126 @@ export class WASIX {
       return Result.SUCCESS;
     } catch (e) {
       return mapError(e, this.context.debug, "futex_wake_all");
+    }
+  }
+
+  //
+  // Signal syscalls (Slice 7).
+  //
+  // Synchronous delivery only — the registered handler runs inside the
+  // syscall frame on `proc_raise`. `signal_register(signo, handler_idx)`
+  // looks up the function in `__indirect_function_table`; the universal
+  // `callback_signal(name_ptr, name_len)` looks up the named export.
+  // Either path resolves to a `SignalHandler` closure that the provider
+  // stores; `proc_raise` re-enters the guest by invoking that closure.
+
+  private get signals(): SignalsProvider | undefined {
+    return this.context.signals;
+  }
+
+  private requireSignals(): SignalsProvider {
+    if (!this.signals) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.signals;
+  }
+
+  /**
+   * Resolve a function-table-index handler into a callable. The wasix
+   * `signal_register` ABI stores a guest indirect-call slot
+   * (i.e. an entry in `__indirect_function_table`). We capture the
+   * lookup at registration time so subsequent table mutations don't
+   * invalidate the registration mid-run — wasix-libc never mutates
+   * a registered slot, and stable capture keeps the contract simple.
+   */
+  private resolveIndirectHandler(idx: number): SignalHandler | null {
+    const table = this.instance.exports.__indirect_function_table as
+      | WebAssembly.Table
+      | undefined;
+    if (!table) return null;
+    let fn: unknown;
+    try {
+      fn = table.get(idx);
+    } catch {
+      return null;
+    }
+    if (typeof fn !== "function") return null;
+    const guestFn = fn as (signo: number) => void;
+    return (signo: number) => guestFn(signo);
+  }
+
+  /**
+   * Resolve a named export into a callable. `callback_signal` ships
+   * the universal handler by string export name; we capture the
+   * function once and dispatch through it on every raise.
+   */
+  private resolveNamedHandler(name: string): SignalHandler | null {
+    const fn = this.instance.exports[name];
+    if (typeof fn !== "function") return null;
+    const guestFn = fn as (signo: number) => void;
+    return (signo: number) => guestFn(signo);
+  }
+
+  private wasix_proc_raise(signo: number): number {
+    try {
+      return this.requireSignals().raise(signo | 0);
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_raise");
+    }
+  }
+
+  private wasix_signal_register(signo: number, handlerIdx: number): number {
+    try {
+      const provider = this.requireSignals();
+      // wasix-libc passes a `null` handler as `0` to clear (matches
+      // POSIX `SIG_DFL`). Anything else is a `__indirect_function_table`
+      // index — resolve it once and stash the closure.
+      if (handlerIdx === 0) {
+        return provider.register(signo | 0, null);
+      }
+      const handler = this.resolveIndirectHandler(handlerIdx >>> 0);
+      if (!handler) {
+        // Index doesn't resolve to a callable — surface EINVAL so the
+        // guest sees a deterministic error.
+        return Result.EINVAL;
+      }
+      return provider.register(signo | 0, handler);
+    } catch (e) {
+      return mapError(e, this.context.debug, "signal_register");
+    }
+  }
+
+  private wasix_callback_signal(namePtr: number, nameLen: number): number {
+    try {
+      const provider = this.requireSignals();
+      const name = readString(this.memory, namePtr, nameLen);
+      if (nameLen === 0) {
+        // Empty name clears the universal callback.
+        return provider.register(0, null);
+      }
+      const handler = this.resolveNamedHandler(name);
+      if (!handler) return Result.EINVAL;
+      // Slot 0 is the universal-callback slot per `SignalsProvider`'s
+      // interface contract (see providers.ts).
+      return provider.register(0, handler);
+    } catch (e) {
+      return mapError(e, this.context.debug, "callback_signal");
+    }
+  }
+
+  private wasix_proc_raise_interval(
+    signo: number,
+    intervalNs: bigint,
+    repeat: number,
+  ): number {
+    try {
+      return this.requireSignals().raiseInterval(
+        signo | 0,
+        intervalNs,
+        repeat !== 0,
+      );
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_raise_interval");
     }
   }
 
@@ -1337,18 +1473,17 @@ export class WASIX {
       proc_exec3: enosys, // TODO(slice-7): proc/exec provider
       proc_join: enosys,
       proc_signal: enosys,
-      // proc_signals_get / _sizes_get land with the signals provider in
-      // Slice 8. Until then we report "zero registered signals" instead
-      // of ENOSYS — wasix-libc's startup path treats ENOSYS as a fatal
-      // init error and exits with 71 before reaching `main`, but a
-      // size-0 signals table is the well-formed "no signals" answer
+      // proc_signals_get / _sizes_get aren't wired through the signals
+      // provider yet — wasix-libc's startup path treats ENOSYS as a
+      // fatal init error and exits with 71 before reaching `main`, but
+      // a size-0 signals table is the well-formed "no signals" answer
       // that lets early init complete.
       proc_signals_get: () => Result.SUCCESS,
       proc_signals_sizes_get: (sizePtr: number) => {
         new DataView(this.memory.buffer).setUint32(sizePtr, 0, true);
         return Result.SUCCESS;
       },
-      proc_raise: enosys,
+      proc_raise: this.wasix_proc_raise.bind(this),
       proc_spawn: enosys,
       proc_spawn2: enosys, // TODO(slice-7): proc/spawn provider
       proc_id: enosys,
@@ -1399,9 +1534,9 @@ export class WASIX {
       futex_wake_bitset: enosys,
 
       // Signals
-      signal_register: enosys,
-      proc_raise_interval: enosys,
-      callback_signal: enosys,
+      signal_register: this.wasix_signal_register.bind(this),
+      proc_raise_interval: this.wasix_proc_raise_interval.bind(this),
+      callback_signal: this.wasix_callback_signal.bind(this),
 
       // TTY
       tty_get: enosys,
@@ -1983,6 +2118,23 @@ function maybeSetThreadStart(
         setThreadStart: (f: (tid: number, startArg: number) => void) => void;
       }
     ).setThreadStart(fn);
+  }
+}
+
+function maybeSetSignalDrain(
+  threads: ThreadsProvider,
+  signals: SignalsProvider,
+): void {
+  const setSignalDrain = (
+    threads as { setSignalDrain?: (fn: (tid: number) => void) => void }
+  ).setSignalDrain;
+  const drainPending = (signals as { drainPending?: (tid: number) => void })
+    .drainPending;
+  if (
+    typeof setSignalDrain === "function" &&
+    typeof drainPending === "function"
+  ) {
+    setSignalDrain((tid: number) => drainPending.call(signals, tid));
   }
 }
 
