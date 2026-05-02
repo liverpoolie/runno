@@ -284,7 +284,13 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
       if (listErr !== Preview1Result.SUCCESS) {
         throw new WASIXError(toWasixResult(listErr));
       }
-      if (entries.length > 0) {
+      // `WASIDrive.pathCreateDir` plants a `.runno` sentinel file inside
+      // every directory it creates because the flat-path drive has no
+      // standalone directory representation. Filter it before counting so
+      // a freshly created directory reports as empty here. Couples the
+      // wrapper to that drive detail; goes away in Slice 9.
+      const realEntries = entries.filter((e) => e.name !== ".runno");
+      if (realEntries.length > 0) {
         throw new WASIXError(Result.ENOTEMPTY);
       }
     } finally {
