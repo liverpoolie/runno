@@ -1,7 +1,7 @@
-import { WASIFS } from "../types.js";
 import { DebugFn } from "../wasi/wasi.js";
 import {
   ClockProvider,
+  FileSystemProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
@@ -10,10 +10,11 @@ import {
   ThreadsProvider,
   TTYProvider,
 } from "./providers.js";
+import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
 
 export type WASIXContextOptions = {
   // File / process basics — same semantics as WASIContext
-  fs: WASIFS;
+  fs: FileSystemProvider;
   args: string[];
   env: Record<string, string>;
   stdin: (maxByteLength: number) => string | null;
@@ -46,7 +47,7 @@ export type WASIXContextOptions = {
  * corresponding wasix_32v1 syscall handler.
  */
 export class WASIXContext {
-  fs: WASIFS;
+  fs: FileSystemProvider;
   args: string[];
   env: Record<string, string>;
   stdin: WASIXContextOptions["stdin"];
@@ -65,7 +66,7 @@ export class WASIXContext {
   proc?: ProcProvider;
 
   constructor(options?: Partial<WASIXContextOptions>) {
-    this.fs = options?.fs ?? {};
+    this.fs = options?.fs ?? new WASIDriveFileSystemProvider({});
     this.args = options?.args ?? [];
     this.env = options?.env ?? {};
 

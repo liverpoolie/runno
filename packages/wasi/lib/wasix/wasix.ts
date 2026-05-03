@@ -1,14 +1,29 @@
-import { ClockId, Result, WASIXError } from "./wasix-32v1.js";
+import {
+  ClockId,
+  DIRENT_SIZE,
+  FDSTAT_SIZE,
+  FILESTAT_SIZE,
+  FileType,
+  PRESTAT_SIZE,
+  PreopenType,
+  Result,
+  WASIXError,
+} from "./wasix-32v1.js";
 import { WASIXContext, WASIXContextOptions } from "./wasix-context.js";
 import {
   WASI,
   InvalidInstanceError,
   InitializationError,
 } from "../wasi/wasi.js";
+import { WASIContextOptions } from "../wasi/wasi-context.js";
 import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
-import type { ClockProvider, RandomProvider } from "./providers.js";
+import type {
+  ClockProvider,
+  FileSystemProvider,
+  RandomProvider,
+} from "./providers.js";
 
 class WASIXExit extends Error {
   code: number;
@@ -21,10 +36,11 @@ class WASIXExit extends Error {
 /**
  * WASIX runtime for the browser.
  *
- * Sibling of WASI (not a subclass). Composes a WASI instance internally to
- * service wasi_snapshot_preview1 and wasi_unstable imports; all wasix_32v1
- * imports are stubbed to ENOSYS this slice. Memory is owned by WASIX and
- * shared with the internal WASI instance.
+ * Sibling of WASI (not a subclass). Composes a WASI instance internally
+ * to service wasi_snapshot_preview1 and wasi_unstable imports.
+ * Filesystem syscalls route through a `FileSystemProvider`; clock and
+ * random go through their respective providers. Memory marshalling lives
+ * in this class — providers only ever see decoded JS-native values.
  *
  * Usage mirrors WASI.start():
  *
@@ -58,9 +74,21 @@ export class WASIX {
 
   constructor(context: Partial<WASIXContextOptions>) {
     this.context = new WASIXContext(context);
-    // Internal WASI shares the same fs / args / env / stdio as WASIX.
-    // It services wasi_snapshot_preview1 and wasi_unstable imports.
-    this.wasi = new WASI(context);
+    // The internal WASI shares args / env / stdio with WASIX. The WASIX
+    // filesystem surface routes through `context.fs` (a FileSystemProvider),
+    // so the internal WASI's preview1 fs is intentionally empty — guests
+    // built against wasix_32v1 should not be reaching for preview1 fs.
+    const wasiContext: Partial<WASIContextOptions> = {
+      args: context.args,
+      env: context.env,
+      stdin: context.stdin,
+      stdout: context.stdout,
+      stderr: context.stderr,
+      isTTY: context.isTTY,
+      debug: context.debug,
+      fs: {},
+    };
+    this.wasi = new WASI(wasiContext);
   }
 
   getImportObject() {
@@ -74,7 +102,7 @@ export class WASIX {
     };
 
     return {
-      wasix_32v1: this.getWasix32v1Stubs(),
+      wasix_32v1: this.getWasix32v1Imports(),
       wasi_snapshot_preview1: { ...preview1, proc_exit: procExit },
       wasi_unstable: { ...unstable, proc_exit: procExit },
     };
@@ -104,7 +132,7 @@ export class WASIX {
       options.memory ?? (this.instance.exports.memory as WebAssembly.Memory);
 
     // Wire the internal WASI instance to the same wasm instance + memory
-    // so that preview1/unstable syscalls can access guest memory and the drive.
+    // so that preview1/unstable syscalls can access guest memory.
     this.wasi.instance = wasm.instance;
     this.wasi.module = wasm.module;
     this.wasi.memory = this.memory;
@@ -127,28 +155,19 @@ export class WASIX {
       entrypoint();
     } catch (e) {
       if (e instanceof WASIXExit) {
-        return {
-          exitCode: e.code,
-          fs: this.wasi.drive.fs,
-        };
+        return { exitCode: e.code };
       } else if (e instanceof WebAssembly.RuntimeError) {
-        return {
-          exitCode: 134,
-          fs: this.wasi.drive.fs,
-        };
+        return { exitCode: 134 };
       } else {
         throw e;
       }
     }
 
-    return {
-      exitCode: 0,
-      fs: this.wasi.drive.fs,
-    };
+    return { exitCode: 0 };
   }
 
   //
-  // Provider accessors — lazy-init system defaults when context slot is unset.
+  // Provider accessors — lazy-init defaults when context slot is unset.
   //
 
   private get clock(): ClockProvider {
@@ -159,8 +178,12 @@ export class WASIX {
     return this.context.random ?? (this._random ??= new SystemRandomProvider());
   }
 
+  private get fs(): FileSystemProvider {
+    return this.context.fs;
+  }
+
   //
-  // wasix_32v1 syscall handlers — clock + random wired; all others ENOSYS.
+  // wasix_32v1 syscall handlers — clock / random / filesystem wired.
   //
 
   private wasix_clock_time_get(
@@ -209,14 +232,287 @@ export class WASIX {
     }
   }
 
-  private getWasix32v1Stubs(): WebAssembly.ModuleImports {
+  //
+  // Filesystem syscalls
+  //
+
+  private wasix_fd_read(
+    fd: number,
+    iovsPtr: number,
+    iovsLen: number,
+    retptr: number,
+  ): number {
+    try {
+      // STDIO routes through the internal WASI so stdin/out callbacks stay in
+      // one place. Any non-stdio fd goes through the provider.
+      if (fd === 0 || fd === 1 || fd === 2) {
+        return this.wasi.fd_read(fd, iovsPtr, iovsLen, retptr);
+      }
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, iovsPtr, iovsLen);
+      const bytesRead = this.fs.fdRead(fd, iovs);
+      view.setUint32(retptr, bytesRead, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_read");
+    }
+  }
+
+  private wasix_fd_write(
+    fd: number,
+    ciovsPtr: number,
+    ciovsLen: number,
+    retptr: number,
+  ): number {
+    try {
+      if (fd === 0 || fd === 1 || fd === 2) {
+        return this.wasi.fd_write(fd, ciovsPtr, ciovsLen, retptr);
+      }
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, ciovsPtr, ciovsLen);
+      const bytesWritten = this.fs.fdWrite(fd, iovs);
+      view.setUint32(retptr, bytesWritten, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_write");
+    }
+  }
+
+  private wasix_fd_seek(
+    fd: number,
+    offset: bigint,
+    whence: number,
+    retptr: number,
+  ): number {
+    try {
+      const newOffset = this.fs.fdSeek(fd, offset, whence);
+      const view = new DataView(this.memory.buffer);
+      view.setBigUint64(retptr, newOffset, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_seek");
+    }
+  }
+
+  private wasix_fd_close(fd: number): number {
+    try {
+      this.fs.fdClose(fd);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_close");
+    }
+  }
+
+  private wasix_fd_fdstat_get(fd: number, retptr: number): number {
+    try {
+      // STDIO still uses the internal WASI for stdio-specific fdstat shape.
+      if (fd < 3) {
+        return this.wasi.fd_fdstat_get(fd, retptr);
+      }
+      const stat = this.fs.fdFdstatGet(fd);
+      const buffer = encodeFdstat(stat);
+      new Uint8Array(this.memory.buffer, retptr, buffer.byteLength).set(buffer);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_fdstat_get");
+    }
+  }
+
+  private wasix_fd_fdstat_set_flags(fd: number, flags: number): number {
+    try {
+      this.fs.fdFdstatSetFlags(fd, flags);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_fdstat_set_flags");
+    }
+  }
+
+  private wasix_fd_filestat_get(fd: number, retptr: number): number {
+    try {
+      if (fd < 3) {
+        return this.wasi.fd_filestat_get(fd, retptr);
+      }
+      const stat = this.fs.fdFilestatGet(fd);
+      const buffer = encodeFilestat(stat);
+      new Uint8Array(this.memory.buffer, retptr, buffer.byteLength).set(buffer);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_filestat_get");
+    }
+  }
+
+  private wasix_fd_prestat_get(fd: number, retptr: number): number {
+    try {
+      const info = this.fs.fdPrestatGet(fd);
+      if (info === null) {
+        return Result.EBADF;
+      }
+      const view = new DataView(this.memory.buffer, retptr, PRESTAT_SIZE);
+      view.setUint8(0, PreopenType.DIR);
+      view.setUint32(4, new TextEncoder().encode(info.name).byteLength, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_prestat_get");
+    }
+  }
+
+  private wasix_fd_prestat_dir_name(
+    fd: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number {
+    try {
+      const name = this.fs.fdPrestatDirName(fd);
+      const bytes = new TextEncoder().encode(name);
+      const dst = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+      dst.set(bytes.subarray(0, pathLen));
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_prestat_dir_name");
+    }
+  }
+
+  private wasix_fd_readdir(
+    fd: number,
+    bufPtr: number,
+    bufLen: number,
+    cookie: bigint,
+    retptr: number,
+  ): number {
+    try {
+      const entries = this.fs.fdReaddir(fd, cookie);
+      const encoded = encodeDirectoryEntries(entries);
+      const dst = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
+      const toWrite = encoded.subarray(0, bufLen);
+      dst.set(toWrite);
+      new DataView(this.memory.buffer).setUint32(
+        retptr,
+        toWrite.byteLength,
+        true,
+      );
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_readdir");
+    }
+  }
+
+  private wasix_path_open(
+    fdDir: number,
+    dirflags: number,
+    pathPtr: number,
+    pathLen: number,
+    oflags: number,
+    rightsBase: bigint,
+    rightsInheriting: bigint,
+    fdflags: number,
+    retptr: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const newFd = this.fs.pathOpen(
+        fdDir,
+        dirflags,
+        path,
+        oflags,
+        rightsBase,
+        rightsInheriting,
+        fdflags,
+      );
+      new DataView(this.memory.buffer).setUint32(retptr, newFd, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_open");
+    }
+  }
+
+  private wasix_path_filestat_get(
+    fdDir: number,
+    dirflags: number,
+    pathPtr: number,
+    pathLen: number,
+    retptr: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const stat = this.fs.pathFilestatGet(fdDir, dirflags, path);
+      const buffer = encodeFilestat(stat);
+      new Uint8Array(this.memory.buffer, retptr, buffer.byteLength).set(buffer);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_filestat_get");
+    }
+  }
+
+  private wasix_path_create_directory(
+    fdDir: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      this.fs.pathCreateDirectory(fdDir, path);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_create_directory");
+    }
+  }
+
+  private wasix_path_unlink_file(
+    fdDir: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      this.fs.pathUnlinkFile(fdDir, path);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_unlink_file");
+    }
+  }
+
+  private wasix_path_remove_directory(
+    fdDir: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      this.fs.pathRemoveDirectory(fdDir, path);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_remove_directory");
+    }
+  }
+
+  private wasix_path_rename(
+    oldFd: number,
+    oldPathPtr: number,
+    oldPathLen: number,
+    newFd: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): number {
+    try {
+      const oldPath = readString(this.memory, oldPathPtr, oldPathLen);
+      const newPath = readString(this.memory, newPathPtr, newPathLen);
+      this.fs.pathRename(oldFd, oldPath, newFd, newPath);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_rename");
+    }
+  }
+
+  private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
     return {
-      // Args / environ
-      args_get: enosys,
-      args_sizes_get: enosys,
-      environ_get: enosys,
-      environ_sizes_get: enosys,
+      // Args / environ — share the internal WASI's preview1 implementations
+      // so wasix-libc's argv/environ setup sees the values that were passed
+      // to the WASIXContext.
+      args_get: this.wasi.args_get.bind(this.wasi),
+      args_sizes_get: this.wasi.args_sizes_get.bind(this.wasi),
+      environ_get: this.wasi.environ_get.bind(this.wasi),
+      environ_sizes_get: this.wasi.environ_sizes_get.bind(this.wasi),
 
       // Clock
       clock_res_get: this.wasix_clock_res_get.bind(this),
@@ -225,40 +521,40 @@ export class WASIX {
       // File descriptors
       fd_advise: enosys,
       fd_allocate: enosys,
-      fd_close: enosys,
+      fd_close: this.wasix_fd_close.bind(this),
       fd_datasync: enosys,
       fd_dup: enosys,
       fd_event: enosys,
-      fd_fdstat_get: enosys,
-      fd_fdstat_set_flags: enosys,
+      fd_fdstat_get: this.wasix_fd_fdstat_get.bind(this),
+      fd_fdstat_set_flags: this.wasix_fd_fdstat_set_flags.bind(this),
       fd_fdstat_set_rights: enosys,
-      fd_filestat_get: enosys,
+      fd_filestat_get: this.wasix_fd_filestat_get.bind(this),
       fd_filestat_set_size: enosys,
       fd_filestat_set_times: enosys,
       fd_pread: enosys,
-      fd_prestat_dir_name: enosys,
-      fd_prestat_get: enosys,
+      fd_prestat_dir_name: this.wasix_fd_prestat_dir_name.bind(this),
+      fd_prestat_get: this.wasix_fd_prestat_get.bind(this),
       fd_pwrite: enosys,
-      fd_read: enosys,
-      fd_readdir: enosys,
+      fd_read: this.wasix_fd_read.bind(this),
+      fd_readdir: this.wasix_fd_readdir.bind(this),
       fd_renumber: enosys,
-      fd_seek: enosys,
+      fd_seek: this.wasix_fd_seek.bind(this),
       fd_sync: enosys,
       fd_tell: enosys,
-      fd_write: enosys,
+      fd_write: this.wasix_fd_write.bind(this),
       fd_pipe: enosys,
 
       // Paths
-      path_create_directory: enosys,
-      path_filestat_get: enosys,
+      path_create_directory: this.wasix_path_create_directory.bind(this),
+      path_filestat_get: this.wasix_path_filestat_get.bind(this),
       path_filestat_set_times: enosys,
       path_link: enosys,
-      path_open: enosys,
+      path_open: this.wasix_path_open.bind(this),
       path_readlink: enosys,
-      path_remove_directory: enosys,
-      path_rename: enosys,
+      path_remove_directory: this.wasix_path_remove_directory.bind(this),
+      path_rename: this.wasix_path_rename.bind(this),
       path_symlink: enosys,
-      path_unlink_file: enosys,
+      path_unlink_file: this.wasix_path_unlink_file.bind(this),
 
       // Process
       proc_exit: enosys,
@@ -367,4 +663,107 @@ export class WASIX {
       epoll_wait: enosys,
     };
   }
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function readString(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): string {
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+}
+
+function readIOVectors(
+  view: DataView,
+  iovsPtr: number,
+  iovsLen: number,
+): Array<Uint8Array> {
+  const result: Array<Uint8Array> = new Array(iovsLen);
+  let ptr = iovsPtr;
+  for (let i = 0; i < iovsLen; i++) {
+    const bufferPtr = view.getUint32(ptr, true);
+    ptr += 4;
+    const bufferLen = view.getUint32(ptr, true);
+    ptr += 4;
+    result[i] = new Uint8Array(view.buffer, bufferPtr, bufferLen);
+  }
+  return result;
+}
+
+function mapError(
+  e: unknown,
+  debug: WASIXContext["debug"] | undefined,
+  name: string,
+): number {
+  if (e instanceof WASIXError) return e.result;
+  debug?.(name, [], Result.EIO, [{ error: String(e) }]);
+  return Result.EIO;
+}
+
+function encodeFilestat(stat: {
+  dev: bigint;
+  ino: bigint;
+  filetype: FileType;
+  nlink: bigint;
+  size: bigint;
+  timestamps: { access: bigint; modification: bigint; change: bigint };
+}): Uint8Array {
+  const buffer = new Uint8Array(FILESTAT_SIZE);
+  const view = new DataView(buffer.buffer);
+  view.setBigUint64(0, stat.dev, true);
+  view.setBigUint64(8, stat.ino, true);
+  view.setUint8(16, stat.filetype);
+  view.setBigUint64(24, stat.nlink, true);
+  view.setBigUint64(32, stat.size, true);
+  view.setBigUint64(40, stat.timestamps.access, true);
+  view.setBigUint64(48, stat.timestamps.modification, true);
+  view.setBigUint64(56, stat.timestamps.change, true);
+  return buffer;
+}
+
+function encodeFdstat(stat: {
+  filetype: FileType;
+  fsFlags: number;
+  fsRightsBase: bigint;
+  fsRightsInheriting: bigint;
+}): Uint8Array {
+  const buffer = new Uint8Array(FDSTAT_SIZE);
+  const view = new DataView(buffer.buffer);
+  view.setUint8(0, stat.filetype);
+  view.setUint16(2, stat.fsFlags, true);
+  view.setBigUint64(8, stat.fsRightsBase, true);
+  view.setBigUint64(16, stat.fsRightsInheriting, true);
+  return buffer;
+}
+
+function encodeDirectoryEntries(
+  entries: Array<{
+    next: bigint;
+    ino: bigint;
+    filetype: FileType;
+    name: string;
+  }>,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const encodedEntries = entries.map((entry) => {
+    const nameBytes = encoder.encode(entry.name);
+    const buffer = new Uint8Array(DIRENT_SIZE + nameBytes.byteLength);
+    const view = new DataView(buffer.buffer);
+    view.setBigUint64(0, entry.next, true);
+    view.setBigUint64(8, entry.ino, true);
+    view.setUint32(16, nameBytes.byteLength, true);
+    view.setUint8(20, entry.filetype);
+    buffer.set(nameBytes, DIRENT_SIZE);
+    return buffer;
+  });
+  const totalLen = encodedEntries.reduce((acc, b) => acc + b.byteLength, 0);
+  const out = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const entry of encodedEntries) {
+    out.set(entry, offset);
+    offset += entry.byteLength;
+  }
+  return out;
 }

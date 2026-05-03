@@ -42,5 +42,4 @@ export type WASIExecutionResult = {
 
 export type WASIXExecutionResult = {
   exitCode: number;
-  fs: WASIFS;
 };

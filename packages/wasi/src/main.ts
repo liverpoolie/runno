@@ -8,6 +8,7 @@ import {
   SystemRandomProvider,
   FixedClockProvider,
   SeededRandomProvider,
+  WASIDriveFileSystemProvider,
 } from "../lib/main.js";
 
 (window as any)["WASI"] = WASI;
@@ -18,6 +19,7 @@ import {
 (window as any)["SystemRandomProvider"] = SystemRandomProvider;
 (window as any)["FixedClockProvider"] = FixedClockProvider;
 (window as any)["SeededRandomProvider"] = SeededRandomProvider;
+(window as any)["WASIDriveFileSystemProvider"] = WASIDriveFileSystemProvider;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;
 const argsInput = document.getElementById("args")! as HTMLInputElement;
