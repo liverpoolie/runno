@@ -39,6 +39,7 @@ import type {
   ThreadsProvider,
   TTYProvider,
 } from "./providers.js";
+import type { ProviderPreopen } from "./providers/ergonomic/filesystem-provider.js";
 import type {
   AsyncClockProvider,
   AsyncFutexProvider,
@@ -74,6 +75,10 @@ import WASIXWorkerEntry from "./worker/wasix-worker?worker&inline";
  *  callback (host may return a Promise from its stdin handler). */
 export type WASIXWorkerHostOptions = {
   fs?: WASIFS;
+  /** Preopens beyond the implicit fd 3 = ".". Crosses postMessage as plain
+   *  data; the worker rebuilds the WASIDriveFileSystemProvider with this
+   *  list. Mirror of WASIDriveFileSystemProviderOptions.preopens. */
+  preopens?: ProviderPreopen[];
   args?: string[];
   env?: Record<string, string>;
   stdin?: (maxByteLength: number) => string | null | Promise<string | null>;
@@ -349,8 +354,10 @@ function serialisableContext(
     // `fs` across postMessage must be a WASIFS — FileSystemProvider class
     // instances can't cross the thread boundary. Future slices may add a
     // bridge opcode set for FileSystemProvider; for now, worker-mode hosts
-    // pass a plain WASIFS.
+    // pass a plain WASIFS plus a preopens descriptor that the worker
+    // re-applies when reconstructing the provider.
     fs: options.fs,
+    preopens: options.preopens,
   };
 }
 
