@@ -64,59 +64,42 @@ export type SkipEntry = {
  *     stubbed ENOSYS at the WASIX layer pending the fd-table extraction
  *     (`requires-future-feature`).
  */
-// Tests that wasixcc compiles and links cleanly under the current
-// toolchain but cannot yet instantiate at runtime. Every wasix-libc
-// binary imports symbols from the `env` namespace (shared memory,
-// indirect function table, pthread helpers); the WASIX runtime does
-// not provide an `env` import object yet, so `WebAssembly.instantiate`
-// rejects every guest before its `_start` is reached.
-//
-// Listing the buildable filesystem-category tests here keeps them
-// inside the harness — Playwright still reports them under
-// `wasix-skip:requires-future-feature` — without making CI red on
-// runtime failures that aren't owned by this filesystem-provider
-// change.
-const ENV_IMPORTS_NOTE =
-  "wasix-libc binary imports from the `env` namespace (shared memory, " +
-  "indirect function table, pthread helpers); WASIX runtime needs to " +
-  "provide the env import surface before any wasix-suite test can " +
-  "instantiate.";
-const ENV_IMPORTS_SKIP: SkipEntry = {
+// wasix-libc binaries call getcwd / chdir at startup and the wasmer test
+// runner mounts the test dir at /home (wasix-libc's default cwd). Slice
+// 3.5 stops at the instantiation surface — it does not implement getcwd /
+// chdir or the /home preopen plumbing — so every FS-category test that
+// expects cwd-relative resolution fails at the first stat / mkdir even
+// though the binary instantiates and reaches main. These all unblock
+// once a cwd / chdir provider lands and the test harness mounts /home;
+// the work is naturally adjacent to the threads / proc slices.
+const REQUIRES_CWD_PLUMBING: SkipEntry = {
   reason: "requires-future-feature",
-  note: ENV_IMPORTS_NOTE,
+  note:
+    "needs cwd / chdir / getcwd providers and /home preopen mount " +
+    "(wasix-libc default cwd is /home; wasmer runner mounts the test " +
+    "dir there).",
 };
-const ENV_IMPORTS_BUILT_TESTS = [
-  "closing-pre-opened-dirs",
-  "create-and-remove-dirs",
-  "create-dir-at-cwd",
-  "create-dir-at-cwd-with-chdir",
-  "cross-fs-rename",
-  "cwd-to-home",
-  "distinct-inodes-same-basename",
-  "fd-close",
-  "fs-mount",
-  "fstatat-with-chdir",
-  "mount-tmp-locally",
-  "msync-end-of-file",
-  "msync-middle-of-file",
-  "msync-start-of-file",
-  "munmap-sync-end-of-file",
-  "munmap-sync-middle-of-file",
-  "munmap-sync-start-of-file",
-  "open-under-file",
-  "popen",
-  "posix_spawn",
-  "pwrite-and-size",
-  "read-after-munmap",
-  "symlink-open-read-write",
-  "udp",
-  "vfork",
-];
 
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
-  ...Object.fromEntries(
-    ENV_IMPORTS_BUILT_TESTS.map((name) => [name, ENV_IMPORTS_SKIP]),
-  ),
+  // ── Slice 3.5 cwd-plumbing carve-outs ─────────────────────────────
+  // Buildable, instantiate cleanly under the new env-import surface,
+  // but the test logic depends on cwd / chdir / /home preopen.
+  "closing-pre-opened-dirs": REQUIRES_CWD_PLUMBING,
+  "create-and-remove-dirs": REQUIRES_CWD_PLUMBING,
+  "create-dir-at-cwd": REQUIRES_CWD_PLUMBING,
+  "create-dir-at-cwd-with-chdir": REQUIRES_CWD_PLUMBING,
+  "cross-fs-rename": REQUIRES_CWD_PLUMBING,
+  "cwd-to-home": REQUIRES_CWD_PLUMBING,
+  "distinct-inodes-same-basename": REQUIRES_CWD_PLUMBING,
+  "fstatat-with-chdir": REQUIRES_CWD_PLUMBING,
+  "open-under-file": REQUIRES_CWD_PLUMBING,
+  "pwrite-and-size": {
+    reason: "requires-future-feature",
+    note:
+      "needs --volume=.:/data preopen mount (the test opens absolute " +
+      "/data/my_file.txt). Single-preopen WASIDrive can't model the " +
+      "wasmer multi-mount layout yet.",
+  },
   "close-preopen": {
     reason: "requires-future-feature",
     note:
@@ -128,6 +111,71 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     note:
       "dup2 = fd_renumber, deliberately stubbed ENOSYS — fd-table mgmt " +
       "is co-located with WASIDrive and will lift later.",
+  },
+  "fd-close": {
+    reason: "requires-provider-sockets",
+    note:
+      "test opens a TCP socket via socket(AF_INET, SOCK_STREAM) and " +
+      "expects close(fd) plus EBADF on second close. Needs " +
+      "SocketsProvider + /bin preopen.",
+  },
+  "fs-mount": {
+    reason: "requires-future-feature",
+    note: "mount syscall; Runno has a single preopen root.",
+  },
+  "mount-tmp-locally": {
+    reason: "requires-future-feature",
+    note: "mount syscall; Runno has a single preopen root.",
+  },
+  "msync-end-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "msync-middle-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "msync-start-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-end-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-middle-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-start-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  popen: {
+    reason: "requires-provider-proc",
+    note: "needs proc_spawn2 + proc_join (proc provider).",
+  },
+  posix_spawn: {
+    reason: "requires-provider-proc",
+    note: "needs proc_spawn2 + proc_join (proc provider).",
+  },
+  "read-after-munmap": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "symlink-open-read-write": {
+    reason: "requires-future-feature",
+    note: "symlinks are not represented in WASIDrive.",
+  },
+  udp: {
+    reason: "requires-provider-sockets",
+    note: "raw UDP send/recv — needs SocketsProvider.",
+  },
+  vfork: {
+    reason: "requires-provider-proc",
+    note:
+      "needs proc_fork_env + proc_exec3 (proc provider). Distinct from " +
+      "POSIX vfork — wasix-libc reuses proc_fork semantics.",
   },
   epoll: {
     reason: "requires-future-feature",
