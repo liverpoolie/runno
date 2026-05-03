@@ -634,5 +634,6 @@ function stubProcProvider(): ProcProvider {
     spawn: () => throwEnosys(),
     exec: () => throwEnosys(),
     join: () => throwEnosys(),
+    kill: () => throwEnosys(),
   };
 }

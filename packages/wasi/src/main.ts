@@ -16,6 +16,8 @@ import {
   CooperativeThreadsProvider,
   SimulatedFutexProvider,
   SelfSignalProvider,
+  InProcessProcProvider,
+  createPipe,
   startThread,
 } from "../lib/main.js";
 
@@ -35,6 +37,8 @@ import {
 (window as any)["CooperativeThreadsProvider"] = CooperativeThreadsProvider;
 (window as any)["SimulatedFutexProvider"] = SimulatedFutexProvider;
 (window as any)["SelfSignalProvider"] = SelfSignalProvider;
+(window as any)["InProcessProcProvider"] = InProcessProcProvider;
+(window as any)["createPipe"] = createPipe;
 (window as any)["startThread"] = startThread;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;

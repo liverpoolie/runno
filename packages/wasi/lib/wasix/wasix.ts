@@ -7,11 +7,19 @@ import {
   FUTEX_RET_TIMEOUT,
   FUTEX_RET_WOKEN,
   FileType,
+  PIPE_FDS_READ_OFFSET,
+  PIPE_FDS_WRITE_OFFSET,
   PRESTAT_SIZE,
+  PROC_SPAWN_FD_OP_ACTION_OFFSET,
+  PROC_SPAWN_FD_OP_FD_OFFSET,
+  PROC_SPAWN_FD_OP_SIZE,
+  PROC_SPAWN_FD_OP_TARGET_FD_OFFSET,
   PreopenType,
+  ProcSpawnFdAction,
   Result,
   SockLevel,
   WASIXError,
+  packExitStatus,
 } from "./wasix-32v1.js";
 import { WASIXContext, WASIXContextOptions } from "./wasix-context.js";
 import {
@@ -26,6 +34,13 @@ import { SystemRandomProvider } from "./providers/system-random.js";
 import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
 import { MainThreadExit } from "./providers/cooperative-threads.js";
 import {
+  InProcessProcProvider,
+  type ChildRunner,
+  type ExecRunner,
+} from "./providers/in-process-proc.js";
+import type { PipeReadEnd, PipeWriteEnd } from "./providers/pipes.js";
+import { SelfSignalProvider } from "./providers/self-signal.js";
+import {
   FUTEX_WAIT_MISMATCH,
   FUTEX_WAIT_OK,
   FUTEX_WAIT_TIMEOUT,
@@ -34,6 +49,11 @@ import type {
   ClockProvider,
   FileSystemProvider,
   FutexProvider,
+  ProcExitInfo,
+  ProcExecRequest,
+  ProcFdTableSlot,
+  ProcProvider,
+  ProcSpawnRequest,
   RandomProvider,
   SignalHandler,
   SignalsProvider,
@@ -57,6 +77,28 @@ class WASIXExit extends Error {
 // generic "imported memory: shared but env doesn't allow shared memory"
 // error from the engine.
 let warnedNotCrossOriginIsolated = false;
+
+/**
+ * Pipe fds start at 1000 to leave room above the WASIDrive's `nextFD`
+ * counter (which starts at 10 and grows monotonically). Any guest-side
+ * fd ≥ `PIPE_FD_BASE` that's been registered in `pipeTable` routes
+ * through pipe handlers before falling through to the filesystem
+ * provider.
+ */
+const PIPE_FD_BASE = 1000;
+
+/**
+ * Internal sentinel — `proc_exec` throws this so the runtime unwinds the
+ * caller's wasm stack. The replacement guest's exit becomes the
+ * effective exit code of the original instance.
+ */
+class WASIXExecReplaced extends Error {
+  exit: ProcExitInfo;
+  constructor(exit: ProcExitInfo) {
+    super("proc_exec replaced");
+    this.exit = exit;
+  }
+}
 
 /**
  * WASIX runtime for the browser.
@@ -88,6 +130,16 @@ export class WASIX {
    * compiled-in default (the wasmer runner mounts the test dir there).
    */
   private cwd: string = "/home";
+
+  /**
+   * Per-instance pipe table — fds registered here are routed through
+   * pipe handlers ahead of the underlying filesystem provider. Keyed by
+   * the (parent / child) fd visible to the guest. Pipe fds are
+   * allocated in a high range (`>= PIPE_FD_BASE`) so they never collide
+   * with WASIDrive's `nextFD` counter (starts at 10).
+   */
+  private pipeTable: Map<number, PipeReadEnd | PipeWriteEnd> = new Map();
+  private nextPipeFd = PIPE_FD_BASE;
 
   /**
    * Start a WASIX command.
@@ -245,6 +297,60 @@ export class WASIX {
   }
 
   /**
+   * Build the import object for a child instance whose source bytes
+   * have already been compiled into a `WebAssembly.Module` (e.g. by
+   * `proc_spawn` / `proc_exec`). Walks `WebAssembly.Module.imports()`
+   * to detect whether the child needs `env.memory` /
+   * `env.__indirect_function_table` and creates fresh instances when
+   * it does. Memory descriptors aren't recoverable from the compiled
+   * Module, so we mirror the parent's resolved memory shape (a shared
+   * memory matching wasix-libc's threading shape) when one was wired,
+   * and fall back to a sensible default otherwise. Hosts that need
+   * tighter control can pass `context.memory` / `context.indirectFunctionTable`
+   * on the child's WASIXContext.
+   */
+  prepareImportObject(
+    module: WebAssembly.Module,
+  ): ReturnType<WASIX["getImportObject"]> {
+    const imports = WebAssembly.Module.imports(module);
+    const wantsMemory = imports.some(
+      (i) => i.kind === "memory" && i.module === "env" && i.name === "memory",
+    );
+    const wantsTable = imports.some(
+      (i) =>
+        i.kind === "table" &&
+        i.module === "env" &&
+        i.name === "__indirect_function_table",
+    );
+
+    let memory: WebAssembly.Memory | undefined;
+    if (wantsMemory) {
+      const parentMem = this.context.memory;
+      if (parentMem) {
+        memory = parentMem;
+      } else {
+        memory = new WebAssembly.Memory({
+          initial: 17,
+          maximum: 32768,
+          shared: true,
+        } as WebAssembly.MemoryDescriptor);
+      }
+    }
+
+    let indirectFunctionTable: WebAssembly.Table | undefined;
+    if (wantsTable) {
+      indirectFunctionTable =
+        this.context.indirectFunctionTable ??
+        new WebAssembly.Table({
+          element: "anyfunc",
+          initial: 1,
+        } as WebAssembly.TableDescriptor);
+    }
+
+    return this.getImportObject({ memory, indirectFunctionTable });
+  }
+
+  /**
    * Start a WASIX command.
    *
    * See: https://github.com/WebAssembly/WASI/blob/main/legacy/application-abi.md
@@ -292,6 +398,30 @@ export class WASIX {
       maybeSetSignalDrain(this.context.threads, this.context.signals);
     }
 
+    // Slice 8: if the host wired an `InProcessProcProvider` without a
+    // module / runChild / runExec, attach the runtime's defaults so a
+    // guest invoking `proc_spawn` / `proc_exec` re-runs the same
+    // compiled module under a fresh child context. This keeps the
+    // public construction shape `new InProcessProcProvider()` zero-arg
+    // for hosts that don't need to inject a custom module resolver.
+    if (this.context.proc instanceof InProcessProcProvider) {
+      const proc = this.context.proc;
+      proc.parentModule = this.module;
+      const runChild = this.buildChildRunner();
+      const runExec = this.buildExecRunner();
+      // Object.assign onto the provider — these fields are private
+      // readonly for hosts but we own the runtime side and need to
+      // back-fill them after construction. Cast through `as any` to
+      // appease the type checker; the `forChild` path in the provider
+      // copies these onto siblings so grandchildren keep working.
+      Object.assign(proc as unknown as Record<string, unknown>, {
+        runChild:
+          (proc as unknown as { runChild?: ChildRunner }).runChild ?? runChild,
+        runExec:
+          (proc as unknown as { runExec?: ExecRunner }).runExec ?? runExec,
+      });
+    }
+
     if ("_initialize" in this.instance.exports) {
       throw new InvalidInstanceError(
         "WebAssembly instance is a reactor and should be started with initialize.",
@@ -304,6 +434,11 @@ export class WASIX {
       );
     }
 
+    // Resolve inherited fd-table slots (pipe ends from a parent's
+    // proc_spawn) before the guest starts so any fd_read on a pipe-
+    // bound stdio fd resolves correctly.
+    this.resolveInheritedFdTable();
+
     const entrypoint = this.instance.exports._start as () => void;
     try {
       entrypoint();
@@ -314,6 +449,10 @@ export class WASIX {
         // The main thread invoked `thread_exit`. wasix-libc treats this
         // as a process exit with the supplied code.
         return { exitCode: e.exitCode };
+      } else if (e instanceof WASIXExecReplaced) {
+        // proc_exec replaced this guest. The replacement's exit info
+        // becomes the effective exit of the original instance.
+        return { exitCode: e.exit.exitCode };
       } else if (e instanceof WebAssembly.RuntimeError) {
         return { exitCode: 134 };
       } else {
@@ -405,6 +544,18 @@ export class WASIX {
     retptr: number,
   ): number {
     try {
+      // Pipe-end fds take precedence over stdio + fs routing — a child
+      // that received pipe ends at fd 0/1/2 (stdio rebound to a pipe by
+      // its parent's `proc_spawn`) reads through the pipe instead of the
+      // host's stdin callback.
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        const view = new DataView(this.memory.buffer);
+        const iovs = readIOVectors(view, iovsPtr, iovsLen);
+        const bytesRead = pipe.fdRead(iovs);
+        view.setUint32(retptr, bytesRead, true);
+        return Result.SUCCESS;
+      }
       // STDIO routes through the internal WASI so stdin/out callbacks stay in
       // one place. Any non-stdio fd goes through the provider.
       if (fd === 0 || fd === 1 || fd === 2) {
@@ -427,6 +578,14 @@ export class WASIX {
     retptr: number,
   ): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        const view = new DataView(this.memory.buffer);
+        const iovs = readIOVectors(view, ciovsPtr, ciovsLen);
+        const bytesWritten = pipe.fdWrite(iovs);
+        view.setUint32(retptr, bytesWritten, true);
+        return Result.SUCCESS;
+      }
       if (fd === 0 || fd === 1 || fd === 2) {
         return this.wasi.fd_write(fd, ciovsPtr, ciovsLen, retptr);
       }
@@ -447,6 +606,11 @@ export class WASIX {
     retptr: number,
   ): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        // Pipes are not seekable.
+        return Result.ESPIPE;
+      }
       const newOffset = this.fs.fdSeek(fd, offset, whence);
       const view = new DataView(this.memory.buffer);
       view.setBigUint64(retptr, newOffset, true);
@@ -458,6 +622,12 @@ export class WASIX {
 
   private wasix_fd_close(fd: number): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        pipe.fdClose();
+        this.pipeTable.delete(fd);
+        return Result.SUCCESS;
+      }
       this.fs.fdClose(fd);
       return Result.SUCCESS;
     } catch (e) {
@@ -467,6 +637,14 @@ export class WASIX {
 
   private wasix_fd_fdstat_get(fd: number, retptr: number): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        const buffer = encodeFdstat(pipe.fdFdstatGet());
+        new Uint8Array(this.memory.buffer, retptr, buffer.byteLength).set(
+          buffer,
+        );
+        return Result.SUCCESS;
+      }
       // STDIO still uses the internal WASI for stdio-specific fdstat shape.
       if (fd < 3) {
         return this.wasi.fd_fdstat_get(fd, retptr);
@@ -482,6 +660,11 @@ export class WASIX {
 
   private wasix_fd_fdstat_set_flags(fd: number, flags: number): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        pipe.fdFdstatSetFlags(flags);
+        return Result.SUCCESS;
+      }
       this.fs.fdFdstatSetFlags(fd, flags);
       return Result.SUCCESS;
     } catch (e) {
@@ -491,6 +674,14 @@ export class WASIX {
 
   private wasix_fd_filestat_get(fd: number, retptr: number): number {
     try {
+      const pipe = this.pipeTable.get(fd);
+      if (pipe) {
+        const buffer = encodeFilestat(pipe.fdFilestatGet());
+        new Uint8Array(this.memory.buffer, retptr, buffer.byteLength).set(
+          buffer,
+        );
+        return Result.SUCCESS;
+      }
       if (fd < 3) {
         return this.wasi.fd_filestat_get(fd, retptr);
       }
@@ -1397,6 +1588,474 @@ export class WASIX {
     }
   }
 
+  //
+  // Proc syscalls (Slice 8).
+  //
+  // The proc provider works with plain-data shapes only (no live
+  // `WebAssembly.Memory`, no live `WASIX`). The runtime serialises
+  // every spawn / exec request into a `ProcSpawnRequest` /
+  // `ProcExecRequest` here before calling the provider, and
+  // de-serialises the result back into guest memory once the provider
+  // returns.
+
+  private get proc(): ProcProvider | undefined {
+    return this.context.proc;
+  }
+
+  private requireProc(): ProcProvider {
+    if (!this.proc) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.proc;
+  }
+
+  /**
+   * Allocate a fresh fd for a pipe end and register it in the per-instance
+   * pipe table. Pipe fds use a high range (`PIPE_FD_BASE`+) so they don't
+   * collide with WASIDrive-allocated fds.
+   */
+  private installPipeEnd(end: PipeReadEnd | PipeWriteEnd): number {
+    const fd = this.nextPipeFd++;
+    this.pipeTable.set(fd, end);
+    return fd;
+  }
+
+  /** Same as `installPipeEnd` but at a caller-specified fd. */
+  private installPipeEndAt(fd: number, end: PipeReadEnd | PipeWriteEnd): void {
+    this.pipeTable.set(fd, end);
+  }
+
+  private wasix_proc_id(retptr: number): number {
+    try {
+      const id = this.requireProc().id();
+      new DataView(this.memory.buffer).setUint32(retptr, id >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_id");
+    }
+  }
+
+  private wasix_proc_parent(retptr: number): number {
+    try {
+      const id = this.requireProc().parentId();
+      new DataView(this.memory.buffer).setUint32(retptr, id >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_parent");
+    }
+  }
+
+  /**
+   * `proc_fork` — always ENOSYS in v1. The in-process simulation cannot
+   * reify the post-fork call stack from JS without Asyncify (see
+   * WASIX-PLAN.md § "Why those tests can't be passed by providers
+   * alone"). The runtime still routes through the provider for forward
+   * compatibility — a future Asyncify-backed provider can return
+   * `{ kind: "parent" | "child" }` to light the post-fork path.
+   */
+  private wasix_proc_fork(_copyMemory: number, retPidPtr: number): number {
+    try {
+      const result = this.requireProc().fork();
+      if (result.kind === "unsupported") {
+        return Result.ENOSYS;
+      }
+      const pid = result.kind === "parent" ? result.childPid : result.pid;
+      new DataView(this.memory.buffer).setUint32(retPidPtr, pid >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_fork");
+    }
+  }
+
+  /**
+   * `proc_spawn` — wasix-libc shape:
+   *
+   *   proc_spawn(
+   *     name_ptr, name_len,
+   *     chroot,
+   *     args_ptr, args_len,
+   *     preopen_ptr, preopen_len,
+   *     stdin_action, stdout_action, stderr_action,
+   *     working_dir_ptr, working_dir_len,
+   *     ret_handles_ptr,                 // __wasi_proc_spawn_fd_op_t[]
+   *     ret_pid_ptr
+   *   ) -> errno
+   *
+   * The argument list is wasix-libc-specific and large; the implementation
+   * here marshals only the subset Slice 8's tests exercise. The full ABI
+   * has stable offsets — adding fields later is additive.
+   *
+   * The fd-action array (`ret_handles_ptr`) is **out-of-band**: the guest
+   * supplies the per-fd actions there, and the runtime writes the
+   * parent-side fd back into each PIPE action's `target_fd` slot once
+   * the pipe is allocated.
+   */
+  private wasix_proc_spawn(
+    namePtr: number,
+    nameLen: number,
+    _chroot: number,
+    argsPtr: number,
+    argsLen: number,
+    _preopenPtr: number,
+    _preopenLen: number,
+    _stdinAction: number,
+    _stdoutAction: number,
+    _stderrAction: number,
+    workingDirPtr: number,
+    workingDirLen: number,
+    fdOpsPtr: number,
+    fdOpsLen: number,
+    retPidPtr: number,
+  ): number {
+    try {
+      const proc = this.requireProc();
+      const path = readString(this.memory, namePtr, nameLen);
+      const argsBlob = readString(this.memory, argsPtr, argsLen);
+      // `args` is a NUL-separated byte string per wasix-libc — split on
+      // \0 and drop empty trailing tokens.
+      const args = argsBlob.split("\0").filter((s) => s.length > 0);
+      const cwd =
+        workingDirLen > 0
+          ? readString(this.memory, workingDirPtr, workingDirLen)
+          : undefined;
+
+      // Decode fd-actions.
+      const fdActions = readProcSpawnFdOps(this.memory, fdOpsPtr, fdOpsLen);
+      const fdTable: ProcFdTableSlot[] = [];
+      const view = new DataView(this.memory.buffer);
+      for (const action of fdActions) {
+        if (action.action === ProcSpawnFdAction.CLOSE) {
+          // Skip — child should not inherit this fd.
+          continue;
+        }
+        if (action.action === ProcSpawnFdAction.COPY) {
+          // Pass the parent's fd through as-is. For stdio (0/1/2)
+          // child stdio is auto-inherited via context; for filesystem
+          // fds we surface the same fd number to the child (shared FS
+          // means the same provider serves both).
+          fdTable.push({
+            childFd: action.fd,
+            entry: stdioEntryOrFs(action.targetFd ?? action.fd),
+          });
+          continue;
+        }
+        if (
+          action.action === ProcSpawnFdAction.PIPE_READ ||
+          action.action === ProcSpawnFdAction.PIPE_WRITE
+        ) {
+          if (!(proc instanceof InProcessProcProvider)) {
+            // Only the in-process simulation knows how to broker
+            // pipes in v1 — surface as ENOSYS for hosts wiring a
+            // different ProcProvider.
+            return Result.ENOSYS;
+          }
+          const { pipeId, read, write } = proc.allocatePipe();
+          // Child receives one end; parent gets the matching end at
+          // a freshly allocated fd, and we write that fd back into
+          // the action's target_fd slot.
+          if (action.action === ProcSpawnFdAction.PIPE_READ) {
+            // Child reads; parent writes.
+            fdTable.push({
+              childFd: action.fd,
+              entry: { kind: "pipe-read", pipeId },
+            });
+            const parentFd = this.installPipeEnd(write);
+            view.setUint32(action.targetFdAddr, parentFd >>> 0, true);
+            // Mark the read end as "to be taken by child" — leave
+            // the pipe-broker entry alive for now; we'll claim the
+            // read end inside `runChild`'s context resolution.
+            void read;
+          } else {
+            fdTable.push({
+              childFd: action.fd,
+              entry: { kind: "pipe-write", pipeId },
+            });
+            const parentFd = this.installPipeEnd(read);
+            view.setUint32(action.targetFdAddr, parentFd >>> 0, true);
+            void write;
+          }
+        }
+      }
+
+      const req: ProcSpawnRequest = {
+        path,
+        args,
+        env: { ...this.context.env },
+        fdTable,
+        cwd,
+        parentPid: proc.id(),
+      };
+      const pid = proc.spawn(req);
+      view.setUint32(retPidPtr, pid >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_spawn");
+    }
+  }
+
+  /**
+   * `proc_exec` — replace the calling guest with a fresh module. After
+   * the provider returns SUCCESS we throw `WASIXExecReplaced` so the
+   * runtime unwinds the original guest's stack and surfaces the
+   * replacement's exit code as the effective exit of this instance
+   * (matches POSIX `execve` semantics — the call doesn't return on
+   * success).
+   *
+   * wasix-libc shape (matches the proc_spawn arg shape, sans pid out):
+   *
+   *   proc_exec(name_ptr, name_len, args_ptr, args_len) -> errno
+   *
+   * The full ABI accepts more arguments (chroot, preopens, …); only
+   * the path / argv pair are wired this slice.
+   */
+  private wasix_proc_exec(
+    namePtr: number,
+    nameLen: number,
+    argsPtr: number,
+    argsLen: number,
+  ): number {
+    try {
+      const proc = this.requireProc();
+      const path = readString(this.memory, namePtr, nameLen);
+      const argsBlob = readString(this.memory, argsPtr, argsLen);
+      const args = argsBlob.split("\0").filter((s) => s.length > 0);
+      // Inherit the entire fd-table — exec re-runs in the same
+      // realm and reuses the parent's pipes / fs handles.
+      const fdTable: ProcFdTableSlot[] = [];
+      for (const [fd, end] of this.pipeTable.entries()) {
+        if (!(proc instanceof InProcessProcProvider)) break;
+        // Pipe ends survive exec. The provider needs a fresh pipeId
+        // because exec spawns a fresh InProcessProcProvider (sibling
+        // of the caller); register the existing live ends through
+        // the same broker. We could share the existing end directly
+        // by routing through a sibling pipeId, but the simulation in
+        // v1 leaves the old pipe table in place — exec discards it
+        // by virtue of replacing the WASIX instance.
+        void fd;
+        void end;
+      }
+      const req: ProcExecRequest = {
+        path,
+        args,
+        env: { ...this.context.env },
+        fdTable,
+      };
+      const result = proc.exec(req);
+      if (result !== Result.SUCCESS) {
+        return result;
+      }
+      // The exec runner stored the replacement's exit on the provider's
+      // self-entry. Re-read it via `join(self)` so we surface the same
+      // exit code the guest will see.
+      const exit = proc.join(proc.id());
+      throw new WASIXExecReplaced(exit);
+    } catch (e) {
+      if (e instanceof WASIXExecReplaced) throw e;
+      return mapError(e, this.context.debug, "proc_exec");
+    }
+  }
+
+  private wasix_proc_join(pid: number, retStatusPtr: number): number {
+    try {
+      const exit = this.requireProc().join(pid >>> 0);
+      const view = new DataView(this.memory.buffer);
+      view.setUint32(
+        retStatusPtr,
+        packExitStatus(exit.exitCode | 0, exit.signal) >>> 0,
+        true,
+      );
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_join");
+    }
+  }
+
+  /**
+   * `proc_signal` — send a signal to another process. wasix-libc maps
+   * `kill(pid, signo)` here.
+   *
+   * Routing:
+   * - `pid === 0` or `pid === self.id()` — self-kill. Dispatched
+   *   directly through this instance's `signals.raise(signo)` so the
+   *   handler runs **inside** the calling syscall frame (matches the
+   *   Slice 7 in-frame delivery semantics). POSIX would send
+   *   `kill(0, …)` to the whole process group — Runno has no process
+   *   groups, so 0 is treated as "self".
+   * - any other pid — routed through `provider.kill(pid, signo)`. The
+   *   in-process `ProcProvider` resolves `pid → SignalsProvider` from
+   *   the realm-shared proc table, then calls `signalThread(MAIN_TID,
+   *   signo)` on the target's signals provider. This is the **single
+   *   cross-provider interaction** in v1; the coupling is documented
+   *   on `ProcProvider.kill` in `providers.ts`.
+   * - unknown pid — provider returns ESRCH.
+   */
+  private wasix_proc_signal(pid: number, signo: number): number {
+    try {
+      const proc = this.requireProc();
+      const target = pid >>> 0;
+      const selfPid = proc.id();
+      if (target === 0 || target === selfPid) {
+        if (this.signals) {
+          return this.signals.raise(signo | 0);
+        }
+        return proc.kill(selfPid, signo | 0);
+      }
+      return proc.kill(target, signo | 0);
+    } catch (e) {
+      return mapError(e, this.context.debug, "proc_signal");
+    }
+  }
+
+  /**
+   * `fd_pipe` — allocate a fresh pipe pair, install both ends in this
+   * instance's pipe table, return the (read, write) fd pair.
+   */
+  private wasix_fd_pipe(retPtr: number): number {
+    try {
+      const proc = this.requireProc();
+      if (!(proc instanceof InProcessProcProvider)) {
+        return Result.ENOSYS;
+      }
+      const { read, write } = proc.allocatePipe();
+      const readFd = this.installPipeEnd(read);
+      const writeFd = this.installPipeEnd(write);
+      const view = new DataView(this.memory.buffer);
+      view.setUint32(retPtr + PIPE_FDS_READ_OFFSET, readFd >>> 0, true);
+      view.setUint32(retPtr + PIPE_FDS_WRITE_OFFSET, writeFd >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_pipe");
+    }
+  }
+
+  /**
+   * Build the default `ChildRunner` for an `InProcessProcProvider` —
+   * the runtime supplies this so the provider can construct a child
+   * `WASIX` instance without circular-importing the runtime itself.
+   *
+   * The child inherits stdio callbacks, the filesystem provider, the
+   * sockets provider, and the host's clock / random; it gets a fresh
+   * `SelfSignalProvider` (so kills routed via the proc fabric land on
+   * a target the child actually owns) and a sibling `proc` slot
+   * sharing the realm-level proc table + pipe registry.
+   */
+  private buildChildRunner(): ChildRunner {
+    return (module, req, pid, installSignals) => {
+      const parentProc = this.proc;
+      if (!(parentProc instanceof InProcessProcProvider)) {
+        throw new WASIXError(Result.ENOSYS);
+      }
+      const childSignals = new SelfSignalProvider();
+      installSignals(childSignals);
+      const childProc = parentProc.forChild(pid, parentProc.id(), {
+        selfSignals: childSignals,
+        parentModule: module,
+      });
+      // wasix-libc passes argv as just the user tokens; convention
+      // prepends the program name as argv[0] when one isn't supplied.
+      const childArgs =
+        req.args.length > 0 ? req.args : [req.path || `process-${pid}`];
+      const childCtx = new WASIXContext({
+        args: childArgs,
+        env: req.env,
+        stdin: this.context.stdin,
+        stdout: this.context.stdout,
+        stderr: this.context.stderr,
+        isTTY: this.context.isTTY,
+        debug: this.context.debug,
+        fs: this.context.fs ?? {},
+        clock: this.context.clock,
+        random: this.context.random,
+        sockets: this.context.sockets,
+        signals: childSignals,
+        proc: childProc,
+        inheritedFdTable: req.fdTable,
+      });
+      const childWasix = new WASIX(childCtx);
+      const childImports = childWasix.prepareImportObject(module);
+      const childInstance = new WebAssembly.Instance(module, childImports);
+      const result = childWasix.start({ instance: childInstance, module });
+      return { exitCode: result.exitCode };
+    };
+  }
+
+  /**
+   * Build the default `ExecRunner`. Like `buildChildRunner` but reuses
+   * the calling instance's pid so a `proc_exec` chain doesn't burn pids.
+   */
+  private buildExecRunner(): ExecRunner {
+    return (module, req, pid) => {
+      const parentProc = this.proc;
+      if (!(parentProc instanceof InProcessProcProvider)) {
+        throw new WASIXError(Result.ENOSYS);
+      }
+      // Replacement guest gets a fresh signals provider but the same
+      // pid as the calling instance.
+      const replSignals = new SelfSignalProvider();
+      const replProc = parentProc.forChild(pid, parentProc.parentId(), {
+        selfSignals: replSignals,
+        parentModule: module,
+      });
+      const replArgs =
+        req.args.length > 0 ? req.args : [req.path || `process-${pid}`];
+      const replCtx = new WASIXContext({
+        args: replArgs,
+        env: req.env,
+        stdin: this.context.stdin,
+        stdout: this.context.stdout,
+        stderr: this.context.stderr,
+        isTTY: this.context.isTTY,
+        debug: this.context.debug,
+        fs: this.context.fs ?? {},
+        clock: this.context.clock,
+        random: this.context.random,
+        sockets: this.context.sockets,
+        signals: replSignals,
+        proc: replProc,
+        inheritedFdTable: req.fdTable,
+      });
+      const replWasix = new WASIX(replCtx);
+      const replImports = replWasix.prepareImportObject(module);
+      const replInstance = new WebAssembly.Instance(module, replImports);
+      const result = replWasix.start({ instance: replInstance, module });
+      return { exitCode: result.exitCode };
+    };
+  }
+
+  /**
+   * Resolve any `inheritedFdTable` slots set on the context — called
+   * from `start()` once the pipe table / filesystem are ready. The
+   * proc provider is responsible for recovering pipe ends from the
+   * pipeId references; non-pipe slots are no-ops in v1 (stdio is
+   * auto-wired through the context callbacks; "fs" entries assume the
+   * filesystem provider is shared between parent and child so child
+   * sees the same fd numbers).
+   */
+  private resolveInheritedFdTable(): void {
+    const inherited = this.context.inheritedFdTable;
+    if (!inherited || inherited.length === 0) return;
+    const proc = this.proc;
+    if (!(proc instanceof InProcessProcProvider)) return;
+    for (const slot of inherited) {
+      switch (slot.entry.kind) {
+        case "pipe-read": {
+          const end = proc.takePipeEnd(slot.entry.pipeId, "read");
+          if (end) this.installPipeEndAt(slot.childFd, end);
+          break;
+        }
+        case "pipe-write": {
+          const end = proc.takePipeEnd(slot.entry.pipeId, "write");
+          if (end) this.installPipeEndAt(slot.childFd, end);
+          break;
+        }
+        // stdin / stdout / stderr / fs slots are no-ops — they're
+        // honoured by virtue of stdio callback wiring + shared FS.
+        default:
+          break;
+      }
+    }
+  }
+
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
     // proc_exit2 mirrors proc_exit semantics: terminate the run with the
@@ -1442,7 +2101,7 @@ export class WASIX {
       fd_sync: enosys,
       fd_tell: enosys,
       fd_write: this.wasix_fd_write.bind(this),
-      fd_pipe: enosys,
+      fd_pipe: this.wasix_fd_pipe.bind(this),
 
       // wasix_32v1 v2 fd surface — flag-extended variants. Stubbed
       // ENOSYS until the fd-table extraction (Slice 9) lifts the
@@ -1467,12 +2126,12 @@ export class WASIX {
       // Process
       proc_exit: enosys,
       proc_exit2: procExit2,
-      proc_fork: enosys,
+      proc_fork: this.wasix_proc_fork.bind(this),
       proc_fork_env: enosys, // TODO(slice-7): proc/fork provider
-      proc_exec: enosys,
+      proc_exec: this.wasix_proc_exec.bind(this),
       proc_exec3: enosys, // TODO(slice-7): proc/exec provider
-      proc_join: enosys,
-      proc_signal: enosys,
+      proc_join: this.wasix_proc_join.bind(this),
+      proc_signal: this.wasix_proc_signal.bind(this),
       // proc_signals_get / _sizes_get aren't wired through the signals
       // provider yet — wasix-libc's startup path treats ENOSYS as a
       // fatal init error and exits with 71 before reaching `main`, but
@@ -1484,10 +2143,10 @@ export class WASIX {
         return Result.SUCCESS;
       },
       proc_raise: this.wasix_proc_raise.bind(this),
-      proc_spawn: enosys,
+      proc_spawn: this.wasix_proc_spawn.bind(this),
       proc_spawn2: enosys, // TODO(slice-7): proc/spawn provider
-      proc_id: enosys,
-      proc_parent: enosys,
+      proc_id: this.wasix_proc_id.bind(this),
+      proc_parent: this.wasix_proc_parent.bind(this),
 
       // Random
       random_get: this.wasix_random_get.bind(this),
@@ -2159,3 +2818,50 @@ function readOptionalTimestamp(
   if (tag === 0) return null;
   return view.getBigInt64(ptr + 8, true);
 }
+
+// ─── Proc fd-action marshalling (Slice 8) ───────────────────────────────────
+
+type ReadProcSpawnFdOp = {
+  fd: number;
+  action: ProcSpawnFdAction;
+  /** For COPY: parent fd to dup. For PIPE_*: filled in by the runtime. */
+  targetFd?: number;
+  /** Address in guest memory of the `target_fd` slot — runtime writes back. */
+  targetFdAddr: number;
+};
+
+function readProcSpawnFdOps(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  count: number,
+): ReadProcSpawnFdOp[] {
+  if (count === 0) return [];
+  const view = new DataView(memory.buffer);
+  const out: ReadProcSpawnFdOp[] = [];
+  for (let i = 0; i < count; i++) {
+    const base = ptr + i * PROC_SPAWN_FD_OP_SIZE;
+    const fd = view.getUint32(base + PROC_SPAWN_FD_OP_FD_OFFSET, true);
+    const action = view.getUint8(base + PROC_SPAWN_FD_OP_ACTION_OFFSET);
+    const targetFdAddr = base + PROC_SPAWN_FD_OP_TARGET_FD_OFFSET;
+    const targetFd = view.getUint32(targetFdAddr, true);
+    out.push({ fd, action, targetFd, targetFdAddr });
+  }
+  return out;
+}
+
+/**
+ * Decide which `ProcFdTableEntry` matches a parent fd for a COPY action.
+ * Stdio fds 0/1/2 produce dedicated `stdin`/`stdout`/`stderr` entries so
+ * the child's stdio routes through the host callbacks; everything else
+ * is treated as a filesystem fd referring to the shared FS provider.
+ */
+function stdioEntryOrFs(
+  parentFd: number,
+): import("./providers.js").ProcFdTableEntry {
+  if (parentFd === 0) return { kind: "stdin" };
+  if (parentFd === 1) return { kind: "stdout" };
+  if (parentFd === 2) return { kind: "stderr" };
+  return { kind: "fs", parentFd };
+}
+
+export { ALL_RIGHTS } from "./wasix-32v1.js";

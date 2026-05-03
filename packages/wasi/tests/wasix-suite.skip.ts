@@ -205,26 +205,58 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-future-feature",
     note: "eventfd surface lands with the poll feature.",
   },
-  "fd-pipe": {
-    reason: "requires-provider-proc",
-    note: "anonymous pipe pair — needs process/pipe plumbing.",
+  // Slice 8 status: fd-pipe is wired via fd_pipe(__wasi_pipe_t*) and
+  // routes through InProcessProcProvider's pipe broker. Removed from
+  // the skip list — un-skip and let the suite confirm under wasixcc.
+  fork: {
+    // proc_fork returns ENOSYS in v1 — the in-process simulation cannot
+    // reify the post-fork call stack from JS. Permanent until Asyncify.
+    reason: "requires-asyncify",
+    note:
+      "Slice 8: proc_fork returns ENOSYS (InProcessProcProvider.fork() = " +
+      '{kind: "unsupported"}). Reifying the post-fork call stack from ' +
+      'JS requires Asyncify — see WASIX-PLAN.md § "Why those tests ' +
+      "can't be passed by providers alone\". If this test only checks " +
+      "the ENOSYS return path, it may pass without un-skipping; flag " +
+      "ambiguity on the issue if the wasmer-built binary surfaces a " +
+      "different post-fork pattern.",
   },
-  fork: { reason: "requires-provider-proc" },
-  "fork-and-exec": { reason: "requires-provider-proc" },
+  "fork-and-exec": {
+    // fork+exec is the "drop-and-replace" idiom — the post-fork code
+    // does nothing but execve a new image. We could pattern-match this
+    // in a future iteration (issue § Out of scope flags it as
+    // ambiguous); for now, treat as requires-asyncify since the
+    // in-process simulation can't tell ahead of time that the post-
+    // fork path is fork+exec rather than arbitrary post-fork code.
+    reason: "requires-asyncify",
+    note:
+      "Slice 8: fork+exec is the drop-and-replace idiom — pattern " +
+      "detection deferred. Today proc_fork returns ENOSYS so this " +
+      "test will fail at the fork() call. Plan-flagged ambiguity " +
+      "noted on the PR.",
+  },
   "fork-longjmp": {
     // Needs both Asyncify (post-fork longjmp) and the process provider.
     // Asyncify is the harder blocker so it wins the token.
     reason: "requires-asyncify",
     note: "post-fork longjmp requires Asyncify.",
   },
-  "fork-pipes": { reason: "requires-provider-proc" },
-  "fork-signals": {
-    reason: "requires-provider-proc",
+  "fork-pipes": {
+    reason: "requires-asyncify",
     note:
-      "Slice 7 status: signal handlers + raise() work in-process; this " +
-      "test exercises signal delivery across a fork boundary, which " +
-      "requires the proc fabric (Slice 8) to flow signals between " +
-      "parent and child.",
+      "Slice 8: relies on post-fork pipe IO. Un-skipping waits on a " +
+      "future Asyncify-backed proc provider that can resume the child " +
+      "post-fork; for now proc_fork = ENOSYS.",
+  },
+  "fork-signals": {
+    reason: "requires-asyncify",
+    note:
+      "Slice 8: relies on post-fork signal delivery; same Asyncify " +
+      "blocker as the rest of the fork-* family. Cross-pid kill itself " +
+      "is wired (proc_signal -> ProcProvider.kill -> SignalsProvider) " +
+      "and works for spawn-based parents/children that outlive their " +
+      "spawn frame; the fork variant adds the post-fork unwind that " +
+      "remains out-of-reach without Asyncify.",
   },
   ioctl: {
     reason: "requires-future-feature",
@@ -240,7 +272,12 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   },
   // multi-threading + condvar removed in Slice 6 — both pass under
   // CooperativeThreadsProvider + SimulatedFutexProvider.
-  pipe: { reason: "requires-provider-proc" },
+  // pipe / unix-pipe / fd-pipe / spawn removed in Slice 8 — the
+  // in-process pipe broker + InProcessProcProvider.spawn() back the
+  // wasix-libc proc/spawn/pipe surface. Tests that depend on
+  // *blocking* pipe IO across the spawn boundary still need the
+  // cooperative-yield path or an async-capable proc provider; flag
+  // those individually if a wasixcc run surfaces failures.
   poll: {
     reason: "requires-future-feature",
     note: "poll surface lands with the poll feature.",
@@ -290,7 +327,6 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
       "entry once a wasixcc-built run confirms it passes. This token is " +
       "expected to be obsolete for the catch-all `sockets` test.",
   },
-  spawn: { reason: "requires-provider-proc" },
   symlink: {
     reason: "requires-future-feature",
     note: "Symlinks are not represented in WASIDrive.",
@@ -299,5 +335,4 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-future-feature",
     note: "TTY semantics — lands with TTY work.",
   },
-  "unix-pipe": { reason: "requires-provider-proc" },
 };
