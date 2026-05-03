@@ -89,6 +89,22 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-provider-fs",
     note: "fd_renumber across preopened fds needs a mount-table that the bundled WASIDriveFileSystemProvider doesn't model.",
   },
+  "closing-pre-opened-dirs": {
+    reason: "requires-provider-fs",
+    note: "wasmer-style libc preopen retention across user close — the bundled WASIDriveFileSystemProvider drops the fd entry on close.",
+  },
+  "create-and-remove-dirs": {
+    reason: "requires-provider-fs",
+    note: "WASIDrive's flat-path map doesn't enforce parent-dir-exists on mkdir, so the test's first negative assertion fails.",
+  },
+  "create-dir-at-cwd": {
+    reason: "requires-provider-fs",
+    note: "WASIDrive's flat-path map doesn't normalise `./` segments, so mkdirat(cwd_fd, \"./test\") writes a path subsequent stat can't find.",
+  },
+  "create-dir-at-cwd-with-chdir": {
+    reason: "requires-provider-fs",
+    note: "Same flat-path normalisation gap as create-dir-at-cwd; chdir()-relative `./` segments don't resolve to the canonical key.",
+  },
   dup: {
     reason: "requires-provider-fs",
     note: "fd_renumber / dup2 semantics aren't implemented by the bundled WASIDriveFileSystemProvider.",
@@ -100,6 +116,10 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   eventfd: {
     reason: "requires-provider-poll",
     note: "eventfd is exposed as a poll-eligible fd; runtime has no poll surface yet.",
+  },
+  "fd-close": {
+    reason: "requires-provider-sockets",
+    note: "Test opens a TCP socket via socket(AF_INET, SOCK_STREAM) and asserts EBADF on second close — needs a SocketsProvider semantics path the bundled LoopbackSocketsProvider doesn't fully implement.",
   },
   fork: {
     reason: "requires-asyncify",
@@ -121,6 +141,10 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-asyncify",
     note: "asserts on signal delivery across the post-fork boundary, which needs Asyncify-level resume.",
   },
+  "fs-mount": {
+    reason: "requires-provider-fs",
+    note: "mount syscall needs a multi-volume mount table the bundled WASIDriveFileSystemProvider doesn't model.",
+  },
   ioctl: {
     reason: "requires-provider-tty",
     note: "TTY ioctls (TIOCGWINSZ / termios) need a raw TTYProvider beyond the ConsoleTTYProvider shim.",
@@ -133,6 +157,38 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-provider-fs",
     note: "mount syscall needs a multi-volume mount table; the bundled WASIDriveFileSystemProvider exposes a single preopen root.",
   },
+  "mount-tmp-locally": {
+    reason: "requires-provider-fs",
+    note: "mount syscall needs a multi-volume mount table the bundled WASIDriveFileSystemProvider doesn't model.",
+  },
+  "msync-end-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / msync — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "msync-middle-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / msync — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "msync-start-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / msync — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "munmap-sync-end-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / munmap — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "munmap-sync-middle-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / munmap — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "munmap-sync-start-of-file": {
+    reason: "requires-provider-fs",
+    note: "mmap / munmap — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
+  },
+  "open-under-file": {
+    reason: "requires-provider-fs",
+    note: "open(\"file/child\") should return ENOTDIR; WASIDrive's flat-path map doesn't validate parent type and lets the deeper path resolve.",
+  },
   poll: {
     reason: "requires-provider-poll",
     note: "Runtime has no poll syscall surface yet.",
@@ -141,6 +197,14 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-provider-poll",
     note: "poll-on-fifo path needs the poll syscall surface.",
   },
+  popen: {
+    reason: "requires-provider-proc",
+    note: "popen() needs proc_spawn2 + proc_join semantics the bundled InProcessProcProvider doesn't fully implement.",
+  },
+  posix_spawn: {
+    reason: "requires-provider-proc",
+    note: "posix_spawn() needs proc_spawn2 + proc_join semantics the bundled InProcessProcProvider doesn't fully implement.",
+  },
   procfs: {
     reason: "requires-provider-fs",
     note: "Wasmer-specific /proc view isn't synthesised by WASIDriveFileSystemProvider.",
@@ -148,6 +212,14 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   ptyname: {
     reason: "requires-provider-tty",
     note: "ptyname() reads /dev/pts entries; needs a raw TTYProvider modelling pty allocation.",
+  },
+  "pwrite-and-size": {
+    reason: "requires-provider-fs",
+    note: "Test opens absolute /data/my_file.txt — needs the wasmer --volume=.:/data multi-mount layout the bundled WASIDriveFileSystemProvider doesn't model.",
+  },
+  "read-after-munmap": {
+    reason: "requires-provider-fs",
+    note: "mmap / munmap — the bundled WASIDriveFileSystemProvider doesn't model file-backed mappings.",
   },
   readlink: {
     reason: "requires-provider-fs",
@@ -161,8 +233,16 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-provider-fs",
     note: "Symlinks aren't represented by WASIDriveFileSystemProvider.",
   },
+  "symlink-open-read-write": {
+    reason: "requires-provider-fs",
+    note: "Symlinks aren't represented by WASIDriveFileSystemProvider.",
+  },
   tty: {
     reason: "requires-provider-tty",
     note: "Asserts on TTY mode flags / line-discipline that the ConsoleTTYProvider shim doesn't model.",
+  },
+  vfork: {
+    reason: "requires-provider-proc",
+    note: "wasix-libc reuses proc_fork semantics for vfork — needs proc_fork_env + proc_exec3 the bundled InProcessProcProvider doesn't implement.",
   },
 };
