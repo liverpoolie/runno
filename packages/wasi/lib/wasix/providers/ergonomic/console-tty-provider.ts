@@ -1,12 +1,16 @@
-// ConsoleTTYProvider
-//
-// Ergonomic shim around the legacy `WASIContext` stdin/stdout/stderr/isTTY
-// callbacks. Hosts that already wire those callbacks get a `TTYProvider`
-// for free without restating the terminal shape.
-//
-// Pure shim: `get()` returns the TTYState the host configured, `set()` is
-// a no-op success. The actual stdio bytes still flow through the
-// preview1/wasix stdio paths (which read the callbacks directly).
+/**
+ * ConsoleTTYProvider — ergonomic shim that wraps the legacy stdio surface.
+ *
+ * Use this when the host already wires `stdin` / `stdout` / `stderr` /
+ * `isTTY` the WASI way and just wants a `TTYProvider` for free without
+ * restating the terminal shape. Sync.
+ *
+ * Pure shim: `get()` returns the host-configured `TTYState`; `set()` stores
+ * the new state and returns `SUCCESS`. The actual stdio bytes still flow
+ * through the preview1 / wasix stdio paths (which read the callbacks
+ * directly). Does **not** implement TTY ioctls — those route through the
+ * raw `TTYProvider` slot if the host wires one.
+ */
 
 import { Result } from "../../wasix-32v1.js";
 import type { TTYProvider, TTYState } from "../../providers.js";

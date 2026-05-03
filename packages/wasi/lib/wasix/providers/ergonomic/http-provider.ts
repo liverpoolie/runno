@@ -1,21 +1,21 @@
-// HTTPProvider — Fetch-shaped sockets provider.
-//
-// Translates the guest's socket-level connect/send/recv sequence into a
-// Fetch-style request the host can respond to with a `Response`. Only the
-// SocketsProvider surface is exposed — the inner WASIX runtime sees a real
-// socket; the host sees an HTTP request.
-//
-// Async by design: responses are produced via `outgoing(request)` whose
-// return type is `Response | Promise<Response>`, so guest reads block on
-// the bridge until the host's handler resolves. Incoming flow (host →
-// guest) is wired but not exhaustively exercised this slice — the wired
-// shape is enough for Slice 6/8 to grow real listen/accept tests.
-//
-// Out of scope (returns ENOTSUP / ENOSYS):
-//   - HTTPS / TLS — pass an unencrypted Response and let the host wrap.
-//   - Persistent connections / pipelining — every connection is "Connection:
-//     close" after the response body.
-//   - Chunked request bodies from the guest.
+/**
+ * HTTPProvider — Fetch-shaped `AsyncSocketsProvider`.
+ *
+ * Use this when the host wants to expose HTTP rather than raw TCP/UDP.
+ * The provider translates guest socket-level `connect` / `send` / `recv`
+ * into a Fetch-style `Request` the host's `outgoing` handler responds to
+ * with a `Response`; bytes route back through the guest's recv buffer.
+ *
+ * Async by design — `outgoing` may return a Promise, so this provider is
+ * usable only via `WASIXWorkerHost` (where the bridge converts async
+ * provider returns into sync syscall responses for the inner runtime).
+ *
+ * Out of scope (returns `ENOTSUP` / `ENOSYS`):
+ *   - HTTPS / TLS — pass an unencrypted `Response` and let the host wrap.
+ *   - Persistent connections / pipelining — every connection is
+ *     "Connection: close" after the response body.
+ *   - Chunked request bodies from the guest.
+ */
 
 import type { AsyncSocketsProvider } from "../async.js";
 import type {

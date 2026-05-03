@@ -191,15 +191,39 @@ export type DirEntry = {
 
 // ─── Provider interfaces ──────────────────────────────────────────────────────
 
+/**
+ * Raw clock provider. Backs `clock_time_get` / `clock_res_get`.
+ *
+ * `now(id)` returns nanoseconds since the relevant epoch (REALTIME = unix,
+ * MONOTONIC = arbitrary fixed origin); `resolution(id)` returns the smallest
+ * meaningful tick. The runtime never assumes the value is monotonic across
+ * calls — providers can pin a clock for replay (`FixedClockProvider`).
+ */
 export interface ClockProvider {
   now(id: ClockId): bigint;
   resolution(id: ClockId): bigint;
 }
 
+/**
+ * Raw random provider. Backs `random_get`.
+ *
+ * `fill(buf)` writes random bytes into the entire buffer in place. The
+ * runtime makes no claim about cryptographic strength — that is the
+ * provider's contract. `SeededRandomProvider` is deterministic by design.
+ */
 export interface RandomProvider {
   fill(buf: Uint8Array): void;
 }
 
+/**
+ * Raw TTY provider. Backs `tty_get` / `tty_set`.
+ *
+ * `get()` returns the current terminal shape (cols / rows / pixel size /
+ * mode flags); `set(state)` updates it and returns `SUCCESS` (or an
+ * errno via the standard `WASIXError` throw path) if the host honours the
+ * change. The runtime does not interpret terminal state — it only marshals
+ * the struct between guest memory and the provider.
+ */
 export interface TTYProvider {
   get(): TTYState;
   set(state: TTYState): Result;
@@ -364,6 +388,21 @@ export type SockAcceptResult = {
   addr: SockAddr;
 };
 
+/**
+ * Raw sockets provider. Backs the wasix socket family
+ * (`sock_open` / `sock_bind` / `sock_connect` / `sock_listen` / `sock_accept` /
+ * `sock_send` / `sock_recv` / `sock_shutdown` / `sock_addr_*` / `sock_*opt_*`).
+ *
+ * Address shapes are JS-native (`SockAddr` discriminated union); raw
+ * `sockaddr` bytes never leave the WASIX class. Methods are synchronous —
+ * an `AsyncSocketsProvider` variant exists for hosts that route through the
+ * worker bridge (e.g. `HTTPProvider`).
+ *
+ * The runtime assumes provider-allocated fd numbers are unique per provider
+ * instance and don't collide with the filesystem fd table. The
+ * `LoopbackSocketsProvider` partitions allocations starting at 1000 to make
+ * this trivially true.
+ */
 export interface SocketsProvider {
   open(af: number, type: number, proto: number): number;
   bind(fd: number, addr: SockAddr): Result;

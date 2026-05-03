@@ -170,6 +170,11 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify README pass/skip count is in sync
+        if: always() && steps.probe.outputs.available == '1'
+        working-directory: packages/wasi
+        run: node tests/check-readme-suite-counts.mjs
+
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@v4
