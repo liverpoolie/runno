@@ -15,9 +15,15 @@
 //     them at Node-time and passes them into `page.evaluate` so each
 //     test sees the right argv.
 //   - `--volume .` maps the test directory's input files (everything
-//     beyond `main.c` / `run.sh`) into the guest's preopened ".". Each
-//     test run starts with a fresh in-memory filesystem seeded from
-//     those inputs, so per-test isolation is preserved.
+//     beyond `main.c` / `run.sh`) into the guest's preopen tree. The
+//     wasmer runner mounts `--volume .` at `/home` because that's
+//     wasix-libc's compiled-in default cwd, so the harness mirrors
+//     that: inputs are seeded under `/home/<rel-path>`, the FS
+//     provider exposes `/home` as a preopen at fd 4, and `PWD` is set
+//     so libc's startup path resolver finds the cwd before calling
+//     `getcwd`.
+//   - Each test run starts with a fresh in-memory filesystem seeded
+//     from those inputs, so per-test isolation is preserved.
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -264,13 +270,16 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
         const WC = w.WASIXContext;
         const WD = w.WASIDriveFileSystemProvider;
 
-        // Seed a fresh WASIFS for this run from the per-test inputs.
-        // Paths are rooted at `/` so they resolve through the single
-        // preopen (".") the WASIDrive exposes.
+        // Seed a fresh WASIFS under /home for this run — the wasmer
+        // runner mounts `--volume .` at /home (wasix-libc's default
+        // cwd), so per-test inputs land at /home/<rel-path>. The
+        // provider exposes /home as a preopen at fd 4 alongside the
+        // implicit fd 3 = ".", and PWD primes the libc startup
+        // resolver before it falls back to getcwd().
         const now = new Date();
         const fs: WASIFS = {};
         for (const input of p.inputs) {
-          const guestPath = `/${input.path}`;
+          const guestPath = `/home/${input.path}`;
           fs[guestPath] = {
             path: guestPath,
             timestamps: { access: now, modification: now, change: now },
@@ -286,6 +295,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
           fetch(p.wasmUrl),
           new WC({
             args: p.args,
+            env: { PWD: "/home" },
             stdout: (out: string) => {
               stdout += out;
             },
@@ -293,7 +303,9 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               stderr += err;
             },
             stdin: () => null,
-            fs: new WD(fs),
+            fs: new WD(fs, {
+              preopens: [{ name: "/home", prefix: "/home/" }],
+            }),
           }),
         );
 
