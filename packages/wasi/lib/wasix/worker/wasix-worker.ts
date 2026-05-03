@@ -273,15 +273,47 @@ async function runGuest(
   });
 
   const wasix = new WASIX(context);
-  // Use the Slice 6 memory auto-detect path: if the module imports
-  // `env.memory`, `prepareImportObject` builds a matching shared memory
-  // and injects it into the import object. For preview1-style modules
-  // (memory exported, not imported) this is a no-op.
+  // Memory auto-detect for the worker entry. The byte-parsing path used
+  // by `WASIX.start` (see `parseEnvImportDescriptors`) needs the raw
+  // bytes; here we only have a `WebAssembly.Module`, so we use the
+  // type-reflection extension on `Module.imports(module)` instead. If
+  // the module imports `env.memory`, we build a matching memory from
+  // the import descriptor and inject it via `getImportObject({ memory })`.
+  const memory = resolveWorkerMemory(module);
   const instance = await WebAssembly.instantiate(
     module,
-    wasix.prepareImportObject(module),
+    wasix.getImportObject({ memory }),
   );
-  return wasix.start({ instance, module });
+  return wasix.start({ instance, module }, { memory });
+}
+
+function resolveWorkerMemory(
+  module: WebAssembly.Module,
+): WebAssembly.Memory | undefined {
+  const memoryImport = WebAssembly.Module.imports(module).find(
+    (i) => i.kind === "memory" && i.module === "env" && i.name === "memory",
+  );
+  if (!memoryImport) return undefined;
+  const type = (
+    memoryImport as {
+      type?: { minimum: number; maximum?: number; shared?: boolean };
+    }
+  ).type;
+  if (!type || typeof type.minimum !== "number") {
+    // Older embedders without type-reflection. Fall back to a
+    // conservative shared-memory shape compatible with wasix-libc's
+    // typical defaults — unreachable in modern browsers.
+    return new WebAssembly.Memory({
+      initial: 17,
+      maximum: 65536,
+      shared: true,
+    });
+  }
+  return new WebAssembly.Memory({
+    initial: type.minimum,
+    ...(type.maximum !== undefined ? { maximum: type.maximum } : {}),
+    ...(type.shared ? { shared: true } : {}),
+  } as WebAssembly.MemoryDescriptor);
 }
 
 function sendMessage(message: WASIXWorkerHostMessage): void {

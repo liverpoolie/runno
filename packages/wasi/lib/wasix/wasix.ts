@@ -4,6 +4,8 @@ import {
   DIRENT_SIZE,
   FDSTAT_SIZE,
   FILESTAT_SIZE,
+  FUTEX_RET_TIMEOUT,
+  FUTEX_RET_WOKEN,
   FileType,
   PRESTAT_SIZE,
   PreopenType,
@@ -22,12 +24,20 @@ import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
 import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
+import { MainThreadExit } from "./providers/cooperative-threads.js";
+import {
+  FUTEX_WAIT_MISMATCH,
+  FUTEX_WAIT_OK,
+  FUTEX_WAIT_TIMEOUT,
+} from "./providers.js";
 import type {
   ClockProvider,
   FileSystemProvider,
+  FutexProvider,
   RandomProvider,
   SockAddr,
   SocketsProvider,
+  ThreadsProvider,
 } from "./providers.js";
 
 class WASIXExit extends Error {
@@ -262,6 +272,17 @@ export class WASIX {
     this.wasi.memory = this.memory;
     this.wasi.hasBeenInitialized = true;
 
+    // Plumb the resolved memory + the guest's `wasi_thread_start` export
+    // (if any) through to the provider slots that need them. Both hooks
+    // are optional — providers that don't need them implement neither.
+    maybeSetMemory(this.context.futex, this.memory);
+    const threadStart = this.instance.exports.wasi_thread_start as
+      | ((tid: number, startArg: number) => void)
+      | undefined;
+    if (typeof threadStart === "function") {
+      maybeSetThreadStart(this.context.threads, threadStart);
+    }
+
     if ("_initialize" in this.instance.exports) {
       throw new InvalidInstanceError(
         "WebAssembly instance is a reactor and should be started with initialize.",
@@ -280,6 +301,10 @@ export class WASIX {
     } catch (e) {
       if (e instanceof WASIXExit) {
         return { exitCode: e.code };
+      } else if (e instanceof MainThreadExit) {
+        // The main thread invoked `thread_exit`. wasix-libc treats this
+        // as a process exit with the supplied code.
+        return { exitCode: e.exitCode };
       } else if (e instanceof WebAssembly.RuntimeError) {
         return { exitCode: 134 };
       } else {
@@ -1069,6 +1094,173 @@ export class WASIX {
     }
   }
 
+  //
+  // Threads syscalls (Slice 6).
+  //
+
+  private get threads(): ThreadsProvider | undefined {
+    return this.context.threads;
+  }
+
+  private get futex(): FutexProvider | undefined {
+    return this.context.futex;
+  }
+
+  private requireThreads(): ThreadsProvider {
+    if (!this.threads) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.threads;
+  }
+
+  private requireFutex(): FutexProvider {
+    if (!this.futex) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return this.futex;
+  }
+
+  private wasix_thread_spawn(startArgPtr: number, retTidPtr: number): number {
+    try {
+      const tid = this.requireThreads().spawn(startArgPtr);
+      new DataView(this.memory.buffer).setUint32(retTidPtr, tid >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_spawn");
+    }
+  }
+
+  private wasix_thread_join(tid: number, retPtr: number): number {
+    try {
+      const code = this.requireThreads().join(tid >>> 0);
+      // wasix-libc's join writes the exit code (i32) at retPtr. -1 is
+      // surfaced verbatim — the guest can detect a missing tid.
+      new DataView(this.memory.buffer).setInt32(retPtr, code | 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_join");
+    }
+  }
+
+  private wasix_thread_exit(code: number): number {
+    // `exit()` is documented to unwind via throw — the provider raises
+    // a sentinel that the cooperative scheduler (or, for the main
+    // thread, `WASIX.start`) catches up the JS call stack. We do NOT
+    // wrap the call in `try/catch`: a `WASIXError` on a missing-provider
+    // path is the only "ordinary error" possible here, so surface it
+    // explicitly and let everything else propagate.
+    if (!this.threads) {
+      this.context.debug?.("thread_exit", [], Result.ENOSYS, []);
+      return Result.ENOSYS;
+    }
+    this.threads.exit(code | 0);
+    // Defensive: providers that return without throwing surface ENOSYS
+    // so the guest sees a clear signal rather than silent fall-through.
+    return Result.ENOSYS;
+  }
+
+  private wasix_thread_sleep(durationNs: bigint): number {
+    try {
+      this.requireThreads().sleep(durationNs);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_sleep");
+    }
+  }
+
+  private wasix_thread_id(retPtr: number): number {
+    try {
+      const tid = this.requireThreads().id();
+      new DataView(this.memory.buffer).setUint32(retPtr, tid >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_id");
+    }
+  }
+
+  private wasix_thread_parallelism(retPtr: number): number {
+    try {
+      const n = this.requireThreads().parallelism();
+      new DataView(this.memory.buffer).setUint32(retPtr, n >>> 0, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_parallelism");
+    }
+  }
+
+  private wasix_thread_signal(tid: number, signo: number): number {
+    try {
+      return this.requireThreads().signal(tid >>> 0, signo | 0);
+    } catch (e) {
+      return mapError(e, this.context.debug, "thread_signal");
+    }
+  }
+
+  //
+  // Futex syscalls (Slice 6).
+  //
+  // The wasix `futex_wait` ABI is:
+  //   futex_wait(futex_ptr, expected, timeout_ptr, ret_woken_ptr) -> errno
+  // where `timeout_ptr` is an `__wasi_optional_timestamp_t` (tag byte +
+  // 7 bytes pad + i64 ns). On a value mismatch the host returns EAGAIN
+  // and does not touch `ret_woken_ptr`. Otherwise it returns SUCCESS and
+  // writes 1 (woken) or 0 (timeout) to `ret_woken_ptr`.
+  //
+  // `futex_wake(futex_ptr, ret_woken_ptr) -> errno` wakes one waiter
+  // (provider sees `wake(addr, 1)`). `futex_wake_all(futex_ptr,
+  // ret_woken_ptr) -> errno` wakes all (`wake(addr, MAX_SAFE_INTEGER)`).
+  // `ret_woken_ptr` receives 1 if at least one waiter was woken, else 0.
+
+  private wasix_futex_wait(
+    futexPtr: number,
+    expected: number,
+    timeoutPtr: number,
+    retWokenPtr: number,
+  ): number {
+    try {
+      const provider = this.requireFutex();
+      const timeoutNs = readOptionalTimestamp(this.memory, timeoutPtr);
+      const result = provider.wait(futexPtr, expected | 0, timeoutNs);
+      if (result === FUTEX_WAIT_MISMATCH) {
+        return Result.EAGAIN;
+      }
+      const view = new DataView(this.memory.buffer);
+      if (result === FUTEX_WAIT_OK) {
+        view.setUint8(retWokenPtr, FUTEX_RET_WOKEN);
+      } else if (result === FUTEX_WAIT_TIMEOUT) {
+        view.setUint8(retWokenPtr, FUTEX_RET_TIMEOUT);
+      } else {
+        // Unknown discriminant — treat as an internal error.
+        return Result.EIO;
+      }
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "futex_wait");
+    }
+  }
+
+  private wasix_futex_wake(futexPtr: number, retWokenPtr: number): number {
+    try {
+      const provider = this.requireFutex();
+      const woken = provider.wake(futexPtr, 1);
+      new DataView(this.memory.buffer).setUint8(retWokenPtr, woken > 0 ? 1 : 0);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "futex_wake");
+    }
+  }
+
+  private wasix_futex_wake_all(futexPtr: number, retWokenPtr: number): number {
+    try {
+      const provider = this.requireFutex();
+      const woken = provider.wake(futexPtr, Number.MAX_SAFE_INTEGER);
+      new DataView(this.memory.buffer).setUint8(retWokenPtr, woken > 0 ? 1 : 0);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "futex_wake_all");
+    }
+  }
+
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
     // proc_exit2 mirrors proc_exit semantics: terminate the run with the
@@ -1192,17 +1384,18 @@ export class WASIX {
       sock_status: this.wasix_sock_status.bind(this),
 
       // Threads
-      thread_exit: enosys,
-      thread_id: enosys,
-      thread_join: enosys,
-      thread_parallelism: enosys,
-      thread_signal: enosys,
-      thread_sleep: enosys,
-      thread_spawn: enosys,
+      thread_exit: this.wasix_thread_exit.bind(this),
+      thread_id: this.wasix_thread_id.bind(this),
+      thread_join: this.wasix_thread_join.bind(this),
+      thread_parallelism: this.wasix_thread_parallelism.bind(this),
+      thread_signal: this.wasix_thread_signal.bind(this),
+      thread_sleep: this.wasix_thread_sleep.bind(this),
+      thread_spawn: this.wasix_thread_spawn.bind(this),
 
       // Futex
-      futex_wait: enosys,
-      futex_wake: enosys,
+      futex_wait: this.wasix_futex_wait.bind(this),
+      futex_wake: this.wasix_futex_wake.bind(this),
+      futex_wake_all: this.wasix_futex_wake_all.bind(this),
       futex_wake_bitset: enosys,
 
       // Signals
@@ -1760,3 +1953,57 @@ function expandIPv6(address: string): number[] {
   return all.map((g) => Number.parseInt(g || "0", 16));
 }
 
+// ─── Provider hook helpers ───────────────────────────────────────────────────
+
+function maybeSetMemory(
+  provider: FutexProvider | undefined,
+  memory: WebAssembly.Memory,
+): void {
+  if (
+    provider &&
+    typeof (provider as { setMemory?: unknown }).setMemory === "function"
+  ) {
+    (provider as { setMemory: (m: WebAssembly.Memory) => void }).setMemory(
+      memory,
+    );
+  }
+}
+
+function maybeSetThreadStart(
+  provider: ThreadsProvider | undefined,
+  fn: (tid: number, startArg: number) => void,
+): void {
+  if (
+    provider &&
+    typeof (provider as { setThreadStart?: unknown }).setThreadStart ===
+      "function"
+  ) {
+    (
+      provider as {
+        setThreadStart: (f: (tid: number, startArg: number) => void) => void;
+      }
+    ).setThreadStart(fn);
+  }
+}
+
+// ─── Optional-timestamp marshalling ──────────────────────────────────────────
+//
+// `__wasi_optional_timestamp_t` (wasix-libc):
+//   layout (size 16, alignment 8):
+//     tag  offset 0 size 1   (0 = none, 1 = some)
+//     pad  offset 1 size 7
+//     u    offset 8 size 8   (i64 nanoseconds; only meaningful when tag = 1)
+//
+// `timeoutPtr === 0` is also accepted as "no timeout" — wasix-libc passes
+// `nullptr` when the application omitted a timeout.
+
+function readOptionalTimestamp(
+  memory: WebAssembly.Memory,
+  ptr: number,
+): bigint | null {
+  if (ptr === 0) return null;
+  const view = new DataView(memory.buffer);
+  const tag = view.getUint8(ptr);
+  if (tag === 0) return null;
+  return view.getBigInt64(ptr + 8, true);
+}
