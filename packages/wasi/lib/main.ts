@@ -14,6 +14,8 @@ export { SystemRandomProvider } from "./wasix/providers/system-random.js";
 export { FixedClockProvider } from "./wasix/providers/fixed-clock.js";
 export { SeededRandomProvider } from "./wasix/providers/seeded-random.js";
 export { WASIDriveFileSystemProvider } from "./wasix/providers/ergonomic/filesystem-provider.js";
+export { ConsoleTTYProvider } from "./wasix/providers/ergonomic/console-tty-provider.js";
+export type { ConsoleTTYOptions } from "./wasix/providers/ergonomic/console-tty-provider.js";
 export { HTTPProvider } from "./wasix/providers/ergonomic/http-provider.js";
 export type {
   HTTPProviderOptions,

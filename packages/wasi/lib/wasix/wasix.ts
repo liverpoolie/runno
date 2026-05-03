@@ -28,6 +28,7 @@ import {
   InitializationError,
 } from "../wasi/wasi.js";
 import { WASIContextOptions } from "../wasi/wasi-context.js";
+import { readIOVectors, readString } from "../wasi-shared/memory.js";
 import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
@@ -2504,36 +2505,6 @@ function resolveAbsolute(cwd: string, path: string): string {
 
 function stripLeadingSlash(path: string): string {
   return path.startsWith("/") ? path.slice(1) : path;
-}
-
-function readString(
-  memory: WebAssembly.Memory,
-  ptr: number,
-  len: number,
-): string {
-  // Copy out before decoding: when env.memory is a SharedArrayBuffer
-  // (the threaded wasix-libc default) TextDecoder rejects views over it.
-  // `slice` returns a Uint8Array backed by a fresh non-shared ArrayBuffer.
-  return new TextDecoder().decode(
-    new Uint8Array(memory.buffer, ptr, len).slice(),
-  );
-}
-
-function readIOVectors(
-  view: DataView,
-  iovsPtr: number,
-  iovsLen: number,
-): Array<Uint8Array> {
-  const result: Array<Uint8Array> = new Array(iovsLen);
-  let ptr = iovsPtr;
-  for (let i = 0; i < iovsLen; i++) {
-    const bufferPtr = view.getUint32(ptr, true);
-    ptr += 4;
-    const bufferLen = view.getUint32(ptr, true);
-    ptr += 4;
-    result[i] = new Uint8Array(view.buffer, bufferPtr, bufferLen);
-  }
-  return result;
 }
 
 function mapError(
