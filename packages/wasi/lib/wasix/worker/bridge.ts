@@ -138,6 +138,15 @@ export enum Opcode {
   FUTEX_WAIT = 17,
   FUTEX_WAKE = 18,
 
+  // Signals — Slice 7. NOTE: no opcodes are wired this slice. Signal
+  // handler dispatch must run in the same realm as the wasm instance
+  // (the runtime calls back into `__indirect_function_table` / a
+  // named export), so the worker installs a local
+  // `SelfSignalProvider` rather than bridging through the host. The
+  // 50–69 range stays reserved for hosts that grow a host-side
+  // dispatch model in a later slice (e.g. async signal sources that
+  // post a deliver-message back to the worker via a nested round trip).
+
   // Sockets — Slice 5.
   SOCK_OPEN = 30,
   SOCK_BIND = 31,

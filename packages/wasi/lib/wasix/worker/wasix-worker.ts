@@ -21,6 +21,7 @@ import {
   WASIDriveFileSystemProvider,
   type ProviderPreopen,
 } from "../providers/ergonomic/filesystem-provider.js";
+import { SelfSignalProvider } from "../providers/self-signal.js";
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
   AddrHints,
@@ -217,8 +218,17 @@ async function runGuest(
   const futex: FutexProvider | undefined = asyncSet.has("futex")
     ? bridgeFutexProvider(msg.sharedBuffer)
     : undefined;
+  // Slice 7: signal handler dispatch is fundamentally realm-local
+  // (the runtime calls back into the guest's `__indirect_function_table`
+  // / a named export). The bridge cannot route a wasm-frame callback
+  // back into the worker without a nested round-trip protocol that
+  // is out of scope for this slice. So when the host configures a
+  // signals slot, the worker installs a *local* `SelfSignalProvider`
+  // and the host-side provider is effectively ignored. Tests that
+  // require host-side signal dispatch into the worker stay skipped
+  // with `requires-asyncify`.
   const signals: SignalsProvider | undefined = asyncSet.has("signals")
-    ? stubSignalsProvider()
+    ? new SelfSignalProvider()
     : undefined;
   const sockets: SocketsProvider | undefined = asyncSet.has("sockets")
     ? bridgeSocketsProvider(msg.sharedBuffer)
@@ -424,12 +434,6 @@ function bridgeFutexProvider(sharedBuffer: SharedArrayBuffer): FutexProvider {
       });
       return r.result.woken;
     },
-  };
-}
-function stubSignalsProvider(): SignalsProvider {
-  return {
-    register: () => throwEnosys(),
-    raiseInterval: () => throwEnosys(),
   };
 }
 /**

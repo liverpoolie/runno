@@ -57,7 +57,11 @@ export type SkipEntry = {
  *     these may be drivable by `LoopbackSocketsProvider` in-process;
  *     the first CI run that builds them with wasixcc should try
  *     removing those entries to confirm.
- *   - `signals`, `fork-signals` → `requires-provider-signals`.
+ *   - `signals` — passes under SelfSignalProvider; the entry was
+ *     dropped from this map.
+ *   - `fork-signals` → `requires-provider-proc` (handlers work
+ *     in-process; the test specifically exercises signal delivery
+ *     across the fork boundary, which the proc provider lands).
  *   - `epoll` / `eventfd` / `poll` / `poll-fifo` → poll surface
  *     (`requires-future-feature`).
  *   - `tty` / `ptyname` / `ioctl` → TTY work (`requires-future-feature`).
@@ -215,8 +219,12 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
   },
   "fork-pipes": { reason: "requires-provider-proc" },
   "fork-signals": {
-    reason: "requires-provider-signals",
-    note: "signal delivery across fork — signals provider drives this.",
+    reason: "requires-provider-proc",
+    note:
+      "Slice 7 status: signal handlers + raise() work in-process; this " +
+      "test exercises signal delivery across a fork boundary, which " +
+      "requires the proc fabric (Slice 8) to flow signals between " +
+      "parent and child.",
   },
   ioctl: {
     reason: "requires-future-feature",
@@ -257,7 +265,10 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-future-feature",
     note: "POSIX shared memory — deferred alongside drive extraction.",
   },
-  signals: { reason: "requires-provider-signals" },
+  // signals removed in Slice 7 — handler register + raise + raise_interval
+  // pass under SelfSignalProvider. Sub-tests that require asynchronous
+  // preemption (signal delivered from outside the current syscall frame)
+  // would need Asyncify and remain off-the-table per the plan.
   "socket-tcp": {
     reason: "requires-provider-sockets",
     note:
