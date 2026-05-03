@@ -19,6 +19,7 @@ import { WASIContextOptions } from "../wasi/wasi-context.js";
 import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
+import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
 import type {
   ClockProvider,
   FileSystemProvider,
@@ -68,18 +69,25 @@ export class WASIX {
   /**
    * Start a WASIX command.
    *
-   * Compiles the module first so we can inspect its imports for
-   * `env.memory` / `env.__indirect_function_table` and supply a matching
-   * `WebAssembly.Memory` / `WebAssembly.Table` (constructed here, or
-   * passed in via `WASIXContextOptions.memory` / `.indirectFunctionTable`).
+   * Buffers the module bytes so we can parse the import section
+   * ourselves: `WebAssembly.Module.imports(module)` returns only the
+   * `{ module, name, kind }` triple — descriptors (memory limits,
+   * shared flag, table element type) are not in the standard surface.
+   * We need those to construct a matching `WebAssembly.Memory` /
+   * `WebAssembly.Table` for `env.memory` / `env.__indirect_function_table`,
+   * so the parse runs over the raw bytes before compile.
    */
   static async start(
     wasmSource: Response | PromiseLike<Response>,
     context: Partial<WASIXContextOptions> = {},
   ): Promise<WASIXExecutionResult> {
     const wasix = new WASIX(context);
-    const module = await WebAssembly.compileStreaming(wasmSource);
-    const { memory, indirectFunctionTable } = wasix.resolveEnvImports(module);
+    const response = await wasmSource;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const envDescriptors = parseEnvImportDescriptors(bytes);
+    const { memory, indirectFunctionTable } =
+      wasix.resolveEnvImports(envDescriptors);
+    const module = await WebAssembly.compile(bytes);
     const imports = wasix.getImportObject({ memory, indirectFunctionTable });
     const instance = await WebAssembly.instantiate(module, imports);
     return wasix.start({ module, instance }, { memory });
@@ -102,10 +110,15 @@ export class WASIX {
           "(`Cross-Origin-Embedder-Policy: require-corp`) on the host page.",
       );
     }
-    // The internal WASI shares args / env / stdio with WASIX. The WASIX
-    // filesystem surface routes through `context.fs` (a FileSystemProvider),
-    // so the internal WASI's preview1 fs is intentionally empty — guests
-    // built against wasix_32v1 should not be reaching for preview1 fs.
+    // The internal WASI shares args / env / stdio with WASIX. wasix-libc
+    // binaries reach for both `wasix_32v1` and `wasi_snapshot_preview1`
+    // filesystem imports — preopen discovery (`fd_prestat_get`) lives in
+    // preview1 — so the inner WASI must see the same drive as the WASIX
+    // FileSystemProvider, not a separate empty drive. When the host hands
+    // us the bundled `WASIDriveFileSystemProvider` we reuse its drive
+    // directly; for opaque providers the inner preview1 fs stays empty
+    // (those hosts shouldn't have wasix-libc binaries reaching for
+    // preview1 fs in the first place).
     const wasiContext: Partial<WASIContextOptions> = {
       args: context.args,
       env: context.env,
@@ -117,79 +130,52 @@ export class WASIX {
       fs: {},
     };
     this.wasi = new WASI(wasiContext);
+    if (this.context.fs instanceof WASIDriveFileSystemProvider) {
+      this.wasi.drive = this.context.fs.drive;
+    }
   }
 
   /**
-   * Inspect the compiled module's imports for `env.memory` and
-   * `env.__indirect_function_table`. For each that's present, either
-   * validate the host-supplied override against the import descriptor
-   * or construct a fresh `WebAssembly.Memory` / `WebAssembly.Table`
-   * matching the declared shape. Returns whichever values the import
-   * object should use for the `env` namespace; either may be undefined
-   * (e.g. preview1-style binaries that export their own memory).
+   * Convert the parsed `env.*` import descriptors into concrete
+   * `WebAssembly.Memory` / `WebAssembly.Table` instances, honouring any
+   * host overrides on the context. Either result may be undefined when
+   * the binary doesn't import the corresponding entry (preview1-style
+   * binaries that export their own memory, for example).
    */
-  resolveEnvImports(module: WebAssembly.Module): {
+  resolveEnvImports(descriptors: ParsedEnvImports): {
     memory?: WebAssembly.Memory;
     indirectFunctionTable?: WebAssembly.Table;
   } {
     let memory: WebAssembly.Memory | undefined;
     let indirectFunctionTable: WebAssembly.Table | undefined;
 
-    for (const entry of WebAssembly.Module.imports(module)) {
-      if (entry.module !== "env") continue;
-
-      if (entry.kind === "memory" && entry.name === "memory") {
-        // The import descriptor (`MemoryDescriptor`) is exposed on the
-        // entry across browsers as the bag of `initial`/`maximum`/`shared`
-        // fields. Type definitions don't surface it yet, so cast.
-        const descriptor = (
-          entry as unknown as { type?: WebAssembly.MemoryDescriptor }
-        ).type;
-        const initial = descriptor?.initial ?? 0;
-        const maximum = descriptor?.maximum;
-        const shared =
-          (descriptor as { shared?: boolean } | undefined)?.shared ?? false;
-
-        const override = this.context.memory;
-        if (override) {
-          validateMemoryOverride(override, { initial, maximum, shared });
-          memory = override;
-        } else {
-          memory = new WebAssembly.Memory({
-            initial,
-            ...(maximum !== undefined ? { maximum } : {}),
-            ...(shared ? { shared: true } : {}),
-          } as WebAssembly.MemoryDescriptor);
-        }
-        continue;
+    if (descriptors.memory) {
+      const { initial, maximum, shared } = descriptors.memory;
+      const override = this.context.memory;
+      if (override) {
+        validateMemoryOverride(override, { initial, maximum, shared });
+        memory = override;
+      } else {
+        memory = new WebAssembly.Memory({
+          initial,
+          ...(maximum !== undefined ? { maximum } : {}),
+          ...(shared ? { shared: true } : {}),
+        } as WebAssembly.MemoryDescriptor);
       }
+    }
 
-      if (
-        entry.kind === "table" &&
-        entry.name === "__indirect_function_table"
-      ) {
-        const descriptor = (
-          entry as unknown as { type?: WebAssembly.TableDescriptor }
-        ).type;
-        const element = (descriptor?.element ?? "funcref") as
-          | "anyfunc"
-          | "funcref"
-          | "externref";
-        const initial = descriptor?.initial ?? 0;
-        const maximum = descriptor?.maximum;
-
-        const override = this.context.indirectFunctionTable;
-        if (override) {
-          validateTableOverride(override, { element, initial, maximum });
-          indirectFunctionTable = override;
-        } else {
-          indirectFunctionTable = new WebAssembly.Table({
-            element,
-            initial,
-            ...(maximum !== undefined ? { maximum } : {}),
-          } as WebAssembly.TableDescriptor);
-        }
-        continue;
+    if (descriptors.table) {
+      const { element, initial, maximum } = descriptors.table;
+      const override = this.context.indirectFunctionTable;
+      if (override) {
+        validateTableOverride(override, { element, initial, maximum });
+        indirectFunctionTable = override;
+      } else {
+        indirectFunctionTable = new WebAssembly.Table({
+          element,
+          initial,
+          ...(maximum !== undefined ? { maximum } : {}),
+        } as WebAssembly.TableDescriptor);
       }
     }
 
@@ -541,6 +527,43 @@ export class WASIX {
     }
   }
 
+  // path_open2 is the wasix v2 variant: same as preview1 path_open
+  // plus an extended fdflags2 word (the last i32 before retptr). The
+  // extra flag bits are not yet modelled, but ignoring them and routing
+  // through the existing pathOpen unblocks every wasix-libc binary
+  // that calls open()/opendir() — those use path_open2 unconditionally.
+  // TODO(slice-9): honour fdflags2 once the fd-table extraction surfaces
+  //   semantics for the new bits (close-on-exec etc.).
+  private wasix_path_open2(
+    fdDir: number,
+    dirflags: number,
+    pathPtr: number,
+    pathLen: number,
+    oflags: number,
+    rightsBase: bigint,
+    rightsInheriting: bigint,
+    fdflags: number,
+    _fdflags2: number,
+    retptr: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const newFd = this.fs.pathOpen(
+        fdDir,
+        dirflags,
+        path,
+        oflags,
+        rightsBase,
+        rightsInheriting,
+        fdflags,
+      );
+      new DataView(this.memory.buffer).setUint32(retptr, newFd, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_open2");
+    }
+  }
+
   private wasix_path_filestat_get(
     fdDir: number,
     dirflags: number,
@@ -679,10 +702,7 @@ export class WASIX {
       path_filestat_set_times: enosys,
       path_link: enosys,
       path_open: this.wasix_path_open.bind(this),
-      // TODO(slice-9): path_open2 carries an extended fdflags arg; for now
-      // it returns ENOSYS so binaries that link both v1 and v2 can still
-      // instantiate, since the v1 path_open is already wired.
-      path_open2: enosys,
+      path_open2: this.wasix_path_open2.bind(this),
       path_readlink: enosys,
       path_remove_directory: this.wasix_path_remove_directory.bind(this),
       path_rename: this.wasix_path_rename.bind(this),
@@ -698,8 +718,17 @@ export class WASIX {
       proc_exec3: enosys, // TODO(slice-7): proc/exec provider
       proc_join: enosys,
       proc_signal: enosys,
-      proc_signals_get: enosys, // TODO(slice-8): signals provider
-      proc_signals_sizes_get: enosys, // TODO(slice-8): signals provider
+      // proc_signals_get / _sizes_get land with the signals provider in
+      // Slice 8. Until then we report "zero registered signals" instead
+      // of ENOSYS — wasix-libc's startup path treats ENOSYS as a fatal
+      // init error and exits with 71 before reaching `main`, but a
+      // size-0 signals table is the well-formed "no signals" answer
+      // that lets early init complete.
+      proc_signals_get: () => Result.SUCCESS,
+      proc_signals_sizes_get: (sizePtr: number) => {
+        new DataView(this.memory.buffer).setUint32(sizePtr, 0, true);
+        return Result.SUCCESS;
+      },
       proc_raise: enosys,
       proc_spawn: enosys,
       proc_spawn2: enosys, // TODO(slice-7): proc/spawn provider
@@ -806,6 +835,188 @@ export class WASIX {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/**
+ * Descriptor info for the two `env.*` imports that drive WASIX module
+ * instantiation. Either field is absent when the binary doesn't import
+ * the corresponding entity.
+ */
+type ParsedEnvImports = {
+  memory?: { initial: number; maximum?: number; shared: boolean };
+  table?: {
+    element: "funcref" | "externref";
+    initial: number;
+    maximum?: number;
+  };
+};
+
+/**
+ * Walk the wasm import section just far enough to extract the descriptor
+ * for `env.memory` and `env.__indirect_function_table`. The standard
+ * `WebAssembly.Module.imports()` API only returns `{ module, name, kind }`
+ * — limits and the shared flag are not exposed — so we read them out of
+ * the binary directly. Returns descriptors for whichever of the two are
+ * present; missing entries map to undefined fields.
+ *
+ * The parser only descends into section id 2 (Imports) and stops as soon
+ * as the imports run out. It tolerates unknown leading custom sections.
+ *
+ * Wasm binary layout (relevant subset):
+ *   magic+version (8 bytes), then a sequence of sections:
+ *     section: id:byte, size:varuint32, content:bytes[size]
+ *   Imports section content:
+ *     count:varuint32, entries:Import[count]
+ *   Import:
+ *     module:vec<u8>, name:vec<u8>, kind:byte, descriptor
+ *   Memory descriptor (kind=2):
+ *     limits-flag:byte (bit0=has_max, bit1=shared, bit2=memory64)
+ *     min:varuint32 (or varuint64 if memory64)
+ *     max:varuint32 (or varuint64) if has_max
+ *   Table descriptor (kind=1):
+ *     elem-type:byte (0x70=funcref, 0x6f=externref)
+ *     limits-flag:byte (bit0=has_max), then min, then max if has_max
+ */
+function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
+  const out: ParsedEnvImports = {};
+
+  // Magic 0x00 0x61 0x73 0x6d ('\0asm') and version 1.
+  if (bytes.length < 8) return out;
+  if (
+    bytes[0] !== 0x00 ||
+    bytes[1] !== 0x61 ||
+    bytes[2] !== 0x73 ||
+    bytes[3] !== 0x6d
+  ) {
+    return out;
+  }
+
+  let offset = 8;
+  const decoder = new TextDecoder();
+
+  while (offset < bytes.length) {
+    const sectionId = bytes[offset++];
+    const [sectionSize, sizeOffset] = readVarUint32(bytes, offset);
+    offset = sizeOffset;
+    const sectionEnd = offset + sectionSize;
+
+    if (sectionId !== 2) {
+      offset = sectionEnd;
+      continue;
+    }
+
+    const [importCount, countOffset] = readVarUint32(bytes, offset);
+    offset = countOffset;
+
+    for (let i = 0; i < importCount; i++) {
+      const [modLen, modLenEnd] = readVarUint32(bytes, offset);
+      offset = modLenEnd;
+      const modName = decoder.decode(bytes.subarray(offset, offset + modLen));
+      offset += modLen;
+
+      const [nmLen, nmLenEnd] = readVarUint32(bytes, offset);
+      offset = nmLenEnd;
+      const importName = decoder.decode(bytes.subarray(offset, offset + nmLen));
+      offset += nmLen;
+
+      const kind = bytes[offset++];
+
+      // 0=function, 1=table, 2=memory, 3=global. We only care about
+      // env.memory and env.__indirect_function_table; everything else
+      // gets skipped past by reading just enough of its descriptor to
+      // advance the cursor.
+      if (kind === 0) {
+        // function: typeidx
+        const [, end] = readVarUint32(bytes, offset);
+        offset = end;
+      } else if (kind === 1) {
+        // table: reftype + limits
+        const elemTypeByte = bytes[offset++];
+        const flags = bytes[offset++];
+        const [initial, afterInitial] = readVarUint32(bytes, offset);
+        offset = afterInitial;
+        let maximum: number | undefined;
+        if (flags & 0x01) {
+          const [max, afterMax] = readVarUint32(bytes, offset);
+          maximum = max;
+          offset = afterMax;
+        }
+        if (modName === "env" && importName === "__indirect_function_table") {
+          const element = elemTypeByte === 0x6f ? "externref" : "funcref";
+          out.table = { element, initial, maximum };
+        }
+      } else if (kind === 2) {
+        // memory: limits with shared bit
+        const flags = bytes[offset++];
+        const isMemory64 = (flags & 0x04) !== 0;
+        const [initial, afterInitial] = isMemory64
+          ? readVarUint64AsNumber(bytes, offset)
+          : readVarUint32(bytes, offset);
+        offset = afterInitial;
+        let maximum: number | undefined;
+        if (flags & 0x01) {
+          const [max, afterMax] = isMemory64
+            ? readVarUint64AsNumber(bytes, offset)
+            : readVarUint32(bytes, offset);
+          maximum = max;
+          offset = afterMax;
+        }
+        if (modName === "env" && importName === "memory") {
+          out.memory = {
+            initial,
+            maximum,
+            shared: (flags & 0x02) !== 0,
+          };
+        }
+      } else if (kind === 3) {
+        // global: valtype + mutability
+        offset += 2;
+      } else {
+        // Unknown kind — bail to be safe rather than misalign the parse.
+        return out;
+      }
+    }
+
+    return out;
+  }
+
+  return out;
+}
+
+function readVarUint32(bytes: Uint8Array, offset: number): [number, number] {
+  let result = 0;
+  let shift = 0;
+  while (true) {
+    const b = bytes[offset++];
+    result |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+    if (shift > 35) {
+      throw new Error("WASIX: malformed varuint32 in module import section");
+    }
+  }
+  return [result >>> 0, offset];
+}
+
+function readVarUint64AsNumber(
+  bytes: Uint8Array,
+  offset: number,
+): [number, number] {
+  let result = 0n;
+  let shift = 0n;
+  while (true) {
+    const b = bytes[offset++];
+    result |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7n;
+    if (shift > 70n) {
+      throw new Error("WASIX: malformed varuint64 in module import section");
+    }
+  }
+  if (result > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("WASIX: memory64 limit exceeds Number.MAX_SAFE_INTEGER");
+  }
+  return [Number(result), offset];
+}
+
 function validateMemoryOverride(
   memory: WebAssembly.Memory,
   descriptor: { initial: number; maximum?: number; shared: boolean },
@@ -855,7 +1066,12 @@ function readString(
   ptr: number,
   len: number,
 ): string {
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+  // Copy out before decoding: when env.memory is a SharedArrayBuffer
+  // (the threaded wasix-libc default) TextDecoder rejects views over it.
+  // `slice` returns a Uint8Array backed by a fresh non-shared ArrayBuffer.
+  return new TextDecoder().decode(
+    new Uint8Array(memory.buffer, ptr, len).slice(),
+  );
 }
 
 function readIOVectors(
