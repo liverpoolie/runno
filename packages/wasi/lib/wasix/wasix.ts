@@ -214,11 +214,34 @@ export class WASIX {
     // surface. Override the preview1 entries so the FS provider's
     // preopen map (e.g. fd 4 = "/home") is visible to the libc startup
     // walk; otherwise it stops after fd 3 and never finds /home.
+    //
+    // Path ops are also routed through the FS provider when libc
+    // happens to import the preview1 entry instead of the wasix_32v1
+    // one. wasix-libc 0.4.3 does this for `rmdir` (preview1
+    // `path_remove_directory`); the preview1 stub in wasi.ts returns
+    // ENOSYS, so without this override `rmdir` always fails even
+    // though the drive can perform it. Mirror the syscalls that have
+    // a richer semantics in the provider (e.g. ENOTEMPTY checks).
+    // wasix-libc reaches into preview1 for several path/fd ops even
+    // when the binary is otherwise wasix_32v1 (rmdir → preview1
+    // `path_remove_directory`, stat → preview1 `path_filestat_get`,
+    // readdir → preview1 `fd_readdir`). The preview1 impls in wasi.ts
+    // call the drive directly and return its raw error vocabulary
+    // (e.g. ENOTCAPABLE for "not present") and don't synthesize the
+    // POSIX-shaped readdir entries (`.` / `..`, no `.runno`). Route
+    // them through the WASIX provider so the translation is uniform.
     const preview1Overrides = {
       ...preview1,
       proc_exit: procExit,
       fd_prestat_get: this.wasix_fd_prestat_get.bind(this),
       fd_prestat_dir_name: this.wasix_fd_prestat_dir_name.bind(this),
+      fd_readdir: this.wasix_fd_readdir.bind(this),
+      path_filestat_get: this.wasix_path_filestat_get.bind(this),
+      path_open: this.wasix_path_open.bind(this),
+      path_create_directory: this.wasix_path_create_directory.bind(this),
+      path_remove_directory: this.wasix_path_remove_directory.bind(this),
+      path_unlink_file: this.wasix_path_unlink_file.bind(this),
+      path_rename: this.wasix_path_rename.bind(this),
     };
     return {
       env: envImports,

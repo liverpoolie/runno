@@ -62,8 +62,18 @@ function dateToNs(date: Date): bigint {
  * `EACCESS` alongside the same numeric slot; wasix uses the canonical
  * `EACCES` spelling with the same value). A numeric cast is therefore
  * exact and round-trip-safe for the ergonomic wrapper's purposes.
+ *
+ * The drive returns `ENOTCAPABLE` for both "path missing" and
+ * "capability denied" because the flat-path map can't distinguish them.
+ * POSIX-shaped binaries (wasix-libc) check `errno == ENOENT` to detect
+ * absent paths, so we rewrite `ENOTCAPABLE` to `ENOENT` here for path
+ * lookups. Preview1 callers go through wasi.ts directly and still see
+ * the original code (the WASI test suite asserts on it).
  */
 function toWasixResult(err: Preview1Result): Result {
+  if (err === Preview1Result.ENOTCAPABLE) {
+    return Result.ENOENT;
+  }
   return err as unknown as Result;
 }
 
@@ -246,12 +256,36 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
     if (cookie > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new WASIXError(Result.EOVERFLOW);
     }
-    const entries: DirEntry[] = list.map((entry, index) => ({
-      next: BigInt(index + 1),
-      ino: cyrb53Bigint(entry.name),
-      filetype: entry.type as unknown as FileType,
-      name: entry.name,
-    }));
+    // Drop the `.runno` sentinel that `WASIDrive.pathCreateDir` plants
+    // in every mkdir'd directory — it's a flat-path-map artefact and
+    // not a real entry the guest ever wrote. Going away with the
+    // drive extraction in a later slice.
+    const realEntries = list.filter((entry) => entry.name !== ".runno");
+    // Synthesize POSIX `.` and `..` entries. wasix-libc's readdir
+    // implementation passes them through verbatim (matches every
+    // hosted-libc behaviour the wasmer suite asserts against), and
+    // omitting them breaks tests like closing-pre-opened-dirs that
+    // grep for `.` in the listing.
+    const entries: DirEntry[] = [
+      {
+        next: 1n,
+        ino: 0n,
+        filetype: FileType.DIRECTORY,
+        name: ".",
+      },
+      {
+        next: 2n,
+        ino: 0n,
+        filetype: FileType.DIRECTORY,
+        name: "..",
+      },
+      ...realEntries.map((entry, index) => ({
+        next: BigInt(index + 3),
+        ino: cyrb53Bigint(entry.name),
+        filetype: entry.type as unknown as FileType,
+        name: entry.name,
+      })),
+    ];
     const startIndex = Number(cookie);
     return entries.slice(startIndex);
   }

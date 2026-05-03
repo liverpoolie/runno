@@ -36,6 +36,14 @@ export class WASIDrive {
   fs: WASIFS;
   nextFD: FileDescriptor = 10;
   openMap: Map<FileDescriptor, OpenFile | OpenDirectory> = new Map();
+  /**
+   * Set of fds bound to preopens. Their entries in `openMap` survive
+   * user-initiated `close()` calls because wasix-libc's preopen cache
+   * keeps using them to resolve cwd-relative paths even after the guest
+   * believes the fd is closed (matches wasmer runtime behaviour — the
+   * `closing-pre-opened-dirs` test relies on it).
+   */
+  private preopens: Set<FileDescriptor> = new Set();
 
   constructor(fs: WASIFS, options?: WASIDriveOptions) {
     this.fs = { ...fs };
@@ -47,6 +55,7 @@ export class WASIDrive {
     //   1. how to access preopens - https://github.com/WebAssembly/WASI/issues/323
     //   2. how preopens work - https://github.com/WebAssembly/WASI/issues/352
     this.openMap.set(3, new OpenDirectory(this.fs, "/"));
+    this.preopens.add(3);
 
     // Extra preopens (WASIX runtimes pass these to expose mounts beyond the
     // implicit root, e.g. "/home" alongside ".").
@@ -55,6 +64,7 @@ export class WASIDrive {
       for (const preopen of options.preopens) {
         const fd = preopen.fd ?? nextPreopenFd++;
         this.openMap.set(fd, new OpenDirectory(this.fs, preopen.prefix));
+        this.preopens.add(fd);
       }
     }
   }
@@ -93,12 +103,40 @@ export class WASIDrive {
     return dir.containsDirectory(path);
   }
 
+  /**
+   * If `path` has a parent component, validate that the parent
+   * resolves to an existing directory. POSIX behaviour:
+   *   - parent doesn't exist → ENOENT
+   *   - parent is a regular file → ENOTDIR
+   *
+   * Returns `null` when validation passes (or there is no parent
+   * component, i.e. the operation targets a single segment under the
+   * directory). Both `open(O_CREAT)` and `mkdir` need this guard so the
+   * flat-path map can't be tricked into planting entries under a leaf
+   * file or a non-existent prefix.
+   */
+  private validateParent(
+    dir: OpenDirectory,
+    path: string,
+  ): Result.ENOTDIR | Result.ENOENT | null {
+    const lastSlash = path.lastIndexOf("/");
+    if (lastSlash <= 0) return null;
+    const parent = path.slice(0, lastSlash);
+    if (dir.containsFile(parent)) {
+      return Result.ENOTDIR;
+    }
+    if (!dir.containsDirectory(parent)) {
+      return Result.ENOENT;
+    }
+    return null;
+  }
+
   //
   // Public Interface
   //
   open(
     fdDir: FileDescriptor,
-    path: WASIPath,
+    rawPath: WASIPath,
     oflags: number,
     fdflags: number,
   ): DriveResult<FileDescriptor> {
@@ -111,6 +149,20 @@ export class WASIDrive {
     if (!(openDir instanceof OpenDirectory)) {
       // Must be relative to a directory
       return [Result.EBADF];
+    }
+
+    const path = normalizeRelative(rawPath);
+    if (path === null) {
+      // Tried to escape past the directory root; the flat-path drive
+      // has no notion of a parent above the preopen.
+      return [Result.ENOTCAPABLE];
+    }
+
+    // POSIX: if a path component above the leaf is a regular file or
+    // doesn't exist, fail before touching the flat path map.
+    const parentErr = this.validateParent(openDir, path);
+    if (parentErr !== null) {
+      return [parentErr];
     }
 
     if (openDir.containsFile(path)) {
@@ -149,6 +201,14 @@ export class WASIDrive {
         };
         return this.openFile(this.fs[fullPath], truncateFile, fdflags);
       }
+      // ENOTCAPABLE is the preview1 vocabulary for "drive can't
+      // satisfy this open"; it covers both "path missing" and
+      // "capability not granted" because the flat-path map can't
+      // distinguish them. The WASIX provider translates this to
+      // ENOENT for POSIX-shaped binaries that key on `errno ==
+      // ENOENT`. Preview1 callers see the original code so the WASI
+      // test suite (which asserts ENOTCAPABLE explicitly) keeps
+      // passing.
       return [Result.ENOTCAPABLE];
     }
   }
@@ -161,6 +221,13 @@ export class WASIDrive {
     const file = this.openMap.get(fd);
     if (file instanceof OpenFile) {
       file.sync();
+    }
+
+    // Preopen fds report success but stay in the map. wasix-libc's
+    // resolver keeps them in its own cache and re-uses them to translate
+    // cwd-relative paths after the guest "closes" them.
+    if (this.preopens.has(fd)) {
+      return Result.SUCCESS;
     }
 
     this.openMap.delete(fd);
@@ -256,11 +323,16 @@ export class WASIDrive {
     return Result.SUCCESS;
   }
 
-  unlink(fdDir: FileDescriptor, path: string): Result {
+  unlink(fdDir: FileDescriptor, rawPath: string): Result {
     const openDir = this.openMap.get(fdDir);
     if (!(openDir instanceof OpenDirectory)) {
       // Must be relative to a directory
       return Result.EBADF;
+    }
+
+    const path = normalizeRelative(rawPath);
+    if (path === null || path === ".") {
+      return Result.ENOENT;
     }
 
     if (!openDir.contains(path)) {
@@ -281,9 +353,9 @@ export class WASIDrive {
 
   rename(
     oldFdDir: FileDescriptor,
-    oldPath: string,
+    rawOldPath: string,
     newFdDir: FileDescriptor,
-    newPath: string,
+    rawNewPath: string,
   ): Result {
     const oldDir = this.openMap.get(oldFdDir);
     const newDir = this.openMap.get(newFdDir);
@@ -293,6 +365,17 @@ export class WASIDrive {
     ) {
       // Must be relative to a directory
       return Result.EBADF;
+    }
+
+    const oldPath = normalizeRelative(rawOldPath);
+    const newPath = normalizeRelative(rawNewPath);
+    if (
+      oldPath === null ||
+      newPath === null ||
+      oldPath === "." ||
+      newPath === "."
+    ) {
+      return Result.ENOENT;
     }
 
     if (!oldDir.contains(oldPath)) {
@@ -336,10 +419,15 @@ export class WASIDrive {
     return [Result.SUCCESS, file.stat()];
   }
 
-  pathStat(fdDir: FileDescriptor, path: string): DriveResult<DriveStat> {
+  pathStat(fdDir: FileDescriptor, rawPath: string): DriveResult<DriveStat> {
     const dir = this.openMap.get(fdDir);
     if (!(dir instanceof OpenDirectory)) {
       return [Result.EBADF];
+    }
+
+    const path = normalizeRelative(rawPath);
+    if (path === null) {
+      return [Result.ENOTCAPABLE];
     }
 
     if (dir.containsFile(path)) {
@@ -361,6 +449,9 @@ export class WASIDrive {
       const stat = new OpenDirectory(Object.fromEntries(subset), prefix).stat();
       return [Result.SUCCESS, stat];
     } else {
+      // See comment in `open` — preview1 keeps the original
+      // ENOTCAPABLE; the WASIX provider rewrites to ENOENT for POSIX
+      // callers.
       return [Result.ENOTCAPABLE];
     }
   }
@@ -405,12 +496,20 @@ export class WASIDrive {
     }
   }
 
-  pathSetAccessTime(fdDir: FileDescriptor, path: string, date: Date): Result {
+  pathSetAccessTime(
+    fdDir: FileDescriptor,
+    rawPath: string,
+    date: Date,
+  ): Result {
     const dir = this.openMap.get(fdDir);
     if (!(dir instanceof OpenDirectory)) {
       return Result.EBADF;
     }
 
+    const path = normalizeRelative(rawPath);
+    if (path === null) {
+      return Result.ENOTCAPABLE;
+    }
     const f = dir.get(path);
     if (!f) {
       return Result.ENOTCAPABLE;
@@ -423,7 +522,7 @@ export class WASIDrive {
 
   pathSetModificationTime(
     fdDir: FileDescriptor,
-    path: string,
+    rawPath: string,
     date: Date,
   ): Result {
     const dir = this.openMap.get(fdDir);
@@ -431,6 +530,10 @@ export class WASIDrive {
       return Result.EBADF;
     }
 
+    const path = normalizeRelative(rawPath);
+    if (path === null) {
+      return Result.ENOTCAPABLE;
+    }
     const f = dir.get(path);
     if (!f) {
       return Result.ENOTCAPABLE;
@@ -441,10 +544,24 @@ export class WASIDrive {
     return Result.SUCCESS;
   }
 
-  pathCreateDir(fdDir: FileDescriptor, path: string): Result {
+  pathCreateDir(fdDir: FileDescriptor, rawPath: string): Result {
     const dir = this.openMap.get(fdDir);
     if (!(dir instanceof OpenDirectory)) {
       return Result.EBADF;
+    }
+
+    const path = normalizeRelative(rawPath);
+    if (path === null || path === ".") {
+      // "." is the directory itself — already exists.
+      return Result.ENOTCAPABLE;
+    }
+
+    // Reject `mkdir foo/bar` when `foo` doesn't exist or is a regular
+    // file. Mirrors POSIX: mkdir fails ENOENT when a path-prefix
+    // component is missing, ENOTDIR when one is a non-directory.
+    const parentErr = this.validateParent(dir, path);
+    if (parentErr !== null) {
+      return parentErr;
     }
 
     if (dir.contains(path)) {
@@ -679,6 +796,32 @@ class OpenFile {
     newBuffer.set(this.buffer);
     this.buffer = newBuffer;
   }
+}
+
+/**
+ * Strip `./`, `/./` and empty segments from a directory-relative path
+ * so the flat-path drive sees one canonical key per logical entry.
+ * Without this, `mkdirat(cwd, "./test")` would store
+ * `<prefix>./test/.runno` while a sibling `stat("test")` would look
+ * for `<prefix>test/...` and miss it (the create-dir-at-cwd case).
+ *
+ * Returns the normalised path (`"."` for the directory itself), or
+ * `null` if the path contains a `..` segment. The flat-path drive
+ * cannot model traversal-relative paths — a path like `foo/../bar`
+ * needs `foo` to be a real directory before `..` is meaningful, and
+ * the drive has no notion of "real directory" beyond the keys present
+ * in the map. Callers turn `null` into ENOTCAPABLE so the WASI
+ * capability semantics (no escape outside the preopen tree) hold —
+ * matches the existing behaviour for paths the drive can't resolve.
+ */
+function normalizeRelative(path: string): string | null {
+  const out: string[] = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") return null;
+    out.push(segment);
+  }
+  return out.length === 0 ? "." : out.join("/");
 }
 
 function removePrefix(path: string, prefix: string) {
