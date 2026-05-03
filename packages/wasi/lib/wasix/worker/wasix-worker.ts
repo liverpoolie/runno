@@ -384,25 +384,47 @@ async function runGuest(
   });
 
   const wasix = new WASIX(context);
-  // Mirror WASIX.start's slice-3.5 env-import surface: wasix-libc binaries
-  // import `env.memory` (often shared) and `env.__indirect_function_table`
-  // and refuse to instantiate without matching descriptors. The host parses
-  // them from the wasm bytes before postMessage; here we turn them into
-  // concrete `WebAssembly.Memory` / `Table` instances and feed them into
-  // both the import object and `wasix.start`'s memory option (so the
-  // SharedArrayBuffer-aware TextDecoder path in `readString` sees the right
-  // memory before any export memory exists). When the host had no bytes
-  // (e.g. it was handed a pre-compiled `WebAssembly.Module`) descriptors
-  // are absent and resolveEnvImports returns an empty object — preview1
-  // binaries that export their own memory still instantiate fine.
-  const { memory, indirectFunctionTable } = wasix.resolveEnvImports(
-    msg.envDescriptors ?? {},
-  );
+  // Memory auto-detect for the worker entry. The byte-parsing path used
+  // by `WASIX.start` (see `parseEnvImportDescriptors`) needs the raw
+  // bytes; here we only have a `WebAssembly.Module`, so we use the
+  // type-reflection extension on `Module.imports(module)` instead. If
+  // the module imports `env.memory`, we build a matching memory from
+  // the import descriptor and inject it via `getImportObject({ memory })`.
+  const memory = resolveWorkerMemory(module);
   const instance = await WebAssembly.instantiate(
     module,
-    wasix.getImportObject({ memory, indirectFunctionTable }),
+    wasix.getImportObject({ memory }),
   );
   return wasix.start({ instance, module }, { memory });
+}
+
+function resolveWorkerMemory(
+  module: WebAssembly.Module,
+): WebAssembly.Memory | undefined {
+  const memoryImport = WebAssembly.Module.imports(module).find(
+    (i) => i.kind === "memory" && i.module === "env" && i.name === "memory",
+  );
+  if (!memoryImport) return undefined;
+  const type = (
+    memoryImport as {
+      type?: { minimum: number; maximum?: number; shared?: boolean };
+    }
+  ).type;
+  if (!type || typeof type.minimum !== "number") {
+    // Older embedders without type-reflection. Fall back to a
+    // conservative shared-memory shape compatible with wasix-libc's
+    // typical defaults — unreachable in modern browsers.
+    return new WebAssembly.Memory({
+      initial: 17,
+      maximum: 65536,
+      shared: true,
+    });
+  }
+  return new WebAssembly.Memory({
+    initial: type.minimum,
+    ...(type.maximum !== undefined ? { maximum: type.maximum } : {}),
+    ...(type.shared ? { shared: true } : {}),
+  } as WebAssembly.MemoryDescriptor);
 }
 
 function sendMessage(message: WASIXWorkerHostMessage): void {
