@@ -33,6 +33,14 @@ class WASIXExit extends Error {
   }
 }
 
+// One-shot warning: emitted on first construction when the host page is
+// not cross-origin-isolated. wasix-libc binaries import a shared
+// `env.memory`, which `WebAssembly.instantiate` rejects without
+// `crossOriginIsolated`. Without this hint the failure looks like a
+// generic "imported memory: shared but env doesn't allow shared memory"
+// error from the engine.
+let warnedNotCrossOriginIsolated = false;
+
 /**
  * WASIX runtime for the browser.
  *
@@ -59,21 +67,41 @@ export class WASIX {
 
   /**
    * Start a WASIX command.
+   *
+   * Compiles the module first so we can inspect its imports for
+   * `env.memory` / `env.__indirect_function_table` and supply a matching
+   * `WebAssembly.Memory` / `WebAssembly.Table` (constructed here, or
+   * passed in via `WASIXContextOptions.memory` / `.indirectFunctionTable`).
    */
   static async start(
     wasmSource: Response | PromiseLike<Response>,
     context: Partial<WASIXContextOptions> = {},
   ): Promise<WASIXExecutionResult> {
     const wasix = new WASIX(context);
-    const wasm = await WebAssembly.instantiateStreaming(
-      wasmSource,
-      wasix.getImportObject(),
-    );
-    return wasix.start(wasm);
+    const module = await WebAssembly.compileStreaming(wasmSource);
+    const { memory, indirectFunctionTable } = wasix.resolveEnvImports(module);
+    const imports = wasix.getImportObject({ memory, indirectFunctionTable });
+    const instance = await WebAssembly.instantiate(module, imports);
+    return wasix.start({ module, instance }, { memory });
   }
 
   constructor(context: Partial<WASIXContextOptions>) {
     this.context = new WASIXContext(context);
+
+    if (
+      !warnedNotCrossOriginIsolated &&
+      typeof globalThis !== "undefined" &&
+      (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated ===
+        false
+    ) {
+      warnedNotCrossOriginIsolated = true;
+      console.warn(
+        "WASIX: page is not cross-origin-isolated; shared-memory imports " +
+          "will fail at WebAssembly.instantiate. Configure COOP " +
+          "(`Cross-Origin-Opener-Policy: same-origin`) and COEP " +
+          "(`Cross-Origin-Embedder-Policy: require-corp`) on the host page.",
+      );
+    }
     // The internal WASI shares args / env / stdio with WASIX. The WASIX
     // filesystem surface routes through `context.fs` (a FileSystemProvider),
     // so the internal WASI's preview1 fs is intentionally empty — guests
@@ -91,7 +119,89 @@ export class WASIX {
     this.wasi = new WASI(wasiContext);
   }
 
-  getImportObject() {
+  /**
+   * Inspect the compiled module's imports for `env.memory` and
+   * `env.__indirect_function_table`. For each that's present, either
+   * validate the host-supplied override against the import descriptor
+   * or construct a fresh `WebAssembly.Memory` / `WebAssembly.Table`
+   * matching the declared shape. Returns whichever values the import
+   * object should use for the `env` namespace; either may be undefined
+   * (e.g. preview1-style binaries that export their own memory).
+   */
+  resolveEnvImports(module: WebAssembly.Module): {
+    memory?: WebAssembly.Memory;
+    indirectFunctionTable?: WebAssembly.Table;
+  } {
+    let memory: WebAssembly.Memory | undefined;
+    let indirectFunctionTable: WebAssembly.Table | undefined;
+
+    for (const entry of WebAssembly.Module.imports(module)) {
+      if (entry.module !== "env") continue;
+
+      if (entry.kind === "memory" && entry.name === "memory") {
+        // The import descriptor (`MemoryDescriptor`) is exposed on the
+        // entry across browsers as the bag of `initial`/`maximum`/`shared`
+        // fields. Type definitions don't surface it yet, so cast.
+        const descriptor = (
+          entry as unknown as { type?: WebAssembly.MemoryDescriptor }
+        ).type;
+        const initial = descriptor?.initial ?? 0;
+        const maximum = descriptor?.maximum;
+        const shared =
+          (descriptor as { shared?: boolean } | undefined)?.shared ?? false;
+
+        const override = this.context.memory;
+        if (override) {
+          validateMemoryOverride(override, { initial, maximum, shared });
+          memory = override;
+        } else {
+          memory = new WebAssembly.Memory({
+            initial,
+            ...(maximum !== undefined ? { maximum } : {}),
+            ...(shared ? { shared: true } : {}),
+          } as WebAssembly.MemoryDescriptor);
+        }
+        continue;
+      }
+
+      if (
+        entry.kind === "table" &&
+        entry.name === "__indirect_function_table"
+      ) {
+        const descriptor = (
+          entry as unknown as { type?: WebAssembly.TableDescriptor }
+        ).type;
+        const element = (descriptor?.element ?? "funcref") as
+          | "anyfunc"
+          | "funcref"
+          | "externref";
+        const initial = descriptor?.initial ?? 0;
+        const maximum = descriptor?.maximum;
+
+        const override = this.context.indirectFunctionTable;
+        if (override) {
+          validateTableOverride(override, { element, initial, maximum });
+          indirectFunctionTable = override;
+        } else {
+          indirectFunctionTable = new WebAssembly.Table({
+            element,
+            initial,
+            ...(maximum !== undefined ? { maximum } : {}),
+          } as WebAssembly.TableDescriptor);
+        }
+        continue;
+      }
+    }
+
+    return { memory, indirectFunctionTable };
+  }
+
+  getImportObject(
+    env: {
+      memory?: WebAssembly.Memory;
+      indirectFunctionTable?: WebAssembly.Table;
+    } = {},
+  ) {
     const preview1 = this.wasi.getImports("preview1", this.context.debug);
     const unstable = this.wasi.getImports("unstable", this.context.debug);
 
@@ -101,7 +211,13 @@ export class WASIX {
       throw new WASIXExit(code);
     };
 
+    const envImports: WebAssembly.ModuleImports = {};
+    if (env.memory) envImports.memory = env.memory;
+    if (env.indirectFunctionTable)
+      envImports.__indirect_function_table = env.indirectFunctionTable;
+
     return {
+      env: envImports,
       wasix_32v1: this.getWasix32v1Imports(),
       wasi_snapshot_preview1: { ...preview1, proc_exit: procExit },
       wasi_unstable: { ...unstable, proc_exit: procExit },
@@ -666,6 +782,50 @@ export class WASIX {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+function validateMemoryOverride(
+  memory: WebAssembly.Memory,
+  descriptor: { initial: number; maximum?: number; shared: boolean },
+): void {
+  // Engines expose memory.buffer as a SharedArrayBuffer when the
+  // underlying memory is shared.
+  const overrideShared =
+    typeof SharedArrayBuffer !== "undefined" &&
+    memory.buffer instanceof SharedArrayBuffer;
+  if (overrideShared !== descriptor.shared) {
+    throw new Error(
+      `WASIX: provided memory.shared=${overrideShared} does not match ` +
+        `module's env.memory.shared=${descriptor.shared}`,
+    );
+  }
+  const overrideInitial = memory.buffer.byteLength / 65536;
+  if (overrideInitial < descriptor.initial) {
+    throw new Error(
+      `WASIX: provided memory has ${overrideInitial} pages but ` +
+        `module's env.memory requires initial=${descriptor.initial}`,
+    );
+  }
+  // Maximum is not directly observable on the JS side without a private
+  // grow attempt, so we rely on the engine to reject at instantiation
+  // time if the override's max is below the descriptor's max.
+}
+
+function validateTableOverride(
+  table: WebAssembly.Table,
+  descriptor: { element: string; initial: number; maximum?: number },
+): void {
+  if (table.length < descriptor.initial) {
+    throw new Error(
+      `WASIX: provided indirect function table has length ${table.length} ` +
+        `but module's env.__indirect_function_table requires ` +
+        `initial=${descriptor.initial}`,
+    );
+  }
+  // Element type is not introspectable from JS; the engine rejects on
+  // mismatch at instantiation time. Maximum likewise.
+  void descriptor.element;
+  void descriptor.maximum;
+}
 
 function readString(
   memory: WebAssembly.Memory,

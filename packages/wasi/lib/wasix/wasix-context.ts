@@ -33,6 +33,14 @@ export type WASIXContextOptions = {
   signals?: SignalsProvider;
   sockets?: SocketsProvider;
   proc?: ProcProvider;
+
+  // Optional overrides for the import surface that WASIX otherwise
+  // auto-detects from the module's import section. Hosts pass these
+  // when reusing a `WebAssembly.Memory` / `WebAssembly.Table` across
+  // sibling instances (the threaded configuration). When unset the
+  // runtime constructs new ones to match the import descriptor.
+  memory?: WebAssembly.Memory;
+  indirectFunctionTable?: WebAssembly.Table;
 };
 
 /**
@@ -65,6 +73,9 @@ export class WASIXContext {
   sockets?: SocketsProvider;
   proc?: ProcProvider;
 
+  memory?: WebAssembly.Memory;
+  indirectFunctionTable?: WebAssembly.Table;
+
   constructor(options?: Partial<WASIXContextOptions>) {
     this.fs = options?.fs ?? new WASIDriveFileSystemProvider({});
     this.args = options?.args ?? [];
@@ -84,5 +95,8 @@ export class WASIXContext {
     this.signals = options?.signals;
     this.sockets = options?.sockets;
     this.proc = options?.proc;
+
+    this.memory = options?.memory;
+    this.indirectFunctionTable = options?.indirectFunctionTable;
   }
 }
