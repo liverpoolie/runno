@@ -17,7 +17,10 @@
 
 import { WASIX } from "../wasix.js";
 import { WASIXContext } from "../wasix-context.js";
-import { WASIDriveFileSystemProvider } from "../providers/ergonomic/filesystem-provider.js";
+import {
+  WASIDriveFileSystemProvider,
+  type ProviderPreopen,
+} from "../providers/ergonomic/filesystem-provider.js";
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
   ClockProvider,
@@ -65,6 +68,9 @@ export type SerialisableContext = {
   env?: Record<string, string>;
   isTTY?: boolean;
   fs?: WASIFS;
+  /** Preopens descriptor for the worker-side WASIDriveFileSystemProvider —
+   *  passes through verbatim from WASIXWorkerHostOptions.preopens. */
+  preopens?: ProviderPreopen[];
 };
 
 export type WASIXWorkerStartMessage = {
@@ -224,7 +230,12 @@ async function runGuest(
     args: msg.contextConfig.args,
     env: msg.contextConfig.env,
     isTTY: msg.contextConfig.isTTY,
-    fs: new WASIDriveFileSystemProvider(msg.contextConfig.fs ?? {}),
+    fs: new WASIDriveFileSystemProvider(
+      msg.contextConfig.fs ?? {},
+      msg.contextConfig.preopens
+        ? { preopens: msg.contextConfig.preopens }
+        : undefined,
+    ),
     stdin: msg.hasStdin ? bridgeStdin(msg.sharedBuffer) : () => null,
     stdout: (out: string) =>
       sendMessage({ target: "host", type: "stdout", text: out }),
