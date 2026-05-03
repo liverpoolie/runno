@@ -64,35 +64,48 @@ export type SkipEntry = {
  *     stubbed ENOSYS at the WASIX layer pending the fd-table extraction
  *     (`requires-future-feature`).
  */
-// wasix-libc binaries call getcwd / chdir at startup and the wasmer test
-// runner mounts the test dir at /home (wasix-libc's default cwd). Slice
-// 3.5 stops at the instantiation surface — it does not implement getcwd /
-// chdir or the /home preopen plumbing — so every FS-category test that
-// expects cwd-relative resolution fails at the first stat / mkdir even
-// though the binary instantiates and reaches main. These all unblock
-// once a cwd / chdir provider lands and the test harness mounts /home;
-// the work is naturally adjacent to the threads / proc slices.
-const REQUIRES_CWD_PLUMBING: SkipEntry = {
+// The remaining FS-category carve-outs hit drive-level limitations that
+// surface only once cwd plumbing lets the binary actually exercise the
+// flat-path WASIDrive (Slice 3.5 added getcwd / chdir / /home preopen,
+// which unblocked the rest of the wasmer cwd tests). The drive will be
+// extracted and grown in a follow-up; until then these stay carved out
+// with the underlying root-cause noted, not the cwd label they used to
+// share.
+const REQUIRES_DRIVE_PATH_NORMALIZATION: SkipEntry = {
   reason: "requires-future-feature",
   note:
-    "needs cwd / chdir / getcwd providers and /home preopen mount " +
-    "(wasix-libc default cwd is /home; wasmer runner mounts the test " +
-    "dir there).",
+    "WASIDrive's flat-path map does not normalise `./` / `/./` segments. " +
+    'wasmer\'s mkdirat(cwd_fd, "./testN") writes /home/./testN/.runno, ' +
+    'which subsequent stat("testN") cannot find. Lifts with the drive ' +
+    "extraction in a later slice.",
 };
 
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
-  // ── Slice 3.5 cwd-plumbing carve-outs ─────────────────────────────
-  // Buildable, instantiate cleanly under the new env-import surface,
-  // but the test logic depends on cwd / chdir / /home preopen.
-  "closing-pre-opened-dirs": REQUIRES_CWD_PLUMBING,
-  "create-and-remove-dirs": REQUIRES_CWD_PLUMBING,
-  "create-dir-at-cwd": REQUIRES_CWD_PLUMBING,
-  "create-dir-at-cwd-with-chdir": REQUIRES_CWD_PLUMBING,
-  "cross-fs-rename": REQUIRES_CWD_PLUMBING,
-  "cwd-to-home": REQUIRES_CWD_PLUMBING,
-  "distinct-inodes-same-basename": REQUIRES_CWD_PLUMBING,
-  "fstatat-with-chdir": REQUIRES_CWD_PLUMBING,
-  "open-under-file": REQUIRES_CWD_PLUMBING,
+  // ── Drive-level limitations exposed by cwd plumbing ───────────────
+  "create-dir-at-cwd": REQUIRES_DRIVE_PATH_NORMALIZATION,
+  "create-dir-at-cwd-with-chdir": REQUIRES_DRIVE_PATH_NORMALIZATION,
+  "create-and-remove-dirs": {
+    reason: "requires-future-feature",
+    note:
+      "WASIDrive does not enforce `parent dir must exist` on mkdir — " +
+      'mkdir("test1/test2") succeeds before mkdir("test1"), so the ' +
+      "test fails its first negative assertion. Drive-level fix.",
+  },
+  "closing-pre-opened-dirs": {
+    reason: "requires-future-feature",
+    note:
+      'test closes preopen fds 3-5 then calls opendir("."); wasmer keeps ' +
+      "the cwd preopen accessible via libc-cached state across close, but " +
+      "Runno's drive drops the fd entry on close so the subsequent open " +
+      "fails. Needs the wasmer-style libc preopen retention.",
+  },
+  "open-under-file": {
+    reason: "requires-future-feature",
+    note:
+      'open("parent/child") when `parent` is a regular file should ' +
+      "return ENOTDIR; WASIDrive happily creates the deeper path because " +
+      "the flat-path map does not validate parent type. Drive-level fix.",
+  },
   "pwrite-and-size": {
     reason: "requires-future-feature",
     note:
