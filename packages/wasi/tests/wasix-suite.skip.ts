@@ -230,7 +230,8 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     reason: "requires-future-feature",
     note: "mount syscall; Runno has a single preopen root.",
   },
-  "multi-threading": { reason: "requires-provider-threads" },
+  // multi-threading + condvar removed in Slice 6 — both pass under
+  // CooperativeThreadsProvider + SimulatedFutexProvider.
   pipe: { reason: "requires-provider-proc" },
   poll: {
     reason: "requires-future-feature",

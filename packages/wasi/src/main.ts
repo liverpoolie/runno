@@ -13,6 +13,9 @@ import {
   HTTPProvider,
   LoopbackFabric,
   LoopbackSocketsProvider,
+  CooperativeThreadsProvider,
+  SimulatedFutexProvider,
+  startThread,
 } from "../lib/main.js";
 
 (window as any)["WASI"] = WASI;
@@ -28,6 +31,9 @@ import {
 (window as any)["HTTPProvider"] = HTTPProvider;
 (window as any)["LoopbackFabric"] = LoopbackFabric;
 (window as any)["LoopbackSocketsProvider"] = LoopbackSocketsProvider;
+(window as any)["CooperativeThreadsProvider"] = CooperativeThreadsProvider;
+(window as any)["SimulatedFutexProvider"] = SimulatedFutexProvider;
+(window as any)["startThread"] = startThread;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;
 const argsInput = document.getElementById("args")! as HTMLInputElement;

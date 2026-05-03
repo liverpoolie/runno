@@ -212,10 +212,10 @@ async function runGuest(
     ? stubTTYProvider()
     : undefined;
   const threads: ThreadsProvider | undefined = asyncSet.has("threads")
-    ? stubThreadsProvider()
+    ? bridgeThreadsProvider(msg.sharedBuffer)
     : undefined;
   const futex: FutexProvider | undefined = asyncSet.has("futex")
-    ? stubFutexProvider()
+    ? bridgeFutexProvider(msg.sharedBuffer)
     : undefined;
   const signals: SignalsProvider | undefined = asyncSet.has("signals")
     ? stubSignalsProvider()
@@ -273,11 +273,47 @@ async function runGuest(
   });
 
   const wasix = new WASIX(context);
+  // Memory auto-detect for the worker entry. The byte-parsing path used
+  // by `WASIX.start` (see `parseEnvImportDescriptors`) needs the raw
+  // bytes; here we only have a `WebAssembly.Module`, so we use the
+  // type-reflection extension on `Module.imports(module)` instead. If
+  // the module imports `env.memory`, we build a matching memory from
+  // the import descriptor and inject it via `getImportObject({ memory })`.
+  const memory = resolveWorkerMemory(module);
   const instance = await WebAssembly.instantiate(
     module,
-    wasix.getImportObject(),
+    wasix.getImportObject({ memory }),
   );
-  return wasix.start({ instance, module });
+  return wasix.start({ instance, module }, { memory });
+}
+
+function resolveWorkerMemory(
+  module: WebAssembly.Module,
+): WebAssembly.Memory | undefined {
+  const memoryImport = WebAssembly.Module.imports(module).find(
+    (i) => i.kind === "memory" && i.module === "env" && i.name === "memory",
+  );
+  if (!memoryImport) return undefined;
+  const type = (
+    memoryImport as {
+      type?: { minimum: number; maximum?: number; shared?: boolean };
+    }
+  ).type;
+  if (!type || typeof type.minimum !== "number") {
+    // Older embedders without type-reflection. Fall back to a
+    // conservative shared-memory shape compatible with wasix-libc's
+    // typical defaults — unreachable in modern browsers.
+    return new WebAssembly.Memory({
+      initial: 17,
+      maximum: 65536,
+      shared: true,
+    });
+  }
+  return new WebAssembly.Memory({
+    initial: type.minimum,
+    ...(type.maximum !== undefined ? { maximum: type.maximum } : {}),
+    ...(type.shared ? { shared: true } : {}),
+  } as WebAssembly.MemoryDescriptor);
 }
 
 function sendMessage(message: WASIXWorkerHostMessage): void {
@@ -298,19 +334,97 @@ function stubRandomProvider(): RandomProvider {
 function stubTTYProvider(): TTYProvider {
   return { get: () => throwEnosys(), set: () => throwEnosys() };
 }
-function stubThreadsProvider(): ThreadsProvider {
+/**
+ * Bridge-backed sync `ThreadsProvider`. The host's async-capable
+ * provider is awaited on the main thread; the worker stays sync.
+ *
+ * Note: a host that wires a *real* multi-worker threads provider here
+ * must serialise the `wasi_thread_start` invocation in its own worker
+ * pool — the bridge only routes the syscall arguments, not the wasm
+ * call back into the spawned thread. The cooperative provider lives in
+ * the same realm as the guest and never uses this shim.
+ */
+function bridgeThreadsProvider(
+  sharedBuffer: SharedArrayBuffer,
+): ThreadsProvider {
+  const call = <T extends BridgeResponse>(
+    req: Parameters<typeof callBridgeSync>[1],
+  ) => callBridgeSync(sharedBuffer, req) as T;
   return {
-    spawn: () => throwEnosys(),
-    join: () => throwEnosys(),
-    exit: () => throwEnosys(),
-    sleep: () => throwEnosys(),
-    id: () => throwEnosys(),
-    parallelism: () => throwEnosys(),
-    signal: () => throwEnosys(),
+    spawn(startArg: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SPAWN }>>({
+        opcode: Opcode.THREAD_SPAWN,
+        args: { startArg },
+      });
+      return r.result.tid;
+    },
+    join(tid: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_JOIN }>>({
+        opcode: Opcode.THREAD_JOIN,
+        args: { tid },
+      });
+      return r.result.exitCode;
+    },
+    exit(code: number): void {
+      call<Extract<BridgeResponse, { opcode: Opcode.THREAD_EXIT }>>({
+        opcode: Opcode.THREAD_EXIT,
+        args: { code },
+      });
+    },
+    sleep(durationNs: bigint): void {
+      call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SLEEP }>>({
+        opcode: Opcode.THREAD_SLEEP,
+        args: { durationNs },
+      });
+    },
+    id(): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_ID }>>({
+        opcode: Opcode.THREAD_ID,
+        args: {},
+      });
+      return r.result.tid;
+    },
+    parallelism(): number {
+      const r = call<
+        Extract<BridgeResponse, { opcode: Opcode.THREAD_PARALLELISM }>
+      >({
+        opcode: Opcode.THREAD_PARALLELISM,
+        args: {},
+      });
+      return r.result.value;
+    },
+    signal(tid: number, signo: number): Result {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.THREAD_SIGNAL }>>(
+        {
+          opcode: Opcode.THREAD_SIGNAL,
+          args: { tid, signo },
+        },
+      );
+      return r.result.result;
+    },
   };
 }
-function stubFutexProvider(): FutexProvider {
-  return { wait: () => throwEnosys(), wake: () => throwEnosys() };
+
+function bridgeFutexProvider(sharedBuffer: SharedArrayBuffer): FutexProvider {
+  const call = <T extends BridgeResponse>(
+    req: Parameters<typeof callBridgeSync>[1],
+  ) => callBridgeSync(sharedBuffer, req) as T;
+  return {
+    wait(addr: number, expected: number, timeoutNs: bigint | null): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.FUTEX_WAIT }>>({
+        opcode: Opcode.FUTEX_WAIT,
+        args: { addr, expected, timeoutNs },
+      });
+      return r.result.value;
+    },
+    wake(addr: number, count: number): number {
+      const r = call<Extract<BridgeResponse, { opcode: Opcode.FUTEX_WAKE }>>({
+        opcode: Opcode.FUTEX_WAKE,
+        args: { addr, count },
+      });
+      return r.result.woken;
+    },
+  };
 }
 function stubSignalsProvider(): SignalsProvider {
   return {

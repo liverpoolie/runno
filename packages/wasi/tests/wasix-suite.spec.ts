@@ -31,6 +31,8 @@ import { join } from "node:path";
 import { test, expect } from "@playwright/test";
 
 import type {
+  CooperativeThreadsProvider,
+  SimulatedFutexProvider,
   WASIX,
   WASIXContext,
   WASIXWorkerHost,
@@ -225,6 +227,19 @@ function planForTest(name: string): TestPlan {
 
 const binaries = listWasmBinaries();
 
+/**
+ * Tests that pass in main mode but skip in worker mode because they
+ * exercise the cooperative threads + simulated futex providers, which
+ * are realm-local. Worker-mode hosts that want to run these would need
+ * to wire an async-capable `ThreadsProvider` (Slice 6 ships the bridge
+ * opcodes for that path; the spec doesn't supply one).
+ */
+const WORKER_MODE_THREADING_SKIPS = new Set<string>([
+  "multi-threading",
+  "example-condvar",
+  "example-multi-threading",
+]);
+
 test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
   test("at least one wasix-suite binary was built", () => {
     expect(
@@ -260,6 +275,21 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
           });
           test.fixme(true, `wasix-skip:${skip.reason}`);
         }
+        // Slice 6 caveat: the cooperative threads + simulated futex
+        // providers live in the same JS realm as the guest, so they
+        // can't cross the postMessage boundary into a Worker. Tests
+        // that exercise threading therefore skip in worker mode until
+        // a host wires a real async-capable threads provider.
+        if (mode === "worker" && WORKER_MODE_THREADING_SKIPS.has(name)) {
+          test.info().annotations.push({
+            type: "wasix-skip",
+            description:
+              "requires-cooperative-realm — cooperative threads / futex live " +
+              "in-realm; worker mode would need a host-supplied async " +
+              "threads provider.",
+          });
+          test.fixme(true, "wasix-skip:requires-cooperative-realm");
+        }
 
         const result = await page.evaluate(
           async (input: { plan: TestPlan; mode: WASIXSuiteMode }) => {
@@ -275,6 +305,8 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               WASIXContext: typeof WASIXContext;
               WASIXWorkerHost: typeof WASIXWorkerHost;
               WASIDriveFileSystemProvider: typeof WASIDriveFileSystemProvider;
+              CooperativeThreadsProvider: typeof CooperativeThreadsProvider;
+              SimulatedFutexProvider: typeof SimulatedFutexProvider;
             };
 
             // Seed a fresh WASIFS under /home for this run — the wasmer
@@ -300,6 +332,16 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
             let stdout = "";
             let stderr = "";
 
+            // Slice 6: always supply CooperativeThreadsProvider +
+            // SimulatedFutexProvider for the in-process suite. Tests that
+            // never call the thread / futex syscalls don't pay any cost
+            // beyond the empty TID-1 record allocated at construction.
+            // The futex provider's memory is wired by `WASIX.start` via
+            // its `setMemory` hook once the auto-detected memory is
+            // resolved.
+            const threads = new w.CooperativeThreadsProvider();
+            const futex = new w.SimulatedFutexProvider({ threads });
+
             if (input.mode === "main") {
               const wasiResult = await w.WASIX.start(
                 fetch(p.wasmUrl),
@@ -314,15 +356,23 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
                   },
                   stdin: () => null,
                   fs: new w.WASIDriveFileSystemProvider(fs, { preopens }),
+                  threads,
+                  futex,
                 }),
               );
               return { exitCode: wasiResult.exitCode, stdout, stderr };
             }
 
             // worker mode — WASIXWorkerHost spawns a dedicated worker and
-            // drives it through the bridge. fs and preopens cross postMessage
-            // as plain data; the worker reconstructs the
+            // drives it through the bridge. fs and preopens cross
+            // postMessage as plain data; the worker reconstructs the
             // WASIDriveFileSystemProvider with the same preopen config.
+            // The cooperative threads / simulated futex providers live
+            // in the same realm as the guest, so they can't be wired
+            // across postMessage — tests that need them are limited to
+            // main-mode in the current slice, and the suite spec relies
+            // on the wasixcc-built suite to surface this naturally (a
+            // guest calling `thread_spawn` in worker mode sees ENOSYS).
             const host = new w.WASIXWorkerHost(fetch(p.wasmUrl), {
               args: p.args,
               env: { PWD: "/home" },

@@ -24,6 +24,10 @@ export {
   LoopbackSocketsProvider,
   LoopbackFabric,
 } from "./wasix/providers/loopback-sockets.js";
+export { CooperativeThreadsProvider } from "./wasix/providers/cooperative-threads.js";
+export { SimulatedFutexProvider } from "./wasix/providers/simulated-futex.js";
+export { startThread } from "./wasix/thread-start.js";
+export type { ThreadStartResult } from "./wasix/thread-start.js";
 export type {
   ClockProvider,
   RandomProvider,

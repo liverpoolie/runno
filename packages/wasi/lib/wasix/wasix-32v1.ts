@@ -352,6 +352,31 @@ export enum SockOpt {
   TYPE = 25,
 }
 
+// ─── Threads + Futex ABI ─────────────────────────────────────────────────────
+//
+// Slice 6 constants. Mirrors `wasix-org/wasix` thread / futex syscalls.
+// The provider sees the JS-native shapes; only the syscall marshalling layer
+// in `wasix.ts` reads / writes these constants from guest memory.
+
+/**
+ * Reserved TID per WASIX convention. The cooperative scheduler allocates
+ * TIDs starting at 2 (TID 1 = the thread that ran `_start`). 0 is never
+ * handed to the guest.
+ */
+export const WASIX_TID_INVALID = 0;
+
+/**
+ * `futex_wait` `ret_woken` byte written into the wasm-side u32 ret_ptr.
+ *
+ * The host returns `Result.SUCCESS` from `futex_wait` whenever the parker
+ * was either woken or timed out — the discriminator is this byte. On
+ * expected-value mismatch, `futex_wait` returns `Result.EAGAIN` and does
+ * not touch ret_ptr. This matches wasmer's host implementation and the
+ * wasix-libc ABI (the field is declared `bool *ret_woken`).
+ */
+export const FUTEX_RET_WOKEN = 1;
+export const FUTEX_RET_TIMEOUT = 0;
+
 // ─── Error class ─────────────────────────────────────────────────────────────
 
 // Thrown by provider implementations to signal a specific WASIX errno.
