@@ -20,12 +20,24 @@ export type DriveStat = {
   type: FileType;
 };
 
+export type WASIDrivePreopen = {
+  /** File-descriptor number to bind this preopen to. Defaults to the next free fd starting at 4. */
+  fd?: FileDescriptor;
+  /** Drive-internal prefix (always rooted, trailing slash) used when resolving paths through this fd. */
+  prefix: string;
+};
+
+export type WASIDriveOptions = {
+  /** Additional preopens beyond the implicit fd 3 = "/" root. */
+  preopens?: WASIDrivePreopen[];
+};
+
 export class WASIDrive {
   fs: WASIFS;
   nextFD: FileDescriptor = 10;
   openMap: Map<FileDescriptor, OpenFile | OpenDirectory> = new Map();
 
-  constructor(fs: WASIFS) {
+  constructor(fs: WASIFS, options?: WASIDriveOptions) {
     this.fs = { ...fs };
 
     // Preopens are discovered by the binary using `fd_prestat_get` and then
@@ -35,6 +47,16 @@ export class WASIDrive {
     //   1. how to access preopens - https://github.com/WebAssembly/WASI/issues/323
     //   2. how preopens work - https://github.com/WebAssembly/WASI/issues/352
     this.openMap.set(3, new OpenDirectory(this.fs, "/"));
+
+    // Extra preopens (WASIX runtimes pass these to expose mounts beyond the
+    // implicit root, e.g. "/home" alongside ".").
+    if (options?.preopens) {
+      let nextPreopenFd = 4;
+      for (const preopen of options.preopens) {
+        const fd = preopen.fd ?? nextPreopenFd++;
+        this.openMap.set(fd, new OpenDirectory(this.fs, preopen.prefix));
+      }
+    }
   }
 
   //
@@ -43,7 +65,7 @@ export class WASIDrive {
   private openFile(
     fileData: WASIFile,
     truncateFile: boolean,
-    fdflags: number
+    fdflags: number,
   ): DriveResult<FileDescriptor> {
     const file = new OpenFile(fileData, fdflags);
     if (truncateFile) {
@@ -78,7 +100,7 @@ export class WASIDrive {
     fdDir: FileDescriptor,
     path: WASIPath,
     oflags: number,
-    fdflags: number
+    fdflags: number,
   ): DriveResult<FileDescriptor> {
     const createFileIfNone: boolean = !!(oflags & OpenFlags.CREAT);
     const failIfNotDir: boolean = !!(oflags & OpenFlags.DIRECTORY);
@@ -103,11 +125,13 @@ export class WASIDrive {
       return this.openFile(openDir.get(path)!, truncateFile, fdflags);
     } else if (this.hasDir(openDir, path)) {
       if (path === ".") {
-        return this.openDir(this.fs, "/");
+        return this.openDir(this.fs, openDir.prefix);
       }
 
-      const prefix = `/${path}/`;
-      // This is a directory
+      // Compose the new prefix from the parent preopen's prefix so a
+      // sub-directory open under a non-root preopen (e.g. fd 4 at
+      // "/home/") resolves to "/home/<path>/" rather than "/<path>/".
+      const prefix = `${openDir.prefix}${path}/`;
       const dir = Object.entries(this.fs).filter(([s]) => s.startsWith(prefix));
       return this.openDir(Object.fromEntries(dir), prefix);
     } else {
@@ -155,7 +179,7 @@ export class WASIDrive {
   pread(
     fd: FileDescriptor,
     bytes: number,
-    offset: number
+    offset: number,
   ): DriveResult<Uint8Array> {
     const file = this.openMap.get(fd);
     if (!file || file instanceof OpenDirectory) {
@@ -199,7 +223,7 @@ export class WASIDrive {
   seek(
     fd: FileDescriptor,
     offset: bigint,
-    whence: Whence
+    whence: Whence,
   ): DriveResult<bigint> {
     const file = this.openMap.get(fd);
     if (!file || file instanceof OpenDirectory) {
@@ -259,7 +283,7 @@ export class WASIDrive {
     oldFdDir: FileDescriptor,
     oldPath: string,
     newFdDir: FileDescriptor,
-    newPath: string
+    newPath: string,
   ): Result {
     const oldDir = this.openMap.get(oldFdDir);
     const newDir = this.openMap.get(newFdDir);
@@ -324,12 +348,17 @@ export class WASIDrive {
       return [Result.SUCCESS, stat];
     } else if (this.hasDir(dir, path)) {
       if (path === ".") {
-        return [Result.SUCCESS, new OpenDirectory(this.fs, "/").stat()];
+        return [Result.SUCCESS, new OpenDirectory(this.fs, dir.prefix).stat()];
       }
 
-      const prefix = `/${path}/`;
-      const dir = Object.entries(this.fs).filter(([s]) => s.startsWith(prefix));
-      const stat = new OpenDirectory(Object.fromEntries(dir), prefix).stat();
+      // See comment in `open` — the new prefix must include the parent
+      // preopen's prefix so multi-preopen layouts (e.g. fd 4 = "/home/")
+      // resolve sub-directories under the right subtree.
+      const prefix = `${dir.prefix}${path}/`;
+      const subset = Object.entries(this.fs).filter(([s]) =>
+        s.startsWith(prefix),
+      );
+      const stat = new OpenDirectory(Object.fromEntries(subset), prefix).stat();
       return [Result.SUCCESS, stat];
     } else {
       return [Result.ENOTCAPABLE];
@@ -395,7 +424,7 @@ export class WASIDrive {
   pathSetModificationTime(
     fdDir: FileDescriptor,
     path: string,
-    date: Date
+    date: Date,
   ): Result {
     const dir = this.openMap.get(fdDir);
     if (!(dir instanceof OpenDirectory)) {
@@ -525,7 +554,7 @@ class OpenFile {
     } else {
       const newSize = Math.max(
         this.offset + data.byteLength,
-        this.buffer.byteLength
+        this.buffer.byteLength,
       );
       this.resize(newSize);
       this.buffer.set(data, this.offset);
@@ -548,7 +577,7 @@ class OpenFile {
     } else {
       const newSize = Math.max(
         offset + data.byteLength,
-        this.buffer.byteLength
+        this.buffer.byteLength,
       );
       this.resize(newSize);
       this.buffer.set(data, offset);
@@ -638,7 +667,7 @@ class OpenFile {
 
     if (this.buffer.buffer.byteLength === 0) {
       underBuffer = new ArrayBuffer(
-        requiredBytes < 1024 ? 1024 : requiredBytes * 2
+        requiredBytes < 1024 ? 1024 : requiredBytes * 2,
       );
     } else if (requiredBytes > this.buffer.buffer.byteLength * 2) {
       underBuffer = new ArrayBuffer(requiredBytes * 2);

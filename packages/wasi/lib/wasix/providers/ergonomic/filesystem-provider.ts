@@ -10,6 +10,7 @@
 
 import { WASIFS } from "../../../types.js";
 import { WASIDrive } from "../../../wasi/wasi-drive.js";
+import type { WASIDrivePreopen } from "../../../wasi/wasi-drive.js";
 // The WASIDrive is a preview1 artefact; its Result enum mirrors
 // wasix-32v1.Result numerically. We read preview1 error codes directly
 // and pass them straight to WASIXError (whose constructor accepts the
@@ -67,6 +68,31 @@ function toWasixResult(err: Preview1Result): Result {
 }
 
 /**
+ * One preopen exposed by the provider beyond the implicit fd 3 = ".".
+ * Each maps a guest-visible name (e.g. "/home") to a drive prefix
+ * (always rooted, trailing slash) used when resolving paths through
+ * the bound fd.
+ */
+export type ProviderPreopen = {
+  /** Guest-visible name returned by `fd_prestat_dir_name`. */
+  name: string;
+  /** Drive-internal prefix used when storing / resolving entries. */
+  prefix: string;
+};
+
+export type WASIDriveFileSystemProviderOptions = {
+  /**
+   * Extra preopens beyond the default fd 3 = ".". Bound to consecutive
+   * fds starting at 4 in the order supplied.
+   *
+   * Required to expose mounts that wasix-libc expects to find by
+   * absolute prefix (e.g. wasix-libc's default cwd is `/home`, so a
+   * `/home` preopen is needed for cwd-relative file ops to resolve).
+   */
+  preopens?: ProviderPreopen[];
+};
+
+/**
  * Ergonomic filesystem provider that delegates to the existing in-memory
  * `WASIDrive`. Hosts construct one with a `WASIFS` (or an existing drive)
  * and pass it as `WASIXContext.fs`.
@@ -74,9 +100,38 @@ function toWasixResult(err: Preview1Result): Result {
 export class WASIDriveFileSystemProvider implements FileSystemProvider {
   readonly drive: WASIDrive;
 
-  constructor(fsOrDrive: WASIFS | WASIDrive) {
-    this.drive =
-      fsOrDrive instanceof WASIDrive ? fsOrDrive : new WASIDrive(fsOrDrive);
+  /** fd → guest-visible preopen name. fd 3 always maps to ".". */
+  private readonly preopenNames: Map<number, string>;
+
+  constructor(
+    fsOrDrive: WASIFS | WASIDrive,
+    options?: WASIDriveFileSystemProviderOptions,
+  ) {
+    this.preopenNames = new Map();
+    this.preopenNames.set(3, ".");
+
+    if (fsOrDrive instanceof WASIDrive) {
+      this.drive = fsOrDrive;
+      // Trust the caller — assume any preopens beyond fd 3 are already
+      // registered on the drive. Mirror them here so prestat reads find
+      // the names.
+      if (options?.preopens) {
+        let nextFd = 4;
+        for (const p of options.preopens) {
+          this.preopenNames.set(nextFd++, p.name);
+        }
+      }
+    } else {
+      const drivePreopens: WASIDrivePreopen[] | undefined =
+        options?.preopens?.map((p) => ({ prefix: p.prefix }));
+      this.drive = new WASIDrive(fsOrDrive, { preopens: drivePreopens });
+      if (options?.preopens) {
+        let nextFd = 4;
+        for (const p of options.preopens) {
+          this.preopenNames.set(nextFd++, p.name);
+        }
+      }
+    }
   }
 
   // ─── File descriptor ops ──────────────────────────────────────────────
@@ -166,18 +221,16 @@ export class WASIDriveFileSystemProvider implements FileSystemProvider {
   }
 
   fdPrestatGet(fd: number): PreopenInfo | null {
-    // WASIDrive hard-codes fd 3 as the single preopen at "/".
-    if (fd !== 3) {
-      return null;
-    }
-    return { name: "." };
+    const name = this.preopenNames.get(fd);
+    return name === undefined ? null : { name };
   }
 
   fdPrestatDirName(fd: number): string {
-    if (fd !== 3) {
+    const name = this.preopenNames.get(fd);
+    if (name === undefined) {
       throw new WASIXError(Result.EBADF);
     }
-    return ".";
+    return name;
   }
 
   fdReaddir(fd: number, cookie: bigint): DirEntry[] {
