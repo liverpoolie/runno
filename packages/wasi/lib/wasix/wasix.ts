@@ -67,6 +67,13 @@ export class WASIX {
   private _random?: RandomProvider;
 
   /**
+   * Current working directory as an absolute, normalised path. Mutated
+   * by `chdir`, read by `getcwd`. Default `/home` mirrors wasix-libc's
+   * compiled-in default (the wasmer runner mounts the test dir there).
+   */
+  private cwd: string = "/home";
+
+  /**
    * Start a WASIX command.
    *
    * Buffers the module bytes so we can parse the import section
@@ -202,10 +209,21 @@ export class WASIX {
     if (env.indirectFunctionTable)
       envImports.__indirect_function_table = env.indirectFunctionTable;
 
+    // wasix-libc binaries discover preopens via preview1's
+    // `fd_prestat_get` / `fd_prestat_dir_name`, not the wasix_32v1
+    // surface. Override the preview1 entries so the FS provider's
+    // preopen map (e.g. fd 4 = "/home") is visible to the libc startup
+    // walk; otherwise it stops after fd 3 and never finds /home.
+    const preview1Overrides = {
+      ...preview1,
+      proc_exit: procExit,
+      fd_prestat_get: this.wasix_fd_prestat_get.bind(this),
+      fd_prestat_dir_name: this.wasix_fd_prestat_dir_name.bind(this),
+    };
     return {
       env: envImports,
       wasix_32v1: this.getWasix32v1Imports(),
-      wasi_snapshot_preview1: { ...preview1, proc_exit: procExit },
+      wasi_snapshot_preview1: preview1Overrides,
       wasi_unstable: { ...unstable, proc_exit: procExit },
     };
   }
@@ -624,6 +642,115 @@ export class WASIX {
     }
   }
 
+  //
+  // Working directory — getcwd / chdir. wasix-libc binaries call these
+  // directly; preview1 has no cwd surface. wasix-libc's `__wasilibc_resolve_path`
+  // reads getcwd to turn relative paths absolute before walking the
+  // preopen table, so the cwd lives entirely as runtime state — there is
+  // no per-syscall cwd-relative resolution further down the path stack.
+  //
+  // ABI:
+  //   getcwd(path_buf: *mut u8, path_buf_len: *mut u32) -> errno
+  //     - On entry, *path_buf_len is the buffer's capacity.
+  //     - On exit, *path_buf_len is set to the cwd's byte length and
+  //       up to that many bytes are copied into path_buf. EOVERFLOW is
+  //       returned (and the length is still written) when the buffer is
+  //       too small, mirroring upstream wasmer behaviour so callers can
+  //       grow the buffer and retry.
+  //   chdir(path: *const u8, path_len: u32) -> errno
+  //     - The string is treated as either absolute or relative-to-cwd
+  //       and validated by checking that the resolved path lives under
+  //       a known preopen and resolves to a directory in the FS provider.
+  //
+
+  private wasix_getcwd(pathBufPtr: number, pathLenPtr: number): number {
+    try {
+      const view = new DataView(this.memory.buffer);
+      const maxLen = view.getUint32(pathLenPtr, true);
+      const bytes = new TextEncoder().encode(this.cwd);
+      // Always write the actual length first — upstream wasmer does the
+      // same so callers can retry with a larger buffer after EOVERFLOW.
+      view.setUint32(pathLenPtr, bytes.byteLength, true);
+      if (bytes.byteLength > maxLen) {
+        return Result.EOVERFLOW;
+      }
+      new Uint8Array(this.memory.buffer, pathBufPtr, bytes.byteLength).set(
+        bytes,
+      );
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "getcwd");
+    }
+  }
+
+  private wasix_chdir(pathPtr: number, pathLen: number): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const resolved = resolveAbsolute(this.cwd, path);
+      const match = this.findPreopenFor(resolved);
+      if (match === null) {
+        return Result.ENOENT;
+      }
+      // The preopen root itself is always a directory; only validate
+      // when there's a non-trivial relative component to look up.
+      if (match.relativePath !== "" && match.relativePath !== ".") {
+        const stat = this.fs.pathFilestatGet(match.fd, 0, match.relativePath);
+        if (stat.filetype !== FileType.DIRECTORY) {
+          return Result.ENOTDIR;
+        }
+      }
+      this.cwd = resolved;
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "chdir");
+    }
+  }
+
+  /**
+   * Find which preopen owns an absolute path. Iterates fds starting at
+   * 3 until `fdPrestatGet` returns null, picking the longest matching
+   * preopen name so nested mounts (e.g. "/home" vs "/") resolve to the
+   * more specific fd. The "." preopen is treated as the implicit root
+   * — it matches every absolute path but loses to any named match.
+   */
+  private findPreopenFor(
+    absPath: string,
+  ): { fd: number; relativePath: string } | null {
+    let best: { fd: number; relativePath: string; nameLen: number } | null =
+      null;
+    for (let fd = 3; fd < 256; fd++) {
+      const info = this.fs.fdPrestatGet(fd);
+      if (info === null) break;
+      const name = info.name;
+      if (name === "." || name === "/") {
+        if (best === null) {
+          best = {
+            fd,
+            relativePath: stripLeadingSlash(absPath),
+            nameLen: 0,
+          };
+        }
+        continue;
+      }
+      if (absPath === name) {
+        if (best === null || best.nameLen < name.length) {
+          best = { fd, relativePath: ".", nameLen: name.length };
+        }
+        continue;
+      }
+      if (absPath.startsWith(name + "/")) {
+        if (best === null || best.nameLen < name.length) {
+          best = {
+            fd,
+            relativePath: absPath.slice(name.length + 1),
+            nameLen: name.length,
+          };
+        }
+      }
+    }
+    return best;
+  }
+
   private wasix_path_rename(
     oldFd: number,
     oldPathPtr: number,
@@ -788,8 +915,8 @@ export class WASIX {
       tty_set: enosys,
 
       // Working directory
-      getcwd: enosys,
-      chdir: enosys,
+      getcwd: this.wasix_getcwd.bind(this),
+      chdir: this.wasix_chdir.bind(this),
 
       // Poll
       poll_oneoff: enosys,
@@ -1059,6 +1186,37 @@ function validateTableOverride(
   // mismatch at instantiation time. Maximum likewise.
   void descriptor.element;
   void descriptor.maximum;
+}
+
+/**
+ * Resolve a guest-supplied path against the current working directory.
+ * Absolute paths (leading `/`) bypass the cwd join. The result is
+ * normalised so `..` segments fold correctly and trailing slashes are
+ * dropped (except for the root).
+ *
+ * Used by `chdir` to compute the absolute target of a relative cwd
+ * change. Other syscalls do not call this — wasix-libc resolves
+ * relative paths against `getcwd()` itself before calling `path_*`,
+ * so by the time a path reaches the runtime it is already preopen-
+ * relative.
+ */
+function resolveAbsolute(cwd: string, path: string): string {
+  const joined = path.startsWith("/") ? path : `${cwd}/${path}`;
+  const segments = joined.split("/");
+  const out: string[] = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(segment);
+  }
+  return "/" + out.join("/");
+}
+
+function stripLeadingSlash(path: string): string {
+  return path.startsWith("/") ? path.slice(1) : path;
 }
 
 function readString(
