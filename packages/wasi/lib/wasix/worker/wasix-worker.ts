@@ -17,10 +17,10 @@
 
 import { WASIX } from "../wasix.js";
 import { WASIXContext } from "../wasix-context.js";
+import { WASIDriveFileSystemProvider } from "../providers/ergonomic/filesystem-provider.js";
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
   ClockProvider,
-  FileSystemProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
@@ -224,7 +224,7 @@ async function runGuest(
     args: msg.contextConfig.args,
     env: msg.contextConfig.env,
     isTTY: msg.contextConfig.isTTY,
-    fs: (msg.contextConfig.fs ?? {}) as WASIFS | FileSystemProvider,
+    fs: new WASIDriveFileSystemProvider(msg.contextConfig.fs ?? {}),
     stdin: msg.hasStdin ? bridgeStdin(msg.sharedBuffer) : () => null,
     stdout: (out: string) =>
       sendMessage({ target: "host", type: "stdout", text: out }),
