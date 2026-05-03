@@ -621,6 +621,12 @@ export class WASIX {
 
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
+    // proc_exit2 mirrors proc_exit semantics: terminate the run with the
+    // supplied code. wasix-libc's exit path always goes through proc_exit2;
+    // proc_exit (v1) is left wired ENOSYS until a binary surfaces it.
+    const procExit2 = (code: number) => {
+      throw new WASIXExit(code);
+    };
     return {
       // Args / environ — share the internal WASI's preview1 implementations
       // so wasix-libc's argv/environ setup sees the values that were passed
@@ -660,12 +666,23 @@ export class WASIX {
       fd_write: this.wasix_fd_write.bind(this),
       fd_pipe: enosys,
 
+      // wasix_32v1 v2 fd surface — flag-extended variants. Stubbed
+      // ENOSYS until the fd-table extraction (Slice 9) lifts the
+      // backing semantics out of WASIDrive.
+      fd_dup2: enosys, // TODO(slice-9): alias of fd_renumber
+      fd_fdflags_get: enosys, // TODO(slice-9): mirrors fd_fdstat_get fs_flags
+      fd_fdflags_set: enosys, // TODO(slice-9): mirrors fd_fdstat_set_flags
+
       // Paths
       path_create_directory: this.wasix_path_create_directory.bind(this),
       path_filestat_get: this.wasix_path_filestat_get.bind(this),
       path_filestat_set_times: enosys,
       path_link: enosys,
       path_open: this.wasix_path_open.bind(this),
+      // TODO(slice-9): path_open2 carries an extended fdflags arg; for now
+      // it returns ENOSYS so binaries that link both v1 and v2 can still
+      // instantiate, since the v1 path_open is already wired.
+      path_open2: enosys,
       path_readlink: enosys,
       path_remove_directory: this.wasix_path_remove_directory.bind(this),
       path_rename: this.wasix_path_rename.bind(this),
@@ -674,12 +691,18 @@ export class WASIX {
 
       // Process
       proc_exit: enosys,
+      proc_exit2: procExit2,
       proc_fork: enosys,
+      proc_fork_env: enosys, // TODO(slice-7): proc/fork provider
       proc_exec: enosys,
+      proc_exec3: enosys, // TODO(slice-7): proc/exec provider
       proc_join: enosys,
       proc_signal: enosys,
+      proc_signals_get: enosys, // TODO(slice-8): signals provider
+      proc_signals_sizes_get: enosys, // TODO(slice-8): signals provider
       proc_raise: enosys,
       proc_spawn: enosys,
+      proc_spawn2: enosys, // TODO(slice-7): proc/spawn provider
       proc_id: enosys,
       proc_parent: enosys,
 
