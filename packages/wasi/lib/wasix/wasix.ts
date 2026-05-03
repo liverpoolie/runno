@@ -297,6 +297,60 @@ export class WASIX {
   }
 
   /**
+   * Build the import object for a child instance whose source bytes
+   * have already been compiled into a `WebAssembly.Module` (e.g. by
+   * `proc_spawn` / `proc_exec`). Walks `WebAssembly.Module.imports()`
+   * to detect whether the child needs `env.memory` /
+   * `env.__indirect_function_table` and creates fresh instances when
+   * it does. Memory descriptors aren't recoverable from the compiled
+   * Module, so we mirror the parent's resolved memory shape (a shared
+   * memory matching wasix-libc's threading shape) when one was wired,
+   * and fall back to a sensible default otherwise. Hosts that need
+   * tighter control can pass `context.memory` / `context.indirectFunctionTable`
+   * on the child's WASIXContext.
+   */
+  prepareImportObject(
+    module: WebAssembly.Module,
+  ): ReturnType<WASIX["getImportObject"]> {
+    const imports = WebAssembly.Module.imports(module);
+    const wantsMemory = imports.some(
+      (i) => i.kind === "memory" && i.module === "env" && i.name === "memory",
+    );
+    const wantsTable = imports.some(
+      (i) =>
+        i.kind === "table" &&
+        i.module === "env" &&
+        i.name === "__indirect_function_table",
+    );
+
+    let memory: WebAssembly.Memory | undefined;
+    if (wantsMemory) {
+      const parentMem = this.context.memory;
+      if (parentMem) {
+        memory = parentMem;
+      } else {
+        memory = new WebAssembly.Memory({
+          initial: 17,
+          maximum: 32768,
+          shared: true,
+        } as WebAssembly.MemoryDescriptor);
+      }
+    }
+
+    let indirectFunctionTable: WebAssembly.Table | undefined;
+    if (wantsTable) {
+      indirectFunctionTable =
+        this.context.indirectFunctionTable ??
+        new WebAssembly.Table({
+          element: "anyfunc",
+          initial: 1,
+        } as WebAssembly.TableDescriptor);
+    }
+
+    return this.getImportObject({ memory, indirectFunctionTable });
+  }
+
+  /**
    * Start a WASIX command.
    *
    * See: https://github.com/WebAssembly/WASI/blob/main/legacy/application-abi.md
