@@ -25,7 +25,7 @@ export type DebugFn = (
   name: string,
   args: string[],
   ret: number,
-  data: { [key: string]: any }[]
+  data: { [key: string]: any }[],
 ) => number | undefined;
 
 let _debugData: { [key: string]: string }[] = [];
@@ -67,12 +67,12 @@ export class WASI implements SnapshotPreview1 {
    */
   static async start(
     wasmSource: Response | PromiseLike<Response>,
-    context: Partial<WASIContextOptions> = {}
+    context: Partial<WASIContextOptions> = {},
   ) {
     const wasi = new WASI(context);
     const wasm = await WebAssembly.instantiateStreaming(
       wasmSource,
-      wasi.getImportObject()
+      wasi.getImportObject(),
     );
     return wasi.start(wasm);
   }
@@ -84,12 +84,12 @@ export class WASI implements SnapshotPreview1 {
    */
   static async initialize(
     wasmSource: Response | PromiseLike<Response>,
-    context: Partial<WASIContextOptions> = {}
+    context: Partial<WASIContextOptions> = {},
   ) {
     const wasi = new WASI(context);
     const wasm = await WebAssembly.instantiateStreaming(
       wasmSource,
-      wasi.getImportObject()
+      wasi.getImportObject(),
     );
     wasi.initialize(wasm);
     return wasm.instance.exports;
@@ -116,11 +116,11 @@ export class WASI implements SnapshotPreview1 {
     wasm: WebAssembly.WebAssemblyInstantiatedSource,
     options: {
       memory?: WebAssembly.Memory;
-    } = {}
+    } = {},
   ): WASIExecutionResult {
     if (this.hasBeenInitialized) {
       throw new InitializationError(
-        "This instance has already been initialized"
+        "This instance has already been initialized",
       );
     }
 
@@ -134,14 +134,14 @@ export class WASI implements SnapshotPreview1 {
     // should be initialized instead
     if ("_initialize" in this.instance.exports) {
       throw new InvalidInstanceError(
-        "WebAssembly instance is a reactor and should be started with initialize."
+        "WebAssembly instance is a reactor and should be started with initialize.",
       );
     }
 
     // If the export doesn't contain `_start` we can't start it
     if (!("_start" in this.instance.exports)) {
       throw new InvalidInstanceError(
-        "WebAssembly instance doesn't export _start, it may not be WASI or may be a Reactor."
+        "WebAssembly instance doesn't export _start, it may not be WASI or may be a Reactor.",
       );
     }
 
@@ -181,11 +181,11 @@ export class WASI implements SnapshotPreview1 {
     wasm: WebAssembly.WebAssemblyInstantiatedSource,
     options: {
       memory?: WebAssembly.Memory;
-    } = {}
+    } = {},
   ) {
     if (this.hasBeenInitialized) {
       throw new InitializationError(
-        "This instance has already been initialized"
+        "This instance has already been initialized",
       );
     }
 
@@ -199,7 +199,7 @@ export class WASI implements SnapshotPreview1 {
     // should be started instead
     if ("_start" in this.instance.exports) {
       throw new InvalidInstanceError(
-        "WebAssembly instance is a command and should be started with start."
+        "WebAssembly instance is a command and should be started with start.",
       );
     }
 
@@ -212,7 +212,7 @@ export class WASI implements SnapshotPreview1 {
 
   getImports(
     version: "unstable" | "preview1",
-    debug?: DebugFn
+    debug?: DebugFn,
   ): WebAssembly.ModuleImports & SnapshotPreview1 {
     const imports = {
       args_get: this.args_get.bind(this),
@@ -304,7 +304,7 @@ export class WASI implements SnapshotPreview1 {
 
   get envArray(): Array<string> {
     return Object.entries(this.context.env).map(
-      ([key, value]) => `${key}=${value}`
+      ([key, value]) => `${key}=${value}`,
     );
   }
 
@@ -326,7 +326,7 @@ export class WASI implements SnapshotPreview1 {
       const buffer = new Uint8Array(
         this.memory.buffer,
         argv_buf_ptr,
-        data.byteLength
+        data.byteLength,
       );
       buffer.set(data);
       argv_buf_ptr += data.byteLength;
@@ -402,7 +402,7 @@ export class WASI implements SnapshotPreview1 {
       const buffer = new Uint8Array(
         this.memory.buffer,
         env_buf_ptr,
-        data.byteLength
+        data.byteLength,
       );
       buffer.set(data);
       env_buf_ptr += data.byteLength;
@@ -468,7 +468,7 @@ export class WASI implements SnapshotPreview1 {
     fd: number,
     iovs_ptr: number,
     iovs_len: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     // Read not supported on stdout and stderr
     if (fd === 1 || fd === 2) {
@@ -523,7 +523,7 @@ export class WASI implements SnapshotPreview1 {
     fd: number,
     ciovs_ptr: number,
     ciovs_len: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     // Write not supported on STDIN
     if (fd === 0) {
@@ -545,7 +545,11 @@ export class WASI implements SnapshotPreview1 {
       // STDOUT or STDERR
       if (fd === 1 || fd === 2) {
         const stdfn = fd === 1 ? this.context.stdout : this.context.stderr;
-        const output = decoder.decode(iov);
+        // Copy before decoding: a WASIX guest with shared env.memory
+        // hands us views over a SharedArrayBuffer, which TextDecoder
+        // refuses. Single fresh allocation per write keeps the preview1
+        // path unchanged.
+        const output = decoder.decode(iov.slice());
         stdfn(output);
 
         pushDebugData({ output });
@@ -580,7 +584,7 @@ export class WASI implements SnapshotPreview1 {
     return this.drive.pwrite(
       fd,
       new Uint8Array(Number(length)),
-      Number(offset)
+      Number(offset),
     );
   }
 
@@ -628,7 +632,7 @@ export class WASI implements SnapshotPreview1 {
       const retBuffer = new Uint8Array(
         this.memory.buffer,
         retptr0,
-        buffer.byteLength
+        buffer.byteLength,
       );
       retBuffer.set(buffer);
 
@@ -645,7 +649,7 @@ export class WASI implements SnapshotPreview1 {
     const retBuffer = new Uint8Array(
       this.memory.buffer,
       retptr0,
-      buffer.byteLength
+      buffer.byteLength,
     );
     retBuffer.set(buffer);
 
@@ -691,7 +695,7 @@ export class WASI implements SnapshotPreview1 {
   shared_fd_filestat_get(
     fd: number,
     retptr0: number,
-    version: "unstable" | "preview1"
+    version: "unstable" | "preview1",
   ): number {
     const createFilestatFn =
       version === "unstable" ? createUnstableFilestat : createFilestat;
@@ -726,7 +730,7 @@ export class WASI implements SnapshotPreview1 {
       const retBuffer = new Uint8Array(
         this.memory.buffer,
         retptr0,
-        buffer.byteLength
+        buffer.byteLength,
       );
       retBuffer.set(buffer);
 
@@ -744,7 +748,7 @@ export class WASI implements SnapshotPreview1 {
     const returnBuffer = new Uint8Array(
       this.memory.buffer,
       retptr0,
-      data.byteLength
+      data.byteLength,
     );
     returnBuffer.set(data);
 
@@ -768,7 +772,7 @@ export class WASI implements SnapshotPreview1 {
     fd: number,
     atim: bigint,
     mtim: bigint,
-    fst_flags: number
+    fst_flags: number,
   ): number {
     let accessTime: Date | null = null;
     if (fst_flags & FileStatTimestampFlags.ATIM) {
@@ -812,7 +816,7 @@ export class WASI implements SnapshotPreview1 {
     iovs_ptr: number,
     iovs_len: number,
     offset: bigint,
-    retptr0: number
+    retptr0: number,
   ): number {
     // Read not supported on stdout and stderr
     if (fd === 1 || fd === 2) {
@@ -833,7 +837,7 @@ export class WASI implements SnapshotPreview1 {
       const [error, value] = this.drive.pread(
         fd,
         iov.byteLength,
-        Number(offset) + bytesRead
+        Number(offset) + bytesRead,
       );
       if (error !== Result.SUCCESS) {
         result = error;
@@ -893,7 +897,7 @@ export class WASI implements SnapshotPreview1 {
     ciovs_ptr: number,
     ciovs_len: number,
     offset: bigint,
-    retptr0: number
+    retptr0: number,
   ): number {
     // Write not supported on STDIN
     if (fd === 0) {
@@ -942,7 +946,7 @@ export class WASI implements SnapshotPreview1 {
     buf: number,
     buf_len: number,
     cookie: bigint,
-    retptr0: number
+    retptr0: number,
   ): number {
     const [result, list] = this.drive.list(fd);
     if (result != Result.SUCCESS) {
@@ -1015,7 +1019,7 @@ export class WASI implements SnapshotPreview1 {
     fd: number,
     offset: bigint,
     whence: number,
-    retptr0: number
+    retptr0: number,
   ) {
     const newWhence = UNSTABLE_WHENCE_MAP[whence as UnstableWhence];
     return this.fd_seek(fd, offset, newWhence, retptr0);
@@ -1056,7 +1060,7 @@ export class WASI implements SnapshotPreview1 {
     flags: number,
     path_ptr: number,
     path_len: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     return this.shared_path_filestat_get(
       fd,
@@ -1064,7 +1068,7 @@ export class WASI implements SnapshotPreview1 {
       path_ptr,
       path_len,
       retptr0,
-      "preview1"
+      "preview1",
     );
   }
 
@@ -1073,7 +1077,7 @@ export class WASI implements SnapshotPreview1 {
     flags: number,
     path_ptr: number,
     path_len: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     return this.shared_path_filestat_get(
       fd,
@@ -1081,7 +1085,7 @@ export class WASI implements SnapshotPreview1 {
       path_ptr,
       path_len,
       retptr0,
-      "unstable"
+      "unstable",
     );
   }
 
@@ -1095,13 +1099,13 @@ export class WASI implements SnapshotPreview1 {
     path_ptr: number,
     path_len: number,
     retptr0: number,
-    version: "unstable" | "preview1"
+    version: "unstable" | "preview1",
   ): number {
     const createFilestatFn =
       version === "unstable" ? createUnstableFilestat : createFilestat;
 
     const path = new TextDecoder().decode(
-      new Uint8Array(this.memory.buffer, path_ptr, path_len)
+      new Uint8Array(this.memory.buffer, path_ptr, path_len).slice(),
     );
 
     pushDebugData({ path });
@@ -1115,7 +1119,7 @@ export class WASI implements SnapshotPreview1 {
     const returnBuffer = new Uint8Array(
       this.memory.buffer,
       retptr0,
-      statBuffer.byteLength
+      statBuffer.byteLength,
     );
     returnBuffer.set(statBuffer);
 
@@ -1133,7 +1137,7 @@ export class WASI implements SnapshotPreview1 {
     path_len: number,
     atim: bigint,
     mtim: bigint,
-    fst_flags: number
+    fst_flags: number,
   ): number {
     let accessTime: Date | null = null;
     if (fst_flags & FileStatTimestampFlags.ATIM) {
@@ -1152,7 +1156,7 @@ export class WASI implements SnapshotPreview1 {
     }
 
     const path = new TextDecoder().decode(
-      new Uint8Array(this.memory.buffer, path_ptr, path_len)
+      new Uint8Array(this.memory.buffer, path_ptr, path_len).slice(),
     );
 
     if (accessTime) {
@@ -1166,7 +1170,7 @@ export class WASI implements SnapshotPreview1 {
       const result = this.drive.pathSetModificationTime(
         fd,
         path,
-        modificationTime
+        modificationTime,
       );
       if (result != Result.SUCCESS) {
         return result;
@@ -1213,7 +1217,7 @@ export class WASI implements SnapshotPreview1 {
     // @ts-expect-error - same as above
     rights_inheriting: bigint,
     fdflags: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     const view = new DataView(this.memory.buffer);
     const path = readString(this.memory, path_ptr, path_len);
@@ -1264,7 +1268,7 @@ export class WASI implements SnapshotPreview1 {
     old_path_len: number,
     new_fd_dir: number,
     new_path_ptr: number,
-    new_path_len: number
+    new_path_len: number,
   ): number {
     const oldPath = readString(this.memory, old_path_ptr, old_path_len);
     const newPath = readString(this.memory, new_path_ptr, new_path_len);
@@ -1292,20 +1296,20 @@ export class WASI implements SnapshotPreview1 {
     in_ptr: number,
     out_ptr: number,
     nsubscriptions: number,
-    retptr0: number
+    retptr0: number,
   ): number {
     for (let i = 0; i < nsubscriptions; i++) {
       const subscriptionBuffer = new Uint8Array(
         this.memory.buffer,
         in_ptr + i * SUBSCRIPTION_SIZE,
-        SUBSCRIPTION_SIZE
+        SUBSCRIPTION_SIZE,
       );
       const subscription = readSubscription(subscriptionBuffer);
 
       const eventBuffer = new Uint8Array(
         this.memory.buffer,
         out_ptr + i * EVENT_SIZE,
-        EVENT_SIZE
+        EVENT_SIZE,
       );
       let byteLength = 0;
       let result: Result = Result.SUCCESS;
@@ -1315,7 +1319,7 @@ export class WASI implements SnapshotPreview1 {
             // Wait until we hit the event time
           }
           eventBuffer.set(
-            createClockEvent(subscription.userdata, Result.SUCCESS)
+            createClockEvent(subscription.userdata, Result.SUCCESS),
           );
           break;
         case EventType.FD_READ:
@@ -1339,8 +1343,8 @@ export class WASI implements SnapshotPreview1 {
               subscription.userdata,
               result,
               EventType.FD_READ,
-              BigInt(byteLength)
-            )
+              BigInt(byteLength),
+            ),
           );
           break;
         case EventType.FD_WRITE:
@@ -1366,8 +1370,8 @@ export class WASI implements SnapshotPreview1 {
               subscription.userdata,
               result,
               EventType.FD_READ,
-              BigInt(byteLength)
-            )
+              BigInt(byteLength),
+            ),
           );
           break;
       }
@@ -1385,7 +1389,7 @@ export class WASI implements SnapshotPreview1 {
   path_create_directory(
     fd: number,
     path_ptr: number,
-    path_len: number
+    path_len: number,
   ): number {
     const path = readString(this.memory, path_ptr, path_len);
     return this.drive.pathCreateDir(fd, path);
@@ -1552,7 +1556,12 @@ class WASIExit extends Error {
  * @returns the string at that address
  */
 function readString(memory: WebAssembly.Memory, ptr: number, len: number) {
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+  // Copy before decoding so callers with a SharedArrayBuffer-backed
+  // memory (WASIX guests) don't trip TextDecoder's "shared view"
+  // rejection. Cheap for typical preview1 paths (single short read).
+  return new TextDecoder().decode(
+    new Uint8Array(memory.buffer, ptr, len).slice(),
+  );
 }
 
 /**
@@ -1567,7 +1576,7 @@ function readString(memory: WebAssembly.Memory, ptr: number, len: number) {
 function readIOVectors(
   view: DataView,
   iovs_ptr: number,
-  iovs_len: number
+  iovs_len: number,
 ): Array<Uint8Array> {
   let result = Array<Uint8Array>(iovs_len);
 
@@ -1731,7 +1740,7 @@ function createUnstableFilestat(stat: DriveStat): Uint8Array {
 function createFdStat(
   type: FileType,
   fdflags: number,
-  rights?: bigint
+  rights?: bigint,
 ): Uint8Array {
   const rightsBase = rights ?? ALL_RIGHTS;
   const rightsInheriting = rights ?? ALL_RIGHTS;
@@ -1762,7 +1771,7 @@ function createFdStat(
 function createDirectoryEntry(
   name: string,
   type: FileType,
-  currentIndex: number
+  currentIndex: number,
 ): Uint8Array {
   // Each entry is made up of:
   // 0 - d_next = dircookie (size: 8) the offset of the next directory entry
@@ -1819,7 +1828,7 @@ function createFDReadWriteEvent(
   userdata: Uint8Array,
   error: Result,
   type: EventType.FD_READ | EventType.FD_WRITE,
-  nbytes: bigint
+  nbytes: bigint,
 ): Uint8Array {
   const eventBuffer = new Uint8Array(32);
   eventBuffer.set(userdata, 0);

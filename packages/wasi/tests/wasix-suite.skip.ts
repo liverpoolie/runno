@@ -64,59 +64,14 @@ export type SkipEntry = {
  *     stubbed ENOSYS at the WASIX layer pending the fd-table extraction
  *     (`requires-future-feature`).
  */
-// Tests that wasixcc compiles and links cleanly under the current
-// toolchain but cannot yet instantiate at runtime. Every wasix-libc
-// binary imports symbols from the `env` namespace (shared memory,
-// indirect function table, pthread helpers); the WASIX runtime does
-// not provide an `env` import object yet, so `WebAssembly.instantiate`
-// rejects every guest before its `_start` is reached.
-//
-// Listing the buildable filesystem-category tests here keeps them
-// inside the harness — Playwright still reports them under
-// `wasix-skip:requires-future-feature` — without making CI red on
-// runtime failures that aren't owned by this filesystem-provider
-// change.
-const ENV_IMPORTS_NOTE =
-  "wasix-libc binary imports from the `env` namespace (shared memory, " +
-  "indirect function table, pthread helpers); WASIX runtime needs to " +
-  "provide the env import surface before any wasix-suite test can " +
-  "instantiate.";
-const ENV_IMPORTS_SKIP: SkipEntry = {
-  reason: "requires-future-feature",
-  note: ENV_IMPORTS_NOTE,
-};
-const ENV_IMPORTS_BUILT_TESTS = [
-  "closing-pre-opened-dirs",
-  "create-and-remove-dirs",
-  "create-dir-at-cwd",
-  "create-dir-at-cwd-with-chdir",
-  "cross-fs-rename",
-  "cwd-to-home",
-  "distinct-inodes-same-basename",
-  "fd-close",
-  "fs-mount",
-  "fstatat-with-chdir",
-  "mount-tmp-locally",
-  "msync-end-of-file",
-  "msync-middle-of-file",
-  "msync-start-of-file",
-  "munmap-sync-end-of-file",
-  "munmap-sync-middle-of-file",
-  "munmap-sync-start-of-file",
-  "open-under-file",
-  "popen",
-  "posix_spawn",
-  "pwrite-and-size",
-  "read-after-munmap",
-  "symlink-open-read-write",
-  "udp",
-  "vfork",
-];
+// Slice 3.5 closed out the FS-category carve-outs at the drive level
+// (`./` normalisation, parent-dir-exists / parent-type validation,
+// preopen retention across `close`, `.`/`..` synthesis in readdir, and
+// the harness-side mount seeding for `/tmp` and `--volume host:guest`
+// targets). The remaining entries below are non-drive gaps —
+// fd-table extraction, sockets, mmap, proc, etc.
 
 export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
-  ...Object.fromEntries(
-    ENV_IMPORTS_BUILT_TESTS.map((name) => [name, ENV_IMPORTS_SKIP]),
-  ),
   "close-preopen": {
     reason: "requires-future-feature",
     note:
@@ -128,6 +83,71 @@ export const WASIX_SUITE_SKIPS: Record<string, SkipEntry> = {
     note:
       "dup2 = fd_renumber, deliberately stubbed ENOSYS — fd-table mgmt " +
       "is co-located with WASIDrive and will lift later.",
+  },
+  "fd-close": {
+    reason: "requires-provider-sockets",
+    note:
+      "test opens a TCP socket via socket(AF_INET, SOCK_STREAM) and " +
+      "expects close(fd) plus EBADF on second close. Needs " +
+      "SocketsProvider + /bin preopen.",
+  },
+  "fs-mount": {
+    reason: "requires-future-feature",
+    note: "mount syscall; Runno has a single preopen root.",
+  },
+  "mount-tmp-locally": {
+    reason: "requires-future-feature",
+    note: "mount syscall; Runno has a single preopen root.",
+  },
+  "msync-end-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "msync-middle-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "msync-start-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / msync — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-end-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-middle-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "munmap-sync-start-of-file": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  popen: {
+    reason: "requires-provider-proc",
+    note: "needs proc_spawn2 + proc_join (proc provider).",
+  },
+  posix_spawn: {
+    reason: "requires-provider-proc",
+    note: "needs proc_spawn2 + proc_join (proc provider).",
+  },
+  "read-after-munmap": {
+    reason: "requires-future-feature",
+    note: "mmap / munmap — WASIDrive doesn't model file-backed mappings.",
+  },
+  "symlink-open-read-write": {
+    reason: "requires-future-feature",
+    note: "symlinks are not represented in WASIDrive.",
+  },
+  udp: {
+    reason: "requires-provider-sockets",
+    note: "raw UDP send/recv — needs SocketsProvider.",
+  },
+  vfork: {
+    reason: "requires-provider-proc",
+    note:
+      "needs proc_fork_env + proc_exec3 (proc provider). Distinct from " +
+      "POSIX vfork — wasix-libc reuses proc_fork semantics.",
   },
   epoll: {
     reason: "requires-future-feature",

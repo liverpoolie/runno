@@ -15,9 +15,15 @@
 //     them at Node-time and passes them into `page.evaluate` so each
 //     test sees the right argv.
 //   - `--volume .` maps the test directory's input files (everything
-//     beyond `main.c` / `run.sh`) into the guest's preopened ".". Each
-//     test run starts with a fresh in-memory filesystem seeded from
-//     those inputs, so per-test isolation is preserved.
+//     beyond `main.c` / `run.sh`) into the guest's preopen tree. The
+//     wasmer runner mounts `--volume .` at `/home` because that's
+//     wasix-libc's compiled-in default cwd, so the harness mirrors
+//     that: inputs are seeded under `/home/<rel-path>`, the FS
+//     provider exposes `/home` as a preopen at fd 4, and `PWD` is set
+//     so libc's startup path resolver finds the cwd before calling
+//     `getcwd`.
+//   - Each test run starts with a fresh in-memory filesystem seeded
+//     from those inputs, so per-test isolation is preserved.
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -44,9 +50,16 @@ const wasixTestsDir = join(
   "wasix",
 );
 
-// Files present in every wasmer test directory that are never part of
-// the preopened input mapping.
-const NON_INPUT_FILES = new Set(["main.c", "run.sh", "Makefile", "README.md"]);
+/**
+ * Files the wasmer runner produces at runtime in the test directory
+ * (the `--volume .` mount is the test source dir, into which wasmer
+ * also writes `main.wasm` and the redirected `output` capture). They
+ * are not present on disk for us to read, so the harness synthesises
+ * empty placeholders alongside the on-disk inputs. Tests that
+ * iterate the cwd listing (e.g. `closing-pre-opened-dirs`) assert
+ * against these names.
+ */
+const SYNTHESIZED_RUNTIME_FILES = ["main.wasm", "output"] as const;
 
 type TestInput = {
   /** Path inside the guest filesystem, relative to the preopen ("."). */
@@ -60,6 +73,13 @@ type TestPlan = {
   wasmUrl: string;
   args: string[];
   inputs: TestInput[];
+  /**
+   * Absolute guest paths that the wasmer runner mounts via
+   * `--volume host:guest` (e.g. `/data`, `/temp1`). The harness
+   * pre-seeds each as an empty directory so file ops under those
+   * mounts pass POSIX parent-exists checks.
+   */
+  mounts: string[];
 };
 
 function listWasmBinaries(): string[] {
@@ -88,6 +108,51 @@ function listWasmBinaries(): string[] {
  * top-level invocation of the wasmer runner.
  */
 function parseRunSh(source: string): string[] {
+  const tokens = runShTokens(source);
+  const sep = tokens.indexOf("--");
+  if (sep === -1) return [];
+  return tokens.slice(sep + 1);
+}
+
+/**
+ * Extract the absolute guest paths that the wasmer run.sh mounts via
+ * `--volume host:guest` (or `--volume=host:guest`). A bare
+ * `--volume host` (no colon) maps to wasix-libc's default cwd
+ * (`/home`) and is already handled by the input seeding, so it is
+ * skipped here.
+ *
+ * Used to pre-seed mount-point directories in the in-memory FS so
+ * `open(O_CREAT)` under those mounts passes the drive's POSIX
+ * parent-exists check (the wasmer runner provides them implicitly).
+ */
+function parseRunShVolumeMounts(source: string): string[] {
+  const tokens = runShTokens(source);
+  const stop = tokens.indexOf("--");
+  const head = stop === -1 ? tokens : tokens.slice(0, stop);
+  const targets: string[] = [];
+  for (let i = 0; i < head.length; i++) {
+    const tok = head[i];
+    let arg: string | undefined;
+    if (tok === "--volume" || tok === "--mapdir") {
+      arg = head[i + 1];
+      i++;
+    } else if (tok.startsWith("--volume=") || tok.startsWith("--mapdir=")) {
+      arg = tok.slice(tok.indexOf("=") + 1);
+    } else {
+      continue;
+    }
+    if (!arg) continue;
+    const colon = arg.indexOf(":");
+    if (colon === -1) continue;
+    const guest = arg.slice(colon + 1);
+    if (guest.startsWith("/")) {
+      targets.push(guest);
+    }
+  }
+  return targets;
+}
+
+function runShTokens(source: string): string[] {
   const body = source
     .split("\n")
     .filter((line) => !line.startsWith("#!") && !/^\s*#/.test(line))
@@ -106,10 +171,7 @@ function parseRunSh(source: string): string[] {
 
   if (!runLine) return [];
 
-  const tokens = shellSplit(runLine);
-  const sep = tokens.indexOf("--");
-  if (sep === -1) return [];
-  return tokens.slice(sep + 1);
+  return shellSplit(runLine);
 }
 
 /**
@@ -181,14 +243,20 @@ function collectInputs(dir: string): TestInput[] {
         continue;
       }
       if (!st.isFile()) continue;
-      // Skip source / metadata files at the top level. Anything nested
-      // (e.g. inputs in a `fixture/` subdir) is kept verbatim.
-      if (sub === "" && NON_INPUT_FILES.has(entry)) continue;
       const bytes = readFileSync(abs);
       out.push({ path: rel, bytes: Array.from(bytes) });
     }
   };
   walk("");
+  // Append empty placeholders for the runtime artefacts that wasmer
+  // would otherwise produce in the test directory (the binary itself
+  // and the captured `output`). Tests that iterate cwd contents
+  // assert these names, but our harness fetches the wasm separately
+  // and never produces an output file.
+  for (const synthetic of SYNTHESIZED_RUNTIME_FILES) {
+    if (out.some((existing) => existing.path === synthetic)) continue;
+    out.push({ path: synthetic, bytes: [] });
+  }
   return out;
 }
 
@@ -196,11 +264,18 @@ function planForTest(name: string): TestPlan {
   const srcDir = join(wasixTestsDir, name);
   const runShPath = join(srcDir, "run.sh");
   let args: string[] = [];
+  let mounts: string[] = [];
   if (existsSync(runShPath)) {
+    const source = readFileSync(runShPath, "utf8");
     try {
-      args = parseRunSh(readFileSync(runShPath, "utf8"));
+      args = parseRunSh(source);
     } catch {
       args = [];
+    }
+    try {
+      mounts = parseRunShVolumeMounts(source);
+    } catch {
+      mounts = [];
     }
   }
   return {
@@ -208,6 +283,7 @@ function planForTest(name: string): TestPlan {
     wasmUrl: `/bin/wasix-tests/${name}.wasm`,
     args,
     inputs: collectInputs(srcDir),
+    mounts,
   };
 }
 
@@ -264,18 +340,39 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
         const WC = w.WASIXContext;
         const WD = w.WASIDriveFileSystemProvider;
 
-        // Seed a fresh WASIFS for this run from the per-test inputs.
-        // Paths are rooted at `/` so they resolve through the single
-        // preopen (".") the WASIDrive exposes.
+        // Seed a fresh WASIFS under /home for this run — the wasmer
+        // runner mounts `--volume .` at /home (wasix-libc's default
+        // cwd), so per-test inputs land at /home/<rel-path>. The
+        // provider exposes /home as a preopen at fd 4 alongside the
+        // implicit fd 3 = ".", and PWD primes the libc startup
+        // resolver before it falls back to getcwd().
         const now = new Date();
         const fs: WASIFS = {};
         for (const input of p.inputs) {
-          const guestPath = `/${input.path}`;
+          const guestPath = `/home/${input.path}`;
           fs[guestPath] = {
             path: guestPath,
             timestamps: { access: now, modification: now, change: now },
             mode: "binary",
             content: new Uint8Array(input.bytes),
+          };
+        }
+
+        // Pre-seed each `--volume host:guest` target plus the implicit
+        // `/tmp` MemFS mount as empty directories. The WASIDrive uses
+        // `.runno` sentinel files to model directory presence, so the
+        // mount points appear as real dirs to subsequent path ops
+        // (POSIX parent-exists checks). Mirrors what the wasmer runner
+        // provides without requiring per-test harness wiring.
+        for (const guest of ["/tmp", ...p.mounts]) {
+          const trimmed = guest.endsWith("/") ? guest.slice(0, -1) : guest;
+          if (!trimmed) continue;
+          const marker = `${trimmed}/.runno`;
+          fs[marker] = {
+            path: marker,
+            timestamps: { access: now, modification: now, change: now },
+            mode: "string",
+            content: "",
           };
         }
 
@@ -286,6 +383,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
           fetch(p.wasmUrl),
           new WC({
             args: p.args,
+            env: { PWD: "/home" },
             stdout: (out: string) => {
               stdout += out;
             },
@@ -293,7 +391,9 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               stderr += err;
             },
             stdin: () => null,
-            fs: new WD(fs),
+            fs: new WD(fs, {
+              preopens: [{ name: "/home", prefix: "/home/" }],
+            }),
           }),
         );
 

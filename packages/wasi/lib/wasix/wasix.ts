@@ -19,6 +19,7 @@ import { WASIContextOptions } from "../wasi/wasi-context.js";
 import { WASIXExecutionResult } from "../types.js";
 import { SystemClockProvider } from "./providers/system-clock.js";
 import { SystemRandomProvider } from "./providers/system-random.js";
+import { WASIDriveFileSystemProvider } from "./providers/ergonomic/filesystem-provider.js";
 import type {
   ClockProvider,
   FileSystemProvider,
@@ -32,6 +33,14 @@ class WASIXExit extends Error {
     this.code = code;
   }
 }
+
+// One-shot warning: emitted on first construction when the host page is
+// not cross-origin-isolated. wasix-libc binaries import a shared
+// `env.memory`, which `WebAssembly.instantiate` rejects without
+// `crossOriginIsolated`. Without this hint the failure looks like a
+// generic "imported memory: shared but env doesn't allow shared memory"
+// error from the engine.
+let warnedNotCrossOriginIsolated = false;
 
 /**
  * WASIX runtime for the browser.
@@ -58,26 +67,65 @@ export class WASIX {
   private _random?: RandomProvider;
 
   /**
+   * Current working directory as an absolute, normalised path. Mutated
+   * by `chdir`, read by `getcwd`. Default `/home` mirrors wasix-libc's
+   * compiled-in default (the wasmer runner mounts the test dir there).
+   */
+  private cwd: string = "/home";
+
+  /**
    * Start a WASIX command.
+   *
+   * Buffers the module bytes so we can parse the import section
+   * ourselves: `WebAssembly.Module.imports(module)` returns only the
+   * `{ module, name, kind }` triple — descriptors (memory limits,
+   * shared flag, table element type) are not in the standard surface.
+   * We need those to construct a matching `WebAssembly.Memory` /
+   * `WebAssembly.Table` for `env.memory` / `env.__indirect_function_table`,
+   * so the parse runs over the raw bytes before compile.
    */
   static async start(
     wasmSource: Response | PromiseLike<Response>,
     context: Partial<WASIXContextOptions> = {},
   ): Promise<WASIXExecutionResult> {
     const wasix = new WASIX(context);
-    const wasm = await WebAssembly.instantiateStreaming(
-      wasmSource,
-      wasix.getImportObject(),
-    );
-    return wasix.start(wasm);
+    const response = await wasmSource;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const envDescriptors = parseEnvImportDescriptors(bytes);
+    const { memory, indirectFunctionTable } =
+      wasix.resolveEnvImports(envDescriptors);
+    const module = await WebAssembly.compile(bytes);
+    const imports = wasix.getImportObject({ memory, indirectFunctionTable });
+    const instance = await WebAssembly.instantiate(module, imports);
+    return wasix.start({ module, instance }, { memory });
   }
 
   constructor(context: Partial<WASIXContextOptions>) {
     this.context = new WASIXContext(context);
-    // The internal WASI shares args / env / stdio with WASIX. The WASIX
-    // filesystem surface routes through `context.fs` (a FileSystemProvider),
-    // so the internal WASI's preview1 fs is intentionally empty — guests
-    // built against wasix_32v1 should not be reaching for preview1 fs.
+
+    if (
+      !warnedNotCrossOriginIsolated &&
+      typeof globalThis !== "undefined" &&
+      (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated ===
+        false
+    ) {
+      warnedNotCrossOriginIsolated = true;
+      console.warn(
+        "WASIX: page is not cross-origin-isolated; shared-memory imports " +
+          "will fail at WebAssembly.instantiate. Configure COOP " +
+          "(`Cross-Origin-Opener-Policy: same-origin`) and COEP " +
+          "(`Cross-Origin-Embedder-Policy: require-corp`) on the host page.",
+      );
+    }
+    // The internal WASI shares args / env / stdio with WASIX. wasix-libc
+    // binaries reach for both `wasix_32v1` and `wasi_snapshot_preview1`
+    // filesystem imports — preopen discovery (`fd_prestat_get`) lives in
+    // preview1 — so the inner WASI must see the same drive as the WASIX
+    // FileSystemProvider, not a separate empty drive. When the host hands
+    // us the bundled `WASIDriveFileSystemProvider` we reuse its drive
+    // directly; for opaque providers the inner preview1 fs stays empty
+    // (those hosts shouldn't have wasix-libc binaries reaching for
+    // preview1 fs in the first place).
     const wasiContext: Partial<WASIContextOptions> = {
       args: context.args,
       env: context.env,
@@ -89,9 +137,64 @@ export class WASIX {
       fs: {},
     };
     this.wasi = new WASI(wasiContext);
+    if (this.context.fs instanceof WASIDriveFileSystemProvider) {
+      this.wasi.drive = this.context.fs.drive;
+    }
   }
 
-  getImportObject() {
+  /**
+   * Convert the parsed `env.*` import descriptors into concrete
+   * `WebAssembly.Memory` / `WebAssembly.Table` instances, honouring any
+   * host overrides on the context. Either result may be undefined when
+   * the binary doesn't import the corresponding entry (preview1-style
+   * binaries that export their own memory, for example).
+   */
+  resolveEnvImports(descriptors: ParsedEnvImports): {
+    memory?: WebAssembly.Memory;
+    indirectFunctionTable?: WebAssembly.Table;
+  } {
+    let memory: WebAssembly.Memory | undefined;
+    let indirectFunctionTable: WebAssembly.Table | undefined;
+
+    if (descriptors.memory) {
+      const { initial, maximum, shared } = descriptors.memory;
+      const override = this.context.memory;
+      if (override) {
+        validateMemoryOverride(override, { initial, maximum, shared });
+        memory = override;
+      } else {
+        memory = new WebAssembly.Memory({
+          initial,
+          ...(maximum !== undefined ? { maximum } : {}),
+          ...(shared ? { shared: true } : {}),
+        } as WebAssembly.MemoryDescriptor);
+      }
+    }
+
+    if (descriptors.table) {
+      const { element, initial, maximum } = descriptors.table;
+      const override = this.context.indirectFunctionTable;
+      if (override) {
+        validateTableOverride(override, { element, initial, maximum });
+        indirectFunctionTable = override;
+      } else {
+        indirectFunctionTable = new WebAssembly.Table({
+          element,
+          initial,
+          ...(maximum !== undefined ? { maximum } : {}),
+        } as WebAssembly.TableDescriptor);
+      }
+    }
+
+    return { memory, indirectFunctionTable };
+  }
+
+  getImportObject(
+    env: {
+      memory?: WebAssembly.Memory;
+      indirectFunctionTable?: WebAssembly.Table;
+    } = {},
+  ) {
     const preview1 = this.wasi.getImports("preview1", this.context.debug);
     const unstable = this.wasi.getImports("unstable", this.context.debug);
 
@@ -101,9 +204,49 @@ export class WASIX {
       throw new WASIXExit(code);
     };
 
+    const envImports: WebAssembly.ModuleImports = {};
+    if (env.memory) envImports.memory = env.memory;
+    if (env.indirectFunctionTable)
+      envImports.__indirect_function_table = env.indirectFunctionTable;
+
+    // wasix-libc binaries discover preopens via preview1's
+    // `fd_prestat_get` / `fd_prestat_dir_name`, not the wasix_32v1
+    // surface. Override the preview1 entries so the FS provider's
+    // preopen map (e.g. fd 4 = "/home") is visible to the libc startup
+    // walk; otherwise it stops after fd 3 and never finds /home.
+    //
+    // Path ops are also routed through the FS provider when libc
+    // happens to import the preview1 entry instead of the wasix_32v1
+    // one. wasix-libc 0.4.3 does this for `rmdir` (preview1
+    // `path_remove_directory`); the preview1 stub in wasi.ts returns
+    // ENOSYS, so without this override `rmdir` always fails even
+    // though the drive can perform it. Mirror the syscalls that have
+    // a richer semantics in the provider (e.g. ENOTEMPTY checks).
+    // wasix-libc reaches into preview1 for several path/fd ops even
+    // when the binary is otherwise wasix_32v1 (rmdir → preview1
+    // `path_remove_directory`, stat → preview1 `path_filestat_get`,
+    // readdir → preview1 `fd_readdir`). The preview1 impls in wasi.ts
+    // call the drive directly and return its raw error vocabulary
+    // (e.g. ENOTCAPABLE for "not present") and don't synthesize the
+    // POSIX-shaped readdir entries (`.` / `..`, no `.runno`). Route
+    // them through the WASIX provider so the translation is uniform.
+    const preview1Overrides = {
+      ...preview1,
+      proc_exit: procExit,
+      fd_prestat_get: this.wasix_fd_prestat_get.bind(this),
+      fd_prestat_dir_name: this.wasix_fd_prestat_dir_name.bind(this),
+      fd_readdir: this.wasix_fd_readdir.bind(this),
+      path_filestat_get: this.wasix_path_filestat_get.bind(this),
+      path_open: this.wasix_path_open.bind(this),
+      path_create_directory: this.wasix_path_create_directory.bind(this),
+      path_remove_directory: this.wasix_path_remove_directory.bind(this),
+      path_unlink_file: this.wasix_path_unlink_file.bind(this),
+      path_rename: this.wasix_path_rename.bind(this),
+    };
     return {
+      env: envImports,
       wasix_32v1: this.getWasix32v1Imports(),
-      wasi_snapshot_preview1: { ...preview1, proc_exit: procExit },
+      wasi_snapshot_preview1: preview1Overrides,
       wasi_unstable: { ...unstable, proc_exit: procExit },
     };
   }
@@ -425,6 +568,43 @@ export class WASIX {
     }
   }
 
+  // path_open2 is the wasix v2 variant: same as preview1 path_open
+  // plus an extended fdflags2 word (the last i32 before retptr). The
+  // extra flag bits are not yet modelled, but ignoring them and routing
+  // through the existing pathOpen unblocks every wasix-libc binary
+  // that calls open()/opendir() — those use path_open2 unconditionally.
+  // TODO(slice-9): honour fdflags2 once the fd-table extraction surfaces
+  //   semantics for the new bits (close-on-exec etc.).
+  private wasix_path_open2(
+    fdDir: number,
+    dirflags: number,
+    pathPtr: number,
+    pathLen: number,
+    oflags: number,
+    rightsBase: bigint,
+    rightsInheriting: bigint,
+    fdflags: number,
+    _fdflags2: number,
+    retptr: number,
+  ): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const newFd = this.fs.pathOpen(
+        fdDir,
+        dirflags,
+        path,
+        oflags,
+        rightsBase,
+        rightsInheriting,
+        fdflags,
+      );
+      new DataView(this.memory.buffer).setUint32(retptr, newFd, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "path_open2");
+    }
+  }
+
   private wasix_path_filestat_get(
     fdDir: number,
     dirflags: number,
@@ -485,6 +665,115 @@ export class WASIX {
     }
   }
 
+  //
+  // Working directory — getcwd / chdir. wasix-libc binaries call these
+  // directly; preview1 has no cwd surface. wasix-libc's `__wasilibc_resolve_path`
+  // reads getcwd to turn relative paths absolute before walking the
+  // preopen table, so the cwd lives entirely as runtime state — there is
+  // no per-syscall cwd-relative resolution further down the path stack.
+  //
+  // ABI:
+  //   getcwd(path_buf: *mut u8, path_buf_len: *mut u32) -> errno
+  //     - On entry, *path_buf_len is the buffer's capacity.
+  //     - On exit, *path_buf_len is set to the cwd's byte length and
+  //       up to that many bytes are copied into path_buf. EOVERFLOW is
+  //       returned (and the length is still written) when the buffer is
+  //       too small, mirroring upstream wasmer behaviour so callers can
+  //       grow the buffer and retry.
+  //   chdir(path: *const u8, path_len: u32) -> errno
+  //     - The string is treated as either absolute or relative-to-cwd
+  //       and validated by checking that the resolved path lives under
+  //       a known preopen and resolves to a directory in the FS provider.
+  //
+
+  private wasix_getcwd(pathBufPtr: number, pathLenPtr: number): number {
+    try {
+      const view = new DataView(this.memory.buffer);
+      const maxLen = view.getUint32(pathLenPtr, true);
+      const bytes = new TextEncoder().encode(this.cwd);
+      // Always write the actual length first — upstream wasmer does the
+      // same so callers can retry with a larger buffer after EOVERFLOW.
+      view.setUint32(pathLenPtr, bytes.byteLength, true);
+      if (bytes.byteLength > maxLen) {
+        return Result.EOVERFLOW;
+      }
+      new Uint8Array(this.memory.buffer, pathBufPtr, bytes.byteLength).set(
+        bytes,
+      );
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "getcwd");
+    }
+  }
+
+  private wasix_chdir(pathPtr: number, pathLen: number): number {
+    try {
+      const path = readString(this.memory, pathPtr, pathLen);
+      const resolved = resolveAbsolute(this.cwd, path);
+      const match = this.findPreopenFor(resolved);
+      if (match === null) {
+        return Result.ENOENT;
+      }
+      // The preopen root itself is always a directory; only validate
+      // when there's a non-trivial relative component to look up.
+      if (match.relativePath !== "" && match.relativePath !== ".") {
+        const stat = this.fs.pathFilestatGet(match.fd, 0, match.relativePath);
+        if (stat.filetype !== FileType.DIRECTORY) {
+          return Result.ENOTDIR;
+        }
+      }
+      this.cwd = resolved;
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "chdir");
+    }
+  }
+
+  /**
+   * Find which preopen owns an absolute path. Iterates fds starting at
+   * 3 until `fdPrestatGet` returns null, picking the longest matching
+   * preopen name so nested mounts (e.g. "/home" vs "/") resolve to the
+   * more specific fd. The "." preopen is treated as the implicit root
+   * — it matches every absolute path but loses to any named match.
+   */
+  private findPreopenFor(
+    absPath: string,
+  ): { fd: number; relativePath: string } | null {
+    let best: { fd: number; relativePath: string; nameLen: number } | null =
+      null;
+    for (let fd = 3; fd < 256; fd++) {
+      const info = this.fs.fdPrestatGet(fd);
+      if (info === null) break;
+      const name = info.name;
+      if (name === "." || name === "/") {
+        if (best === null) {
+          best = {
+            fd,
+            relativePath: stripLeadingSlash(absPath),
+            nameLen: 0,
+          };
+        }
+        continue;
+      }
+      if (absPath === name) {
+        if (best === null || best.nameLen < name.length) {
+          best = { fd, relativePath: ".", nameLen: name.length };
+        }
+        continue;
+      }
+      if (absPath.startsWith(name + "/")) {
+        if (best === null || best.nameLen < name.length) {
+          best = {
+            fd,
+            relativePath: absPath.slice(name.length + 1),
+            nameLen: name.length,
+          };
+        }
+      }
+    }
+    return best;
+  }
+
   private wasix_path_rename(
     oldFd: number,
     oldPathPtr: number,
@@ -505,6 +794,12 @@ export class WASIX {
 
   private getWasix32v1Imports(): WebAssembly.ModuleImports {
     const enosys = () => Result.ENOSYS;
+    // proc_exit2 mirrors proc_exit semantics: terminate the run with the
+    // supplied code. wasix-libc's exit path always goes through proc_exit2;
+    // proc_exit (v1) is left wired ENOSYS until a binary surfaces it.
+    const procExit2 = (code: number) => {
+      throw new WASIXExit(code);
+    };
     return {
       // Args / environ — share the internal WASI's preview1 implementations
       // so wasix-libc's argv/environ setup sees the values that were passed
@@ -544,12 +839,20 @@ export class WASIX {
       fd_write: this.wasix_fd_write.bind(this),
       fd_pipe: enosys,
 
+      // wasix_32v1 v2 fd surface — flag-extended variants. Stubbed
+      // ENOSYS until the fd-table extraction (Slice 9) lifts the
+      // backing semantics out of WASIDrive.
+      fd_dup2: enosys, // TODO(slice-9): alias of fd_renumber
+      fd_fdflags_get: enosys, // TODO(slice-9): mirrors fd_fdstat_get fs_flags
+      fd_fdflags_set: enosys, // TODO(slice-9): mirrors fd_fdstat_set_flags
+
       // Paths
       path_create_directory: this.wasix_path_create_directory.bind(this),
       path_filestat_get: this.wasix_path_filestat_get.bind(this),
       path_filestat_set_times: enosys,
       path_link: enosys,
       path_open: this.wasix_path_open.bind(this),
+      path_open2: this.wasix_path_open2.bind(this),
       path_readlink: enosys,
       path_remove_directory: this.wasix_path_remove_directory.bind(this),
       path_rename: this.wasix_path_rename.bind(this),
@@ -558,12 +861,27 @@ export class WASIX {
 
       // Process
       proc_exit: enosys,
+      proc_exit2: procExit2,
       proc_fork: enosys,
+      proc_fork_env: enosys, // TODO(slice-7): proc/fork provider
       proc_exec: enosys,
+      proc_exec3: enosys, // TODO(slice-7): proc/exec provider
       proc_join: enosys,
       proc_signal: enosys,
+      // proc_signals_get / _sizes_get land with the signals provider in
+      // Slice 8. Until then we report "zero registered signals" instead
+      // of ENOSYS — wasix-libc's startup path treats ENOSYS as a fatal
+      // init error and exits with 71 before reaching `main`, but a
+      // size-0 signals table is the well-formed "no signals" answer
+      // that lets early init complete.
+      proc_signals_get: () => Result.SUCCESS,
+      proc_signals_sizes_get: (sizePtr: number) => {
+        new DataView(this.memory.buffer).setUint32(sizePtr, 0, true);
+        return Result.SUCCESS;
+      },
       proc_raise: enosys,
       proc_spawn: enosys,
+      proc_spawn2: enosys, // TODO(slice-7): proc/spawn provider
       proc_id: enosys,
       proc_parent: enosys,
 
@@ -620,8 +938,8 @@ export class WASIX {
       tty_set: enosys,
 
       // Working directory
-      getcwd: enosys,
-      chdir: enosys,
+      getcwd: this.wasix_getcwd.bind(this),
+      chdir: this.wasix_chdir.bind(this),
 
       // Poll
       poll_oneoff: enosys,
@@ -667,12 +985,274 @@ export class WASIX {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/**
+ * Descriptor info for the two `env.*` imports that drive WASIX module
+ * instantiation. Either field is absent when the binary doesn't import
+ * the corresponding entity.
+ */
+type ParsedEnvImports = {
+  memory?: { initial: number; maximum?: number; shared: boolean };
+  table?: {
+    element: "funcref" | "externref";
+    initial: number;
+    maximum?: number;
+  };
+};
+
+/**
+ * Walk the wasm import section just far enough to extract the descriptor
+ * for `env.memory` and `env.__indirect_function_table`. The standard
+ * `WebAssembly.Module.imports()` API only returns `{ module, name, kind }`
+ * — limits and the shared flag are not exposed — so we read them out of
+ * the binary directly. Returns descriptors for whichever of the two are
+ * present; missing entries map to undefined fields.
+ *
+ * The parser only descends into section id 2 (Imports) and stops as soon
+ * as the imports run out. It tolerates unknown leading custom sections.
+ *
+ * Wasm binary layout (relevant subset):
+ *   magic+version (8 bytes), then a sequence of sections:
+ *     section: id:byte, size:varuint32, content:bytes[size]
+ *   Imports section content:
+ *     count:varuint32, entries:Import[count]
+ *   Import:
+ *     module:vec<u8>, name:vec<u8>, kind:byte, descriptor
+ *   Memory descriptor (kind=2):
+ *     limits-flag:byte (bit0=has_max, bit1=shared, bit2=memory64)
+ *     min:varuint32 (or varuint64 if memory64)
+ *     max:varuint32 (or varuint64) if has_max
+ *   Table descriptor (kind=1):
+ *     elem-type:byte (0x70=funcref, 0x6f=externref)
+ *     limits-flag:byte (bit0=has_max), then min, then max if has_max
+ */
+function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
+  const out: ParsedEnvImports = {};
+
+  // Magic 0x00 0x61 0x73 0x6d ('\0asm') and version 1.
+  if (bytes.length < 8) return out;
+  if (
+    bytes[0] !== 0x00 ||
+    bytes[1] !== 0x61 ||
+    bytes[2] !== 0x73 ||
+    bytes[3] !== 0x6d
+  ) {
+    return out;
+  }
+
+  let offset = 8;
+  const decoder = new TextDecoder();
+
+  while (offset < bytes.length) {
+    const sectionId = bytes[offset++];
+    const [sectionSize, sizeOffset] = readVarUint32(bytes, offset);
+    offset = sizeOffset;
+    const sectionEnd = offset + sectionSize;
+
+    if (sectionId !== 2) {
+      offset = sectionEnd;
+      continue;
+    }
+
+    const [importCount, countOffset] = readVarUint32(bytes, offset);
+    offset = countOffset;
+
+    for (let i = 0; i < importCount; i++) {
+      const [modLen, modLenEnd] = readVarUint32(bytes, offset);
+      offset = modLenEnd;
+      const modName = decoder.decode(bytes.subarray(offset, offset + modLen));
+      offset += modLen;
+
+      const [nmLen, nmLenEnd] = readVarUint32(bytes, offset);
+      offset = nmLenEnd;
+      const importName = decoder.decode(bytes.subarray(offset, offset + nmLen));
+      offset += nmLen;
+
+      const kind = bytes[offset++];
+
+      // 0=function, 1=table, 2=memory, 3=global. We only care about
+      // env.memory and env.__indirect_function_table; everything else
+      // gets skipped past by reading just enough of its descriptor to
+      // advance the cursor.
+      if (kind === 0) {
+        // function: typeidx
+        const [, end] = readVarUint32(bytes, offset);
+        offset = end;
+      } else if (kind === 1) {
+        // table: reftype + limits
+        const elemTypeByte = bytes[offset++];
+        const flags = bytes[offset++];
+        const [initial, afterInitial] = readVarUint32(bytes, offset);
+        offset = afterInitial;
+        let maximum: number | undefined;
+        if (flags & 0x01) {
+          const [max, afterMax] = readVarUint32(bytes, offset);
+          maximum = max;
+          offset = afterMax;
+        }
+        if (modName === "env" && importName === "__indirect_function_table") {
+          const element = elemTypeByte === 0x6f ? "externref" : "funcref";
+          out.table = { element, initial, maximum };
+        }
+      } else if (kind === 2) {
+        // memory: limits with shared bit
+        const flags = bytes[offset++];
+        const isMemory64 = (flags & 0x04) !== 0;
+        const [initial, afterInitial] = isMemory64
+          ? readVarUint64AsNumber(bytes, offset)
+          : readVarUint32(bytes, offset);
+        offset = afterInitial;
+        let maximum: number | undefined;
+        if (flags & 0x01) {
+          const [max, afterMax] = isMemory64
+            ? readVarUint64AsNumber(bytes, offset)
+            : readVarUint32(bytes, offset);
+          maximum = max;
+          offset = afterMax;
+        }
+        if (modName === "env" && importName === "memory") {
+          out.memory = {
+            initial,
+            maximum,
+            shared: (flags & 0x02) !== 0,
+          };
+        }
+      } else if (kind === 3) {
+        // global: valtype + mutability
+        offset += 2;
+      } else {
+        // Unknown kind — bail to be safe rather than misalign the parse.
+        return out;
+      }
+    }
+
+    return out;
+  }
+
+  return out;
+}
+
+function readVarUint32(bytes: Uint8Array, offset: number): [number, number] {
+  let result = 0;
+  let shift = 0;
+  while (true) {
+    const b = bytes[offset++];
+    result |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+    if (shift > 35) {
+      throw new Error("WASIX: malformed varuint32 in module import section");
+    }
+  }
+  return [result >>> 0, offset];
+}
+
+function readVarUint64AsNumber(
+  bytes: Uint8Array,
+  offset: number,
+): [number, number] {
+  let result = 0n;
+  let shift = 0n;
+  while (true) {
+    const b = bytes[offset++];
+    result |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7n;
+    if (shift > 70n) {
+      throw new Error("WASIX: malformed varuint64 in module import section");
+    }
+  }
+  if (result > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("WASIX: memory64 limit exceeds Number.MAX_SAFE_INTEGER");
+  }
+  return [Number(result), offset];
+}
+
+function validateMemoryOverride(
+  memory: WebAssembly.Memory,
+  descriptor: { initial: number; maximum?: number; shared: boolean },
+): void {
+  // Engines expose memory.buffer as a SharedArrayBuffer when the
+  // underlying memory is shared.
+  const overrideShared =
+    typeof SharedArrayBuffer !== "undefined" &&
+    memory.buffer instanceof SharedArrayBuffer;
+  if (overrideShared !== descriptor.shared) {
+    throw new Error(
+      `WASIX: provided memory.shared=${overrideShared} does not match ` +
+        `module's env.memory.shared=${descriptor.shared}`,
+    );
+  }
+  const overrideInitial = memory.buffer.byteLength / 65536;
+  if (overrideInitial < descriptor.initial) {
+    throw new Error(
+      `WASIX: provided memory has ${overrideInitial} pages but ` +
+        `module's env.memory requires initial=${descriptor.initial}`,
+    );
+  }
+  // Maximum is not directly observable on the JS side without a private
+  // grow attempt, so we rely on the engine to reject at instantiation
+  // time if the override's max is below the descriptor's max.
+}
+
+function validateTableOverride(
+  table: WebAssembly.Table,
+  descriptor: { element: string; initial: number; maximum?: number },
+): void {
+  if (table.length < descriptor.initial) {
+    throw new Error(
+      `WASIX: provided indirect function table has length ${table.length} ` +
+        `but module's env.__indirect_function_table requires ` +
+        `initial=${descriptor.initial}`,
+    );
+  }
+  // Element type is not introspectable from JS; the engine rejects on
+  // mismatch at instantiation time. Maximum likewise.
+  void descriptor.element;
+  void descriptor.maximum;
+}
+
+/**
+ * Resolve a guest-supplied path against the current working directory.
+ * Absolute paths (leading `/`) bypass the cwd join. The result is
+ * normalised so `..` segments fold correctly and trailing slashes are
+ * dropped (except for the root).
+ *
+ * Used by `chdir` to compute the absolute target of a relative cwd
+ * change. Other syscalls do not call this — wasix-libc resolves
+ * relative paths against `getcwd()` itself before calling `path_*`,
+ * so by the time a path reaches the runtime it is already preopen-
+ * relative.
+ */
+function resolveAbsolute(cwd: string, path: string): string {
+  const joined = path.startsWith("/") ? path : `${cwd}/${path}`;
+  const segments = joined.split("/");
+  const out: string[] = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(segment);
+  }
+  return "/" + out.join("/");
+}
+
+function stripLeadingSlash(path: string): string {
+  return path.startsWith("/") ? path.slice(1) : path;
+}
+
 function readString(
   memory: WebAssembly.Memory,
   ptr: number,
   len: number,
 ): string {
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+  // Copy out before decoding: when env.memory is a SharedArrayBuffer
+  // (the threaded wasix-libc default) TextDecoder rejects views over it.
+  // `slice` returns a Uint8Array backed by a fresh non-shared ArrayBuffer.
+  return new TextDecoder().decode(
+    new Uint8Array(memory.buffer, ptr, len).slice(),
+  );
 }
 
 function readIOVectors(

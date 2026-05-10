@@ -61,11 +61,12 @@ test("WASIDriveFileSystemProvider: mkdir foo then rmdir foo round-trips on an em
   expect(result.createError).toBe(null);
   expect(result.removeError).toBe(null);
   expect(result.removeResult).toBe(null);
-  // Confirm the directory really is gone — pathStat over a missing path
-  // surfaces ENOTCAPABLE === 76 from the underlying WASIDrive (which
-  // doesn't distinguish "path absent" from "path not allowed"). Pinning
-  // 76 here is fine; this test guards the wrapper, not the drive.
-  expect(result.postStatResult).toBe(76);
+  // Confirm the directory really is gone — pathStat over a missing
+  // path surfaces ENOENT === 44 from the underlying WASIDrive. (The
+  // drive used to return ENOTCAPABLE for both "not allowed" and "not
+  // present", which leaked WASI's capability vocabulary into errno
+  // paths that POSIX consumers expect to see ENOENT.)
+  expect(result.postStatResult).toBe(44);
 });
 
 test("WASIDriveFileSystemProvider: rmdir on a non-empty directory still returns ENOTEMPTY", async ({

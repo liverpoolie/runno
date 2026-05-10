@@ -1,6 +1,6 @@
 # WASIX support — technical design
 
-*Status: design phase. Describes the target architecture; revise as decisions land.*
+_Status: design phase. Describes the target architecture; revise as decisions land._
 
 ## Goal
 
@@ -41,7 +41,7 @@ Every WASIX syscall has a provider slot. Unwired slots return `ENOSYS`.
   the path to lifting this.
 - `proc_exec` and `proc_spawn` are **not** in this category — they start a
   fresh instance, which a provider can do. Expected to pass.
-- Real socket / process / thread implementations baked into the runtime *or*
+- Real socket / process / thread implementations baked into the runtime _or_
   shipped as Runno providers. Runno is a sandbox; its providers are
   simulations. A host that wants real-world semantics wires its own
   providers — Runno does not ship them.
@@ -59,24 +59,34 @@ export { WASIX, WASIXContext, WASIXWorkerHost } from "./wasix/...";
 
 // Raw provider interfaces — always synchronous, consumed by `WASIX`
 export type {
-  ClockProvider, RandomProvider,
-  TTYProvider, ThreadsProvider, FutexProvider,
-  SignalsProvider, SocketsProvider, ProcProvider,
+  ClockProvider,
+  RandomProvider,
+  TTYProvider,
+  ThreadsProvider,
+  FutexProvider,
+  SignalsProvider,
+  SocketsProvider,
+  ProcProvider,
 } from "./wasix/providers.js";
 
 // Async-capable variants — accepted only by WASIXWorkerHost
 export type {
-  AsyncClockProvider, AsyncRandomProvider,
-  AsyncTTYProvider, AsyncThreadsProvider, AsyncFutexProvider,
-  AsyncSignalsProvider, AsyncSocketsProvider, AsyncProcProvider,
+  AsyncClockProvider,
+  AsyncRandomProvider,
+  AsyncTTYProvider,
+  AsyncThreadsProvider,
+  AsyncFutexProvider,
+  AsyncSignalsProvider,
+  AsyncSocketsProvider,
+  AsyncProcProvider,
   AsyncCapable,
 } from "./wasix/providers/async.js";
 
 // Ergonomic providers — concrete classes hosts can drop in
 export {
-  HTTPProvider,        // AsyncSocketsProvider (Fetch-style) — worker-only
-  FileSystemProvider,  // wraps WASIDrive; sync + async variants
-  ConsoleTTYProvider,  // TTYProvider (sync)
+  HTTPProvider, // AsyncSocketsProvider (Fetch-style) — worker-only
+  FileSystemProvider, // wraps WASIDrive; sync + async variants
+  ConsoleTTYProvider, // TTYProvider (sync)
 } from "./wasix/providers/ergonomic.js";
 ```
 
@@ -155,14 +165,14 @@ type WASIXContextOptions = {
 
   // Providers — all sync. Async variants are configured via
   // WASIXWorkerHostOptions; see "Async-capable providers" below.
-  clock?:   ClockProvider;    // clock_time_get, clock_res_get
-  random?:  RandomProvider;   // random_get
-  tty?:     TTYProvider;      // tty_get, tty_set
-  threads?: ThreadsProvider;  // thread_spawn/join/exit/sleep/id/parallelism/signal
-  futex?:   FutexProvider;    // futex_wait, futex_wake(_all)
-  signals?: SignalsProvider;  // signal_register, proc_raise_interval
-  sockets?: SocketsProvider;  // WASIX socket surface (TCP/UDP/resolve)
-  proc?:    ProcProvider;     // proc_id, proc_fork/spawn/exec/join, proc_parent
+  clock?: ClockProvider; // clock_time_get, clock_res_get
+  random?: RandomProvider; // random_get
+  tty?: TTYProvider; // tty_get, tty_set
+  threads?: ThreadsProvider; // thread_spawn/join/exit/sleep/id/parallelism/signal
+  futex?: FutexProvider; // futex_wait, futex_wake(_all)
+  signals?: SignalsProvider; // signal_register, proc_raise_interval
+  sockets?: SocketsProvider; // WASIX socket surface (TCP/UDP/resolve)
+  proc?: ProcProvider; // proc_id, proc_fork/spawn/exec/join, proc_parent
 };
 ```
 
@@ -193,7 +203,7 @@ Raw interface shapes (final forms pinned during implementation):
 
 ```ts
 interface ClockProvider {
-  now(id: ClockId): bigint;                  // nanoseconds
+  now(id: ClockId): bigint; // nanoseconds
   resolution(id: ClockId): bigint;
 }
 
@@ -202,8 +212,8 @@ interface RandomProvider {
 }
 
 interface ThreadsProvider {
-  spawn(startArg: number): number;    // tid
-  join(tid: number): number;          // exit code
+  spawn(startArg: number): number; // tid
+  join(tid: number): number; // exit code
   exit(code: number): void;
   sleep(durationNs: bigint): void;
   id(): number;
@@ -249,7 +259,7 @@ interface SignalsProvider {
 }
 
 interface TTYProvider {
-  get(): TTYState;       // cols, rows, pixel size, echo, line, raw, …
+  get(): TTYState; // cols, rows, pixel size, echo, line, raw, …
   set(state: TTYState): Result;
 }
 ```
@@ -266,7 +276,7 @@ type AsyncCapable<T> = {
     : T[K];
 };
 
-type AsyncClockProvider   = AsyncCapable<ClockProvider>;
+type AsyncClockProvider = AsyncCapable<ClockProvider>;
 type AsyncSocketsProvider = AsyncCapable<SocketsProvider>;
 // …one per raw provider
 ```
@@ -298,8 +308,8 @@ bundled clock and filesystem is a normal configuration.
   about HTTP, not raw TCP/UDP. `HTTPProvider` exposes two handlers:
   ```ts
   new HTTPProvider({
-    outgoing: (req: Request) => Response | Promise<Response>,   // guest-initiated
-    incoming: (port: number) => ReadableStream<Request>,         // guest-bound service
+    outgoing: (req: Request) => Response | Promise<Response>, // guest-initiated
+    incoming: (port: number) => ReadableStream<Request>, // guest-bound service
   });
   ```
   Internally it translates socket-level calls (`connect`, `send`, `recv`)
@@ -359,17 +369,19 @@ Promise. The types enforce the split — an async-capable provider passed to
 ## Thread / memory model
 
 Threaded WASIX binaries expect:
+
 - A `wasi_thread_start(tid: i32, startArg: i32) -> ()` export on the module.
 - The module imports its memory (`env.memory`) rather than exporting it, and
   that memory is declared `shared: true`.
 
 The runtime's responsibility:
+
 - Construct (or accept from the host) a
   `WebAssembly.Memory({ initial, maximum, shared: true })`.
 - Instantiate the main module against that memory.
 - On `thread_spawn(startArg)`, call `ThreadsProvider.spawn(startArg)` for a TID.
 
-The *semantics* of running the new thread are the provider's problem:
+The _semantics_ of running the new thread are the provider's problem:
 
 - A real-worker provider instantiates a new worker, loads the same WASM module
   against the same shared `Memory`, and calls `wasi_thread_start(tid, startArg)`.
@@ -398,6 +410,21 @@ A host can override auto-detection by passing `WASIXContextOptions.memory`
 threaded configuration). If supplied, it must satisfy whichever mode the
 module expects.
 
+### Sequencing
+
+The auto-detect path lands ahead of the threads / futex provider work
+because every wasix-libc binary imports `env.memory` (declared `shared`)
+regardless of whether the test exercises threads. wasix-libc is built with
+`-pthread -mthread-model posix -matomics -mbulk-memory` for the whole
+sysroot, so a strictly single-threaded filesystem test still rejects at
+`WebAssembly.instantiate` until the runtime supplies a matching shared
+`WebAssembly.Memory`. Wiring the import surface is therefore a prerequisite
+for any wasmer-suite coverage — including the FS tests served by Slice 3 —
+and ships in a small carve-out (Slice 3.5) that does not introduce the
+threads provider, the futex provider, or the worker-host bridge. Those
+remain in their own slices and consume the same auto-detected memory
+when they land.
+
 ## Determinism
 
 With `clock` and `random` as providers, a host can pin either or both for
@@ -405,8 +432,8 @@ reproducibility:
 
 ```ts
 const wasix = new WASIX({
-  clock:  new FixedClockProvider(0n),     // epoch 0, monotonic 0
-  random: new SeededRandomProvider(42),   // seeded PRNG
+  clock: new FixedClockProvider(0n), // epoch 0, monotonic 0
+  random: new SeededRandomProvider(42), // seeded PRNG
   // …
 });
 ```
@@ -449,7 +476,7 @@ integration suite runner configures a `WASIX` instance from this set; a unit
 test can swap in a `FixedClockProvider`, a `SeededRandomProvider`, or its own
 fakes.
 
-This is the design point: *simulations are enough to pass the suite.* The
+This is the design point: _simulations are enough to pass the suite._ The
 tests exercise API shape and errno behaviour, not real-world networking or
 real OS process semantics. A host that needs real behaviour plugs in its own
 providers (e.g. a `node-sockets.ts` backed by `node:net`) — but Runno doesn't
@@ -502,7 +529,7 @@ There is no API for it, public or private.
 
 Entering a WASM instance from JS means calling an export from its start.
 There is no "resume at frame N, instruction M." So a provider can clone
-memory but cannot tell the child instance *where to begin*.
+memory but cannot tell the child instance _where to begin_.
 
 The same limitation hits two related syscalls:
 
@@ -518,7 +545,7 @@ In all three, the root cause is identical: **WASM execution state is not
 reifiable from JS**.
 
 Both workarounds described in [Future: Asyncify opt-in](#future-asyncify-opt-in)
-operate below the provider layer. Asyncify moves the stack *into* guest
+operate below the provider layer. Asyncify moves the stack _into_ guest
 memory where JS can see it; JSPI adds a first-class pause/resume primitive
 at the engine. Neither is something a provider can do at call time — which
 is why v1 ships with these tests skipped rather than working around them.
