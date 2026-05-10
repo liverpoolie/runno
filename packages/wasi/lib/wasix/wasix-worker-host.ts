@@ -51,6 +51,7 @@ import type {
   AsyncTTYProvider,
 } from "./providers/async.js";
 import { ClockId, Result, WASIXError } from "./wasix-32v1.js";
+import { parseEnvImportDescriptors, type ParsedEnvImports } from "./wasix.js";
 import {
   DEFAULT_BRIDGE_BUFFER_BYTES,
   Opcode,
@@ -145,7 +146,7 @@ export class WASIXWorkerHost {
   }
 
   private async runOnce(): Promise<WASIXExecutionResult> {
-    const module = await this.compileModule();
+    const { module, envDescriptors } = await this.compileModule();
     this.sharedBuffer = createBridgeBuffer(DEFAULT_BRIDGE_BUFFER_BYTES);
     const sharedBuffer = this.sharedBuffer;
 
@@ -175,6 +176,7 @@ export class WASIXWorkerHost {
       target: "worker",
       type: "start",
       module,
+      envDescriptors,
       sharedBuffer,
       contextConfig: serialisableContext(this.options),
       asyncSlots: detectAsyncSlots(this.options),
@@ -211,12 +213,31 @@ export class WASIXWorkerHost {
 
   // ─── Internals ───────────────────────────────────────────────────────────
 
-  private async compileModule(): Promise<WebAssembly.Module> {
+  /**
+   * Compile the wasm module on the main thread (workers can't fetch on
+   * their own in every browser). When the source is a `Response`, we read
+   * the bytes once so we can also parse the `env.*` import descriptors
+   * here — the worker needs the descriptors to construct matching
+   * `WebAssembly.Memory` / `Table` instances at instantiation time. When
+   * the source is a pre-compiled `WebAssembly.Module` we have no bytes,
+   * so descriptors are absent and the worker falls back to passing no
+   * `env` imports — fine for preview1 binaries that export their own
+   * memory, but wasix-libc binaries handed in module form would fail to
+   * instantiate. Callers wanting wasix-libc support should pass a
+   * `Response` (or `Promise<Response>`) instead.
+   */
+  private async compileModule(): Promise<{
+    module: WebAssembly.Module;
+    envDescriptors?: ParsedEnvImports;
+  }> {
     if (this.moduleSource instanceof WebAssembly.Module) {
-      return this.moduleSource;
+      return { module: this.moduleSource };
     }
     const response = await Promise.resolve(this.moduleSource);
-    return WebAssembly.compileStreaming(response);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const envDescriptors = parseEnvImportDescriptors(bytes);
+    const module = await WebAssembly.compile(bytes);
+    return { module, envDescriptors };
   }
 
   private spawnWorker(): {

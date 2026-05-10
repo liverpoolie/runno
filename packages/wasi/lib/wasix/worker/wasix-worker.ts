@@ -15,7 +15,7 @@
 // via re-export; the host imports these types without pulling in any
 // runtime worker code.
 
-import { WASIX } from "../wasix.js";
+import { WASIX, type ParsedEnvImports } from "../wasix.js";
 import { WASIXContext } from "../wasix-context.js";
 import {
   WASIDriveFileSystemProvider,
@@ -78,6 +78,15 @@ export type WASIXWorkerStartMessage = {
   type: "start";
   /** Compiled module or raw bytes. Module is preferred (no re-compile). */
   module: WebAssembly.Module | ArrayBuffer;
+  /** Parsed `env.memory` / `env.__indirect_function_table` descriptors. The
+   *  host pre-parses these from the wasm bytes (when bytes are available)
+   *  and ships them so the worker can construct matching
+   *  `WebAssembly.Memory` / `Table` instances and pass them as `env` imports
+   *  — wasix-libc binaries import `env.memory` and refuse to instantiate
+   *  without a matching one. Absent when the host was given a pre-compiled
+   *  `WebAssembly.Module` (no bytes to parse) or when neither import is
+   *  present in the binary. */
+  envDescriptors?: ParsedEnvImports;
   /** SharedArrayBuffer is shared (not transferred) across postMessage; the
    *  main thread keeps its reference for the bridge dispatcher. */
   sharedBuffer: SharedArrayBuffer;
@@ -269,11 +278,25 @@ async function runGuest(
   });
 
   const wasix = new WASIX(context);
+  // Mirror WASIX.start's slice-3.5 env-import surface: wasix-libc binaries
+  // import `env.memory` (often shared) and `env.__indirect_function_table`
+  // and refuse to instantiate without matching descriptors. The host parses
+  // them from the wasm bytes before postMessage; here we turn them into
+  // concrete `WebAssembly.Memory` / `Table` instances and feed them into
+  // both the import object and `wasix.start`'s memory option (so the
+  // SharedArrayBuffer-aware TextDecoder path in `readString` sees the right
+  // memory before any export memory exists). When the host had no bytes
+  // (e.g. it was handed a pre-compiled `WebAssembly.Module`) descriptors
+  // are absent and resolveEnvImports returns an empty object — preview1
+  // binaries that export their own memory still instantiate fine.
+  const { memory, indirectFunctionTable } = wasix.resolveEnvImports(
+    msg.envDescriptors ?? {},
+  );
   const instance = await WebAssembly.instantiate(
     module,
-    wasix.getImportObject(),
+    wasix.getImportObject({ memory, indirectFunctionTable }),
   );
-  return wasix.start({ instance, module });
+  return wasix.start({ instance, module }, { memory });
 }
 
 function sendMessage(message: WASIXWorkerHostMessage): void {

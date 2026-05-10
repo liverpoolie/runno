@@ -990,7 +990,7 @@ export class WASIX {
  * instantiation. Either field is absent when the binary doesn't import
  * the corresponding entity.
  */
-type ParsedEnvImports = {
+export type ParsedEnvImports = {
   memory?: { initial: number; maximum?: number; shared: boolean };
   table?: {
     element: "funcref" | "externref";
@@ -1025,7 +1025,7 @@ type ParsedEnvImports = {
  *     elem-type:byte (0x70=funcref, 0x6f=externref)
  *     limits-flag:byte (bit0=has_max), then min, then max if has_max
  */
-function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
+export function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
   const out: ParsedEnvImports = {};
 
   // Magic 0x00 0x61 0x73 0x6d ('\0asm') and version 1.
