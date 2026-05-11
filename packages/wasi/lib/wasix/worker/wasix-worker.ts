@@ -24,6 +24,11 @@ import {
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
   ClockProvider,
+  DirEntry,
+  Fdstat,
+  FileSystemProvider,
+  Filestat,
+  PreopenInfo,
   RandomProvider,
   TTYProvider,
   TTYState,
@@ -32,6 +37,7 @@ import { ClockId, Result } from "../wasix-32v1.js";
 import {
   Opcode,
   callBridgeSync,
+  requestRegionByteLength,
   type BridgeResponse,
   type TTYStateWire,
 } from "./bridge.js";
@@ -61,7 +67,8 @@ export type AsyncBridgedSlot =
   | "futex"
   | "signals"
   | "sockets"
-  | "proc";
+  | "proc"
+  | "fs";
 
 /**
  * Subset of WASIXContext that survives postMessage. Callbacks and class
@@ -268,6 +275,227 @@ function bridgeStdin(
   };
 }
 
+/**
+ * Build a sync `FileSystemProvider` whose every method routes through the
+ * bridge to the main thread. The host-side dispatcher awaits the Promise
+ * return of each `AsyncFileSystemProvider` method before writing the
+ * response back to this worker.
+ *
+ * Chunking: `fdRead` / `fdWrite` payloads are bounded by the request /
+ * response region size. The region is symmetric, so we use the request side
+ * as the per-call ceiling for both directions. The shim reserves ~4 KiB of
+ * headroom for codec framing (per the bridge layout's length-prefix +
+ * `RequestTag.ARGS` byte) and breaks larger transfers into successive
+ * round trips.
+ */
+function bridgeFileSystemProvider(
+  sharedBuffer: SharedArrayBuffer,
+): FileSystemProvider {
+  const regionBytes = requestRegionByteLength(sharedBuffer);
+  const CHUNK_OVERHEAD = 4 * 1024; // Conservative headroom for codec framing.
+  const chunkLimit = Math.max(1024, regionBytes - CHUNK_OVERHEAD);
+
+  // Single-call helper. Each caller passes the opcode + args shape it expects
+  // and reads back the matching result. The cast is local to this helper so
+  // call sites stay strongly-typed on the surrounding shim's signatures.
+  type CallResult<O extends Opcode> = Extract<
+    BridgeResponse,
+    { opcode: O }
+  >["result"];
+  function call<O extends Opcode>(opcode: O, args: unknown): CallResult<O> {
+    const response = callBridgeSync(sharedBuffer, {
+      opcode,
+      args,
+    } as unknown as Parameters<typeof callBridgeSync>[1]);
+    // The cast survives the lifetime of one call — the dispatcher is the
+    // only writer of `result` and it always matches `opcode`.
+    return (response as unknown as { result: CallResult<O> }).result;
+  }
+
+  return {
+    fdRead(fd: number, bufs: Uint8Array[]): number {
+      // Loop: each round trip may cover one or more bufs. We send as many
+      // sizes as fit in `chunkLimit` (rounded down by 4-byte size slots);
+      // the host returns the same number of bytes (or fewer on short read).
+      // Short read = EOF — stop and return total read so far.
+      let total = 0;
+      let bufIndex = 0;
+      while (bufIndex < bufs.length) {
+        const batchSizes: number[] = [];
+        let batchTotal = 0;
+        let endIndex = bufIndex;
+        while (endIndex < bufs.length) {
+          const remaining = bufs[endIndex].byteLength;
+          if (batchTotal + remaining > chunkLimit) {
+            // Single buf bigger than the chunk limit on its own — split it.
+            if (batchSizes.length === 0) {
+              batchSizes.push(chunkLimit);
+              batchTotal = chunkLimit;
+            }
+            break;
+          }
+          batchSizes.push(remaining);
+          batchTotal += remaining;
+          endIndex++;
+        }
+        if (batchSizes.length === 0) break;
+
+        const { bytes } = call(Opcode.FS_FD_READ, { fd, sizes: batchSizes });
+        if (bytes.byteLength === 0) break;
+
+        let bytesCursor = 0;
+        for (let i = 0; i < batchSizes.length; i++) {
+          const wantSize = batchSizes[i];
+          const slice = bytes.subarray(
+            bytesCursor,
+            bytesCursor + Math.min(wantSize, bytes.byteLength - bytesCursor),
+          );
+          if (slice.byteLength === 0) break;
+
+          // The single buf may have been split across two batches; copy at
+          // the right offset into bufs[bufIndex].
+          const target = bufs[bufIndex];
+          const writtenInBuf = target.byteLength - wantSize;
+          target.set(slice, writtenInBuf);
+          bytesCursor += slice.byteLength;
+          total += slice.byteLength;
+
+          if (slice.byteLength === wantSize) {
+            // This buf is fully consumed by this batch slot — advance.
+            bufIndex++;
+          } else {
+            // Short read on this slot — done.
+            return total;
+          }
+        }
+        // If the host returned fewer bytes than the batch asked for and we
+        // already covered every slot, the break above triggers; here we
+        // just continue to the next batch.
+        if (bytes.byteLength < batchTotal) {
+          return total;
+        }
+      }
+      return total;
+    },
+
+    fdWrite(fd: number, bufs: Uint8Array[]): number {
+      // Concatenate up to one chunk's worth at a time. Short write returns
+      // immediately with the partial total.
+      const flattened = concatBufs(bufs);
+      let written = 0;
+      while (written < flattened.byteLength) {
+        const slice = flattened.subarray(
+          written,
+          Math.min(flattened.byteLength, written + chunkLimit),
+        );
+        // Copy into a fresh Uint8Array — bytes are encoded with a fresh
+        // length-prefix copy in the bridge codec, so a subarray view is
+        // fine, but bytes that hand the codec a shared-memory view make
+        // the spec brittle. The copy here is at most chunkLimit bytes.
+        const { written: n } = call(Opcode.FS_FD_WRITE, {
+          fd,
+          bytes: new Uint8Array(slice),
+        });
+        written += n;
+        if (n < slice.byteLength) break;
+      }
+      return written;
+    },
+
+    fdSeek(fd: number, offset: bigint, whence: number): bigint {
+      return call(Opcode.FS_FD_SEEK, { fd, offset, whence }).position;
+    },
+
+    fdClose(fd: number): void {
+      call(Opcode.FS_FD_CLOSE, { fd });
+    },
+
+    fdFdstatGet(fd: number): Fdstat {
+      return call(Opcode.FS_FD_FDSTAT_GET, { fd }).fdstat;
+    },
+
+    fdFdstatSetFlags(fd: number, flags: number): void {
+      call(Opcode.FS_FD_FDSTAT_SET_FLAGS, { fd, flags });
+    },
+
+    fdFilestatGet(fd: number): Filestat {
+      return call(Opcode.FS_FD_FILESTAT_GET, { fd }).filestat;
+    },
+
+    fdPrestatGet(fd: number): PreopenInfo | null {
+      return call(Opcode.FS_FD_PRESTAT_GET, { fd }).prestat;
+    },
+
+    fdPrestatDirName(fd: number): string {
+      return call(Opcode.FS_FD_PRESTAT_DIR_NAME, { fd }).name;
+    },
+
+    fdReaddir(fd: number, cookie: bigint): DirEntry[] {
+      return call(Opcode.FS_FD_READDIR, { fd, cookie }).entries;
+    },
+
+    pathOpen(
+      fdDir: number,
+      dirflags: number,
+      path: string,
+      oflags: number,
+      rightsBase: bigint,
+      rightsInheriting: bigint,
+      fdflags: number,
+    ): number {
+      return call(Opcode.FS_PATH_OPEN, {
+        fdDir,
+        dirflags,
+        path,
+        oflags,
+        rightsBase,
+        rightsInheriting,
+        fdflags,
+      }).fd;
+    },
+
+    pathFilestatGet(fdDir: number, dirflags: number, path: string): Filestat {
+      return call(Opcode.FS_PATH_FILESTAT_GET, { fdDir, dirflags, path })
+        .filestat;
+    },
+
+    pathCreateDirectory(fdDir: number, path: string): void {
+      call(Opcode.FS_PATH_CREATE_DIRECTORY, { fdDir, path });
+    },
+
+    pathUnlinkFile(fdDir: number, path: string): void {
+      call(Opcode.FS_PATH_UNLINK_FILE, { fdDir, path });
+    },
+
+    pathRemoveDirectory(fdDir: number, path: string): void {
+      call(Opcode.FS_PATH_REMOVE_DIRECTORY, { fdDir, path });
+    },
+
+    pathRename(
+      fdDir: number,
+      oldPath: string,
+      fdNewDir: number,
+      newPath: string,
+    ): void {
+      call(Opcode.FS_PATH_RENAME, { fdDir, oldPath, fdNewDir, newPath });
+    },
+  };
+}
+
+function concatBufs(bufs: Uint8Array[]): Uint8Array {
+  if (bufs.length === 0) return new Uint8Array(0);
+  if (bufs.length === 1) return bufs[0];
+  let total = 0;
+  for (const buf of bufs) total += buf.byteLength;
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const buf of bufs) {
+    out.set(buf, cursor);
+    cursor += buf.byteLength;
+  }
+  return out;
+}
+
 // ─── Main entry ────────────────────────────────────────────────────────────
 
 // Worker globals — `self` is a DedicatedWorkerGlobalScope; narrow just the
@@ -322,6 +550,20 @@ async function runGuest(
     ? bridgeTTYProvider(msg.sharedBuffer)
     : undefined;
 
+  // Filesystem slot. If the host passed a `FileSystemProvider` (sync) or an
+  // `AsyncFileSystemProvider`, it lives on the main thread and the worker
+  // routes through the bridge — `fs` appears in `asyncSlots`. Otherwise the
+  // host passed a serialisable `WASIFS`, which the worker reconstructs into
+  // a local `WASIDriveFileSystemProvider`.
+  const fs = asyncSet.has("fs")
+    ? bridgeFileSystemProvider(msg.sharedBuffer)
+    : new WASIDriveFileSystemProvider(
+        msg.contextConfig.fs ?? {},
+        msg.contextConfig.preopens
+          ? { preopens: msg.contextConfig.preopens }
+          : undefined,
+      );
+
   // Reconstruct the WASIXContext. `stdin` — if the host configured one — is
   // wired through the bridge; stdout/stderr/debug stream back via
   // postMessage.
@@ -329,12 +571,7 @@ async function runGuest(
     args: msg.contextConfig.args,
     env: msg.contextConfig.env,
     isTTY: msg.contextConfig.isTTY,
-    fs: new WASIDriveFileSystemProvider(
-      msg.contextConfig.fs ?? {},
-      msg.contextConfig.preopens
-        ? { preopens: msg.contextConfig.preopens }
-        : undefined,
-    ),
+    fs,
     stdin: msg.hasStdin ? bridgeStdin(msg.sharedBuffer) : () => null,
     stdout: (out: string) =>
       sendMessage({ target: "host", type: "stdout", text: out }),
