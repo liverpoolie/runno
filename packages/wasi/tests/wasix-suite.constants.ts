@@ -24,12 +24,23 @@ export const WASIX_VENDOR_DIR = "tests/wasix-vendor";
 export const WASIX_SUITE_BIN_DIR = "public/bin/wasix-tests";
 
 /**
- * Execution modes the suite runs every test under. Slice 4 parameterises
- * the harness so each `.wasm` runs through both `WASIX.start` on the main
- * thread and `WASIXWorkerHost.start()` in a dedicated worker. Skip-map
- * entries apply to both modes by default — no mode-specific skips yet.
+ * Execution modes the suite runs every test under.
+ *
+ * - `main`        — `WASIX.start` on the main thread; no bridge.
+ * - `worker`      — `WASIXWorkerHost.start()` with a serialisable `WASIFS`.
+ *                   The worker reconstructs a sync FS provider locally;
+ *                   FS calls never touch the bridge.
+ * - `worker-fs-async` — `WASIXWorkerHost.start()` with the same `WASIFS`
+ *                   data wrapped behind an `AsyncFileSystemProvider` on
+ *                   the main thread. Every FS call round-trips through the
+ *                   bridge with a `Promise.resolve()`-deferred return, so
+ *                   the same test exercises slice-4.1's FS bridge codec +
+ *                   dispatcher arms end-to-end.
+ *
+ * Skip-map entries apply across all modes by default — no mode-specific
+ * skips yet.
  */
-export const WASIX_SUITE_MODES = ["main", "worker"] as const;
+export const WASIX_SUITE_MODES = ["main", "worker", "worker-fs-async"] as const;
 export type WASIXSuiteMode = (typeof WASIX_SUITE_MODES)[number];
 
 /**
