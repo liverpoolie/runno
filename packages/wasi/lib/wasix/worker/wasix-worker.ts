@@ -295,6 +295,22 @@ function bridgeFileSystemProvider(
   const CHUNK_OVERHEAD = 4 * 1024; // Conservative headroom for codec framing.
   const chunkLimit = Math.max(1024, regionBytes - CHUNK_OVERHEAD);
 
+  // Path-opcode budget: the request region carries opcode-specific fixed
+  // args (≤ 32 bytes for FS_PATH_OPEN), a tag byte, and one length prefix
+  // per path. 64 bytes of overhead is comfortably more than any path opcode
+  // needs and leaves the encoded path room to fail with the right errno
+  // before `writeUtf8` would throw a generic RangeError.
+  const PATH_OVERHEAD = 64;
+  const pathBudget = Math.max(0, regionBytes - PATH_OVERHEAD);
+  const pathEncoder = new TextEncoder();
+  function ensurePathFits(...paths: string[]): void {
+    let total = 0;
+    for (const p of paths) total += pathEncoder.encode(p).byteLength;
+    if (total > pathBudget) {
+      throw new WASIXError(Result.ENAMETOOLONG);
+    }
+  }
+
   // Single-call helper. Each caller passes the opcode + args shape it expects
   // and reads back the matching result. The cast is local to this helper so
   // call sites stay strongly-typed on the surrounding shim's signatures.
@@ -314,29 +330,47 @@ function bridgeFileSystemProvider(
 
   return {
     fdRead(fd: number, bufs: Uint8Array[]): number {
-      // Loop: each round trip may cover one or more bufs. We send as many
-      // sizes as fit in `chunkLimit` (rounded down by 4-byte size slots);
-      // the host returns the same number of bytes (or fewer on short read).
-      // Short read = EOF — stop and return total read so far.
+      // Loop: each round trip may cover one or more bufs, or a single slice
+      // of one buf when that buf is larger than chunkLimit. We track per-buf
+      // cumulative bytes already placed so a buf split across multiple round
+      // trips lands its chunks at consecutive offsets, not always at the
+      // tail.
       let total = 0;
       let bufIndex = 0;
+      let writtenInBuf = 0;
       while (bufIndex < bufs.length) {
+        // Skip already-full or zero-length bufs.
+        if (bufs[bufIndex].byteLength - writtenInBuf === 0) {
+          bufIndex++;
+          writtenInBuf = 0;
+          continue;
+        }
+
+        // Build a batch: each slot records (target bufIndex, offset, length).
         const batchSizes: number[] = [];
+        const batchPlacements: { bufIndex: number; offset: number }[] = [];
         let batchTotal = 0;
-        let endIndex = bufIndex;
-        while (endIndex < bufs.length) {
-          const remaining = bufs[endIndex].byteLength;
-          if (batchTotal + remaining > chunkLimit) {
-            // Single buf bigger than the chunk limit on its own — split it.
-            if (batchSizes.length === 0) {
-              batchSizes.push(chunkLimit);
-              batchTotal = chunkLimit;
-            }
+        let probeIndex = bufIndex;
+        let probeOffset = writtenInBuf;
+        while (probeIndex < bufs.length && batchTotal < chunkLimit) {
+          const remainingInBuf = bufs[probeIndex].byteLength - probeOffset;
+          if (remainingInBuf === 0) {
+            probeIndex++;
+            probeOffset = 0;
+            continue;
+          }
+          const remainingInChunk = chunkLimit - batchTotal;
+          const slotSize = Math.min(remainingInBuf, remainingInChunk);
+          batchSizes.push(slotSize);
+          batchPlacements.push({ bufIndex: probeIndex, offset: probeOffset });
+          batchTotal += slotSize;
+          if (slotSize === remainingInBuf) {
+            probeIndex++;
+            probeOffset = 0;
+          } else {
+            // Hit chunk limit mid-buf — this slot is the tail of the batch.
             break;
           }
-          batchSizes.push(remaining);
-          batchTotal += remaining;
-          endIndex++;
         }
         if (batchSizes.length === 0) break;
 
@@ -344,36 +378,38 @@ function bridgeFileSystemProvider(
         if (bytes.byteLength === 0) break;
 
         let bytesCursor = 0;
+        let shortRead = false;
         for (let i = 0; i < batchSizes.length; i++) {
           const wantSize = batchSizes[i];
           const slice = bytes.subarray(
             bytesCursor,
             bytesCursor + Math.min(wantSize, bytes.byteLength - bytesCursor),
           );
-          if (slice.byteLength === 0) break;
-
-          // The single buf may have been split across two batches; copy at
-          // the right offset into bufs[bufIndex].
-          const target = bufs[bufIndex];
-          const writtenInBuf = target.byteLength - wantSize;
-          target.set(slice, writtenInBuf);
+          if (slice.byteLength === 0) {
+            shortRead = true;
+            break;
+          }
+          const { bufIndex: targetIndex, offset } = batchPlacements[i];
+          bufs[targetIndex].set(slice, offset);
           bytesCursor += slice.byteLength;
           total += slice.byteLength;
 
-          if (slice.byteLength === wantSize) {
-            // This buf is fully consumed by this batch slot — advance.
+          // Advance the persistent cursor.
+          bufIndex = targetIndex;
+          writtenInBuf = offset + slice.byteLength;
+          if (writtenInBuf === bufs[targetIndex].byteLength) {
             bufIndex++;
-          } else {
+            writtenInBuf = 0;
+          }
+          if (slice.byteLength < wantSize) {
             // Short read on this slot — done.
-            return total;
+            shortRead = true;
+            break;
           }
         }
-        // If the host returned fewer bytes than the batch asked for and we
-        // already covered every slot, the break above triggers; here we
-        // just continue to the next batch.
-        if (bytes.byteLength < batchTotal) {
-          return total;
-        }
+        if (shortRead) return total;
+        // Host returned fewer bytes than the full batch asked for — stop.
+        if (bytes.byteLength < batchTotal) return total;
       }
       return total;
     },
@@ -443,6 +479,7 @@ function bridgeFileSystemProvider(
       rightsInheriting: bigint,
       fdflags: number,
     ): number {
+      ensurePathFits(path);
       return call(Opcode.FS_PATH_OPEN, {
         fdDir,
         dirflags,
@@ -455,19 +492,23 @@ function bridgeFileSystemProvider(
     },
 
     pathFilestatGet(fdDir: number, dirflags: number, path: string): Filestat {
+      ensurePathFits(path);
       return call(Opcode.FS_PATH_FILESTAT_GET, { fdDir, dirflags, path })
         .filestat;
     },
 
     pathCreateDirectory(fdDir: number, path: string): void {
+      ensurePathFits(path);
       call(Opcode.FS_PATH_CREATE_DIRECTORY, { fdDir, path });
     },
 
     pathUnlinkFile(fdDir: number, path: string): void {
+      ensurePathFits(path);
       call(Opcode.FS_PATH_UNLINK_FILE, { fdDir, path });
     },
 
     pathRemoveDirectory(fdDir: number, path: string): void {
+      ensurePathFits(path);
       call(Opcode.FS_PATH_REMOVE_DIRECTORY, { fdDir, path });
     },
 
@@ -477,6 +518,7 @@ function bridgeFileSystemProvider(
       fdNewDir: number,
       newPath: string,
     ): void {
+      ensurePathFits(oldPath, newPath);
       call(Opcode.FS_PATH_RENAME, { fdDir, oldPath, fdNewDir, newPath });
     },
   };
