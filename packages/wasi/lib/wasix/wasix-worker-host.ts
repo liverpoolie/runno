@@ -31,6 +31,7 @@
 import type { WASIFS, WASIXExecutionResult } from "../types.js";
 import type {
   ClockProvider,
+  FileSystemProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
@@ -43,6 +44,7 @@ import type {
 import type { ProviderPreopen } from "./providers/ergonomic/filesystem-provider.js";
 import type {
   AsyncClockProvider,
+  AsyncFileSystemProvider,
   AsyncFutexProvider,
   AsyncProcProvider,
   AsyncRandomProvider,
@@ -89,10 +91,25 @@ import WASIXWorkerEntry from "./worker/wasix-worker?worker&inline";
  * drain externally.
  */
 export type WASIXWorkerHostOptions = {
-  fs?: WASIFS;
+  /**
+   * Filesystem slot. Two shapes are accepted:
+   *
+   *   1. `WASIFS` — a serialisable plain-object filesystem snapshot. Crosses
+   *      postMessage; the worker reconstructs a local
+   *      `WASIDriveFileSystemProvider` on the worker side. Zero bridge
+   *      traffic.
+   *   2. `FileSystemProvider` or `AsyncFileSystemProvider` — a real provider
+   *      instance. Stays on the main thread; the worker accesses it through
+   *      the SAB bridge. Async-capable providers may return Promises from
+   *      any method — the host dispatcher awaits before writing the
+   *      response.
+   */
+  fs?: WASIFS | FileSystemProvider | AsyncFileSystemProvider;
   /** Preopens beyond the implicit fd 3 = ".". Crosses postMessage as plain
    *  data; the worker rebuilds the WASIDriveFileSystemProvider with this
-   *  list. Mirror of WASIDriveFileSystemProviderOptions.preopens. */
+   *  list. Mirror of WASIDriveFileSystemProviderOptions.preopens. Ignored
+   *  when `fs` is a provider — the provider supplies its own preopen
+   *  topology via `fdPrestatGet` / `fdPrestatDirName`. */
   preopens?: ProviderPreopen[];
   args?: string[];
   env?: Record<string, string>;
@@ -487,7 +504,250 @@ export class WASIXWorkerHost {
         });
         return;
       }
+      case Opcode.FS_FD_READ: {
+        const fs = this.requireFsProvider();
+        const bufs = request.args.sizes.map((n) => new Uint8Array(n));
+        const total = await raceSignal(
+          Promise.resolve(fs.fdRead(request.args.fd, bufs)),
+          signal,
+        );
+        const out = concatRead(bufs, total);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_READ,
+          result: { bytes: out },
+        });
+        return;
+      }
+      case Opcode.FS_FD_WRITE: {
+        const fs = this.requireFsProvider();
+        const written = await raceSignal(
+          Promise.resolve(fs.fdWrite(request.args.fd, [request.args.bytes])),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_WRITE,
+          result: { written },
+        });
+        return;
+      }
+      case Opcode.FS_FD_SEEK: {
+        const fs = this.requireFsProvider();
+        const position = await raceSignal(
+          Promise.resolve(
+            fs.fdSeek(
+              request.args.fd,
+              request.args.offset,
+              request.args.whence,
+            ),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_SEEK,
+          result: { position },
+        });
+        return;
+      }
+      case Opcode.FS_FD_CLOSE: {
+        const fs = this.requireFsProvider();
+        await raceSignal(Promise.resolve(fs.fdClose(request.args.fd)), signal);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_CLOSE,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.FS_FD_FDSTAT_GET: {
+        const fs = this.requireFsProvider();
+        const fdstat = await raceSignal(
+          Promise.resolve(fs.fdFdstatGet(request.args.fd)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_FDSTAT_GET,
+          result: { fdstat },
+        });
+        return;
+      }
+      case Opcode.FS_FD_FDSTAT_SET_FLAGS: {
+        const fs = this.requireFsProvider();
+        await raceSignal(
+          Promise.resolve(
+            fs.fdFdstatSetFlags(request.args.fd, request.args.flags),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_FDSTAT_SET_FLAGS,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.FS_FD_FILESTAT_GET: {
+        const fs = this.requireFsProvider();
+        const filestat = await raceSignal(
+          Promise.resolve(fs.fdFilestatGet(request.args.fd)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_FILESTAT_GET,
+          result: { filestat },
+        });
+        return;
+      }
+      case Opcode.FS_FD_PRESTAT_GET: {
+        const fs = this.requireFsProvider();
+        const prestat = await raceSignal(
+          Promise.resolve(fs.fdPrestatGet(request.args.fd)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_PRESTAT_GET,
+          result: { prestat },
+        });
+        return;
+      }
+      case Opcode.FS_FD_PRESTAT_DIR_NAME: {
+        const fs = this.requireFsProvider();
+        const name = await raceSignal(
+          Promise.resolve(fs.fdPrestatDirName(request.args.fd)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_PRESTAT_DIR_NAME,
+          result: { name },
+        });
+        return;
+      }
+      case Opcode.FS_FD_READDIR: {
+        const fs = this.requireFsProvider();
+        const entries = await raceSignal(
+          Promise.resolve(fs.fdReaddir(request.args.fd, request.args.cookie)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_FD_READDIR,
+          result: { entries },
+        });
+        return;
+      }
+      case Opcode.FS_PATH_OPEN: {
+        const fs = this.requireFsProvider();
+        const fd = await raceSignal(
+          Promise.resolve(
+            fs.pathOpen(
+              request.args.fdDir,
+              request.args.dirflags,
+              request.args.path,
+              request.args.oflags,
+              request.args.rightsBase,
+              request.args.rightsInheriting,
+              request.args.fdflags,
+            ),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_OPEN,
+          result: { fd },
+        });
+        return;
+      }
+      case Opcode.FS_PATH_FILESTAT_GET: {
+        const fs = this.requireFsProvider();
+        const filestat = await raceSignal(
+          Promise.resolve(
+            fs.pathFilestatGet(
+              request.args.fdDir,
+              request.args.dirflags,
+              request.args.path,
+            ),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_FILESTAT_GET,
+          result: { filestat },
+        });
+        return;
+      }
+      case Opcode.FS_PATH_CREATE_DIRECTORY: {
+        const fs = this.requireFsProvider();
+        await raceSignal(
+          Promise.resolve(
+            fs.pathCreateDirectory(request.args.fdDir, request.args.path),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_CREATE_DIRECTORY,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.FS_PATH_UNLINK_FILE: {
+        const fs = this.requireFsProvider();
+        await raceSignal(
+          Promise.resolve(
+            fs.pathUnlinkFile(request.args.fdDir, request.args.path),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_UNLINK_FILE,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.FS_PATH_REMOVE_DIRECTORY: {
+        const fs = this.requireFsProvider();
+        await raceSignal(
+          Promise.resolve(
+            fs.pathRemoveDirectory(request.args.fdDir, request.args.path),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_REMOVE_DIRECTORY,
+          result: {},
+        });
+        return;
+      }
+      case Opcode.FS_PATH_RENAME: {
+        const fs = this.requireFsProvider();
+        await raceSignal(
+          Promise.resolve(
+            fs.pathRename(
+              request.args.fdDir,
+              request.args.oldPath,
+              request.args.fdNewDir,
+              request.args.newPath,
+            ),
+          ),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.FS_PATH_RENAME,
+          result: {},
+        });
+        return;
+      }
     }
+  }
+
+  /**
+   * Resolve the host's filesystem provider, throwing ENOSYS if the slot is
+   * absent or holds a non-provider `WASIFS` (which routes the WASIFS data
+   * over postMessage to the worker — those calls never reach the bridge).
+   * The bridge only fires when `fs` is a provider, so this branch is
+   * defensive.
+   */
+  private requireFsProvider(): FileSystemProvider | AsyncFileSystemProvider {
+    const fs = this.options.fs;
+    if (!fs || !isFsProvider(fs)) {
+      throw new WASIXError(Result.ENOSYS);
+    }
+    return fs;
   }
 }
 
@@ -496,18 +756,61 @@ export class WASIXWorkerHost {
 function serialisableContext(
   options: WASIXWorkerHostOptions,
 ): SerialisableContext {
+  // `fs` across postMessage must be a plain `WASIFS`. If the caller passed a
+  // provider, it stays on the main thread and the worker accesses it via
+  // the bridge — the `fs` field is omitted from the context here and the
+  // worker's `asyncSlots.has("fs")` check picks up the bridge path instead.
+  const fs = options.fs;
+  const fsAsData = fs && !isFsProvider(fs) ? (fs as WASIFS) : undefined;
   return {
     args: options.args,
     env: options.env,
     isTTY: options.isTTY,
-    // `fs` across postMessage must be a WASIFS — FileSystemProvider class
-    // instances can't cross the thread boundary. Future slices may add a
-    // bridge opcode set for FileSystemProvider; for now, worker-mode hosts
-    // pass a plain WASIFS plus a preopens descriptor that the worker
-    // re-applies when reconstructing the provider.
-    fs: options.fs,
+    fs: fsAsData,
     preopens: options.preopens,
   };
+}
+
+/**
+ * Discriminator between the `WASIFS` plain-object shape and a
+ * `FileSystemProvider` / `AsyncFileSystemProvider` instance. A provider has
+ * functional methods; a `WASIFS` is `Record<string, WASIFile>` and would
+ * never carry a `fdRead` key in practice. Picking one provider method as
+ * the witness keeps the check cheap and robust to either side adding more
+ * methods later.
+ */
+function isFsProvider(
+  fs: WASIFS | FileSystemProvider | AsyncFileSystemProvider,
+): fs is FileSystemProvider | AsyncFileSystemProvider {
+  return (
+    typeof (fs as Partial<FileSystemProvider>).fdRead === "function" &&
+    typeof (fs as Partial<FileSystemProvider>).pathOpen === "function"
+  );
+}
+
+/**
+ * Concatenate the first `total` bytes across `bufs` into a single
+ * `Uint8Array`. The provider's `fdRead` populates the head of each buf in
+ * order and reports the cumulative byte count; this is the inverse
+ * concatenation step the worker shim's chunking loop expects on the
+ * response side.
+ */
+function concatRead(bufs: Uint8Array[], total: number): Uint8Array {
+  if (total <= 0) return new Uint8Array(0);
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const buf of bufs) {
+    if (cursor >= total) break;
+    const remaining = total - cursor;
+    if (buf.byteLength <= remaining) {
+      out.set(buf, cursor);
+      cursor += buf.byteLength;
+    } else {
+      out.set(buf.subarray(0, remaining), cursor);
+      cursor += remaining;
+    }
+  }
+  return out;
 }
 
 /**
@@ -558,6 +861,10 @@ function detectAsyncSlots(options: WASIXWorkerHostOptions): AsyncBridgedSlot[] {
   if (options.signals) slots.push("signals");
   if (options.sockets) slots.push("sockets");
   if (options.proc) slots.push("proc");
+  // Filesystem is the lone slot where the option may hold a plain `WASIFS`
+  // (serialisable data) instead of a provider; only the provider variant
+  // routes through the bridge.
+  if (options.fs && isFsProvider(options.fs)) slots.push("fs");
   return slots;
 }
 
