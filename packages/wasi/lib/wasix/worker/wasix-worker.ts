@@ -1,0 +1,389 @@
+// Worker entry for WASIXWorkerHost.
+//
+// This module runs inside a dedicated Web Worker. It receives an init
+// message from the main thread, instantiates a `WASIX` against the SAB
+// syscall bridge, runs the guest to completion, and posts the result
+// back.
+//
+// The inner `WASIX` class still consumes sync providers. For any slot the
+// main-thread host configured as async-capable, the worker constructs a
+// thin sync shim that calls `callBridgeSync` — blocking on `Atomics.wait`
+// until the main-thread dispatcher writes the response.
+//
+// The shape of the init message (`WASIXWorkerStartMessage`) and the reply
+// messages (`WASIXWorkerHostMessage`) are shared with `wasix-worker-host.ts`
+// via re-export; the host imports these types without pulling in any
+// runtime worker code.
+
+import { WASIX, type ParsedEnvImports } from "../wasix.js";
+import { WASIXContext } from "../wasix-context.js";
+import {
+  WASIDriveFileSystemProvider,
+  type ProviderPreopen,
+} from "../providers/ergonomic/filesystem-provider.js";
+import type { WASIFS, WASIXExecutionResult } from "../../types.js";
+import type {
+  ClockProvider,
+  RandomProvider,
+  TTYProvider,
+  TTYState,
+} from "../providers.js";
+import { ClockId, Result } from "../wasix-32v1.js";
+import {
+  Opcode,
+  callBridgeSync,
+  type BridgeResponse,
+  type TTYStateWire,
+} from "./bridge.js";
+
+// ─── Messages ──────────────────────────────────────────────────────────────
+
+/**
+ * Provider slot identifiers the host declares as async-capable. The worker
+ * substitutes a bridge-backed sync shim for each one; slots not listed stay
+ * undefined (yielding ENOSYS) or are carried across verbatim if a pre-built
+ * sync provider was configured — but the main-thread host only ever ships
+ * sync providers over postMessage when they are trivially serialisable
+ * (currently, only `contextConfig.stdin`-stream intent flag). In practice
+ * this slice wires the bridge for anything async on the host side, and
+ * leaves sync-only slots to later refactors.
+ *
+ * The host rejects at startup any slot listed here whose opcode set hasn't
+ * landed yet (see `assertAsyncSlotsSupported` in `wasix-worker-host.ts`),
+ * so by the time the worker reads `asyncSlots` every entry maps to a
+ * bridge-backed shim below.
+ */
+export type AsyncBridgedSlot =
+  | "clock"
+  | "random"
+  | "tty"
+  | "threads"
+  | "futex"
+  | "signals"
+  | "sockets"
+  | "proc";
+
+/**
+ * Subset of WASIXContext that survives postMessage. Callbacks and class
+ * instances cannot cross the thread boundary, so the host sends a plain
+ * data description; stdin / stdout / stderr / debug funnel through
+ * bridge opcodes or `postMessage`-based streaming events.
+ */
+export type SerialisableContext = {
+  args?: string[];
+  env?: Record<string, string>;
+  isTTY?: boolean;
+  fs?: WASIFS;
+  /** Preopens descriptor for the worker-side WASIDriveFileSystemProvider —
+   *  passes through verbatim from WASIXWorkerHostOptions.preopens. */
+  preopens?: ProviderPreopen[];
+};
+
+export type WASIXWorkerStartMessage = {
+  target: "worker";
+  type: "start";
+  /** Compiled module or raw bytes. Module is preferred (no re-compile). */
+  module: WebAssembly.Module | ArrayBuffer;
+  /** Parsed `env.memory` / `env.__indirect_function_table` descriptors. The
+   *  host pre-parses these from the wasm bytes (when bytes are available)
+   *  and ships them so the worker can construct matching
+   *  `WebAssembly.Memory` / `Table` instances and pass them as `env` imports
+   *  — wasix-libc binaries import `env.memory` and refuse to instantiate
+   *  without a matching one. Absent when the host was given a pre-compiled
+   *  `WebAssembly.Module` (no bytes to parse) or when neither import is
+   *  present in the binary. */
+  envDescriptors?: ParsedEnvImports;
+  /** SharedArrayBuffer is shared (not transferred) across postMessage; the
+   *  main thread keeps its reference for the bridge dispatcher. */
+  sharedBuffer: SharedArrayBuffer;
+  contextConfig: SerialisableContext;
+  /** Which provider slots the host declared as async-capable. */
+  asyncSlots: AsyncBridgedSlot[];
+  /** True if the host configured a stdin callback (async or sync). */
+  hasStdin: boolean;
+  /** Pre-resolved `clock.resolution(id)` values, keyed by `ClockId` numeric.
+   *  Resolution is allowed to be a constant on every real provider, so we
+   *  cache it once at start instead of round-tripping every `clock_res_get`
+   *  through the bridge. Slots not present in this record fall back to the
+   *  bridge shim's `1µs` default and log a debug warning. */
+  clockResolutions?: Partial<Record<ClockId, bigint>>;
+};
+
+export type WASIXWorkerHostMessage =
+  | { target: "host"; type: "stdout"; text: string }
+  | { target: "host"; type: "stderr"; text: string }
+  | {
+      target: "host";
+      type: "debug";
+      name: string;
+      args: string[];
+      ret: number;
+      data: Array<{ [key: string]: unknown }>;
+    }
+  | { target: "host"; type: "result"; result: WASIXExecutionResult }
+  | { target: "host"; type: "crash"; error: { message: string; type: string } };
+
+// ─── Provider shims ────────────────────────────────────────────────────────
+
+/**
+ * Assert the bridge response's opcode matches what the shim requested. The
+ * encoded request and the encoded response carry the opcode independently;
+ * a protocol-drift bug on either side would otherwise be silently
+ * misinterpreted (we'd decode a CLOCK_NOW response into a STDIN_READ shape
+ * because the type system erased the union narrowing). This runtime check
+ * surfaces it as a clear error.
+ */
+function expectOpcode<O extends Opcode>(
+  response: BridgeResponse,
+  opcode: O,
+): Extract<BridgeResponse, { opcode: O }> {
+  if (response.opcode !== opcode) {
+    throw new Error(
+      `bridge: mismatched response opcode (got ${response.opcode}, expected ${opcode})`,
+    );
+  }
+  return response as Extract<BridgeResponse, { opcode: O }>;
+}
+
+function bridgeClockProvider(
+  sharedBuffer: SharedArrayBuffer,
+  cachedResolutions: Partial<Record<ClockId, bigint>>,
+): ClockProvider {
+  return {
+    now(id: ClockId): bigint {
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.CLOCK_NOW,
+          args: { clockId: id },
+        }),
+        Opcode.CLOCK_NOW,
+      );
+      return response.result.timeNs;
+    },
+    resolution(id: ClockId): bigint {
+      // The host pre-resolves and ships every supported clock's resolution
+      // in the start message — see WASIXWorkerHost.runOnce. We look it up
+      // here so async-capable `ClockProvider`s with non-default resolutions
+      // (e.g. `new FixedClockProvider({ resolution: 5_000n })`) round-trip
+      // correctly. The 1µs fallback only fires for clock IDs the host did
+      // not pre-resolve (typically because the provider threw on
+      // resolution(id)) — matches SystemClockProvider's default.
+      return cachedResolutions[id] ?? 1_000n;
+    },
+  };
+}
+
+function bridgeRandomProvider(sharedBuffer: SharedArrayBuffer): RandomProvider {
+  return {
+    fill(buf: Uint8Array): void {
+      // The bridge response region caps a single fill at < region byte size.
+      // We chunk so a guest-side fill of >region bytes still works — the
+      // shim issues multiple round trips and stitches them together.
+      let offset = 0;
+      while (offset < buf.byteLength) {
+        // Conservative chunk size: 16 KiB. Smaller than the 64 KiB region,
+        // leaves headroom for tag + length header, and avoids pathologically
+        // large host allocations for a runaway guest.
+        const chunk = Math.min(buf.byteLength - offset, 16 * 1024);
+        const response = expectOpcode(
+          callBridgeSync(sharedBuffer, {
+            opcode: Opcode.RANDOM_FILL,
+            args: { byteLength: chunk },
+          }),
+          Opcode.RANDOM_FILL,
+        );
+        buf.set(response.result.bytes, offset);
+        offset += chunk;
+      }
+    },
+  };
+}
+
+function bridgeTTYProvider(sharedBuffer: SharedArrayBuffer): TTYProvider {
+  return {
+    get(): TTYState {
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.TTY_GET,
+          args: {},
+        }),
+        Opcode.TTY_GET,
+      );
+      return wireToTTYState(response.result.state);
+    },
+    set(state: TTYState): Result {
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.TTY_SET,
+          args: { state: ttyStateToWire(state) },
+        }),
+        Opcode.TTY_SET,
+      );
+      return response.result.result;
+    },
+  };
+}
+
+function ttyStateToWire(state: TTYState): TTYStateWire {
+  return {
+    cols: state.cols,
+    rows: state.rows,
+    pixelWidth: state.pixelWidth,
+    pixelHeight: state.pixelHeight,
+    echo: state.echo,
+    lineBuffered: state.lineBuffered,
+    raw: state.raw,
+  };
+}
+
+function wireToTTYState(wire: TTYStateWire): TTYState {
+  return {
+    cols: wire.cols,
+    rows: wire.rows,
+    pixelWidth: wire.pixelWidth,
+    pixelHeight: wire.pixelHeight,
+    echo: wire.echo,
+    lineBuffered: wire.lineBuffered,
+    raw: wire.raw,
+  };
+}
+
+/**
+ * Build a sync stdin callback out of the STDIN_READ opcode. The inner WASI
+ * (inside the inner WASIX) calls stdin on every read — each call is one
+ * bridge round trip.
+ */
+function bridgeStdin(
+  sharedBuffer: SharedArrayBuffer,
+): (maxByteLength: number) => string | null {
+  return (maxByteLength: number): string | null => {
+    const response = expectOpcode(
+      callBridgeSync(sharedBuffer, {
+        opcode: Opcode.STDIN_READ,
+        args: { maxByteLength },
+      }),
+      Opcode.STDIN_READ,
+    );
+    return response.result.text;
+  };
+}
+
+// ─── Main entry ────────────────────────────────────────────────────────────
+
+// Worker globals — `self` is a DedicatedWorkerGlobalScope; narrow just the
+// pieces we use (postMessage + onmessage) to avoid pulling in the `webworker`
+// lib (which would fight `DOM` in the shared tsconfig).
+declare const self: {
+  onmessage: ((ev: MessageEvent) => void) | null;
+  postMessage: (message: unknown) => void;
+};
+
+self.onmessage = async (ev: MessageEvent) => {
+  const data = ev.data as WASIXWorkerStartMessage;
+  if (data.target !== "worker" || data.type !== "start") return;
+
+  try {
+    const result = await runGuest(data);
+    sendMessage({ target: "host", type: "result", result });
+  } catch (e) {
+    const error =
+      e instanceof Error
+        ? { message: e.message, type: e.constructor.name }
+        : { message: `unknown error - ${String(e)}`, type: "Unknown" };
+    sendMessage({ target: "host", type: "crash", error });
+  }
+};
+
+async function runGuest(
+  msg: WASIXWorkerStartMessage,
+): Promise<WASIXExecutionResult> {
+  const module =
+    msg.module instanceof WebAssembly.Module
+      ? msg.module
+      : await WebAssembly.compile(msg.module);
+
+  // Build provider slots. For each async-capable slot on the host side,
+  // install the bridge-backed sync shim. Non-async slots remain undefined —
+  // the inner WASIX will lazy-init defaults (e.g. SystemClockProvider) as
+  // today.
+  //
+  // Slots without bridge opcodes (threads / futex / signals / sockets /
+  // proc) cannot appear here — the host's `assertAsyncSlotsSupported`
+  // rejects them at startup with ENOSYS, so they never reach the worker.
+  const asyncSet = new Set<AsyncBridgedSlot>(msg.asyncSlots);
+
+  const clock: ClockProvider | undefined = asyncSet.has("clock")
+    ? bridgeClockProvider(msg.sharedBuffer, msg.clockResolutions ?? {})
+    : undefined;
+  const random: RandomProvider | undefined = asyncSet.has("random")
+    ? bridgeRandomProvider(msg.sharedBuffer)
+    : undefined;
+  const tty: TTYProvider | undefined = asyncSet.has("tty")
+    ? bridgeTTYProvider(msg.sharedBuffer)
+    : undefined;
+
+  // Reconstruct the WASIXContext. `stdin` — if the host configured one — is
+  // wired through the bridge; stdout/stderr/debug stream back via
+  // postMessage.
+  const context = new WASIXContext({
+    args: msg.contextConfig.args,
+    env: msg.contextConfig.env,
+    isTTY: msg.contextConfig.isTTY,
+    fs: new WASIDriveFileSystemProvider(
+      msg.contextConfig.fs ?? {},
+      msg.contextConfig.preopens
+        ? { preopens: msg.contextConfig.preopens }
+        : undefined,
+    ),
+    stdin: msg.hasStdin ? bridgeStdin(msg.sharedBuffer) : () => null,
+    stdout: (out: string) =>
+      sendMessage({ target: "host", type: "stdout", text: out }),
+    stderr: (err: string) =>
+      sendMessage({ target: "host", type: "stderr", text: err }),
+    debug: (name, args, ret, dataArg) => {
+      const cloned = JSON.parse(JSON.stringify(dataArg)) as Array<{
+        [key: string]: unknown;
+      }>;
+      sendMessage({
+        target: "host",
+        type: "debug",
+        name,
+        args,
+        ret,
+        data: cloned,
+      });
+      // Match the behaviour of wasi-worker.ts: return the ret value so the
+      // debug hook is a no-op rewrite. The DebugFn signature expects
+      // `number | undefined`.
+      return ret;
+    },
+    clock,
+    random,
+    tty,
+  });
+
+  const wasix = new WASIX(context);
+  // Mirror WASIX.start's slice-3.5 env-import surface: wasix-libc binaries
+  // import `env.memory` (often shared) and `env.__indirect_function_table`
+  // and refuse to instantiate without matching descriptors. The host parses
+  // them from the wasm bytes before postMessage; here we turn them into
+  // concrete `WebAssembly.Memory` / `Table` instances and feed them into
+  // both the import object and `wasix.start`'s memory option (so the
+  // SharedArrayBuffer-aware TextDecoder path in `readString` sees the right
+  // memory before any export memory exists). When the host had no bytes
+  // (e.g. it was handed a pre-compiled `WebAssembly.Module`) descriptors
+  // are absent and resolveEnvImports returns an empty object — preview1
+  // binaries that export their own memory still instantiate fine.
+  const { memory, indirectFunctionTable } = wasix.resolveEnvImports(
+    msg.envDescriptors ?? {},
+  );
+  const instance = await WebAssembly.instantiate(
+    module,
+    wasix.getImportObject({ memory, indirectFunctionTable }),
+  );
+  return wasix.start({ instance, module }, { memory });
+}
+
+function sendMessage(message: WASIXWorkerHostMessage): void {
+  self.postMessage(message);
+}

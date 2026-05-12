@@ -990,7 +990,7 @@ export class WASIX {
  * instantiation. Either field is absent when the binary doesn't import
  * the corresponding entity.
  */
-type ParsedEnvImports = {
+export type ParsedEnvImports = {
   memory?: { initial: number; maximum?: number; shared: boolean };
   table?: {
     element: "funcref" | "externref";
@@ -1025,7 +1025,7 @@ type ParsedEnvImports = {
  *     elem-type:byte (0x70=funcref, 0x6f=externref)
  *     limits-flag:byte (bit0=has_max), then min, then max if has_max
  */
-function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
+export function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
   const out: ParsedEnvImports = {};
 
   // Magic 0x00 0x61 0x73 0x6d ('\0asm') and version 1.
@@ -1125,7 +1125,14 @@ function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
       }
     }
 
-    return out;
+    // The WebAssembly spec guarantees at most one import section (id=2)
+    // per module. Once we've finished walking it, there cannot be more
+    // env-import descriptors to discover further into the binary, so
+    // break the section walk rather than wasting cycles. Using `break`
+    // here (over `return out`) keeps the function's exit path single
+    // and the post-loop tail acts as the canonical "no import section
+    // seen" return.
+    break;
   }
 
   return out;
