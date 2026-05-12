@@ -56,7 +56,8 @@
 // sides (main thread and worker thread) share this file to guarantee a
 // single source of truth for layout constants and tag values.
 
-import { Result, WASIXError } from "../wasix-32v1.js";
+import { FileType, Result, WASIXError } from "../wasix-32v1.js";
+import type { DirEntry, Fdstat, Filestat, PreopenInfo } from "../providers.js";
 
 // ─── Layout constants ──────────────────────────────────────────────────────
 
@@ -127,6 +128,28 @@ export enum Opcode {
   RANDOM_FILL = 4,
   TTY_GET = 5,
   TTY_SET = 6,
+
+  // Filesystem opcodes — one per `FileSystemProvider` method. The worker
+  // shim exposes each as a sync method (`FileSystemProvider`), translating
+  // each call into one bridge round trip so the host's
+  // `AsyncFileSystemProvider` can resolve a Promise return on the main
+  // thread before the worker continues.
+  FS_FD_READ = 7,
+  FS_FD_WRITE = 8,
+  FS_FD_SEEK = 9,
+  FS_FD_CLOSE = 10,
+  FS_FD_FDSTAT_GET = 11,
+  FS_FD_FDSTAT_SET_FLAGS = 12,
+  FS_FD_FILESTAT_GET = 13,
+  FS_FD_PRESTAT_GET = 14,
+  FS_FD_PRESTAT_DIR_NAME = 15,
+  FS_FD_READDIR = 16,
+  FS_PATH_OPEN = 17,
+  FS_PATH_FILESTAT_GET = 18,
+  FS_PATH_CREATE_DIRECTORY = 19,
+  FS_PATH_UNLINK_FILE = 20,
+  FS_PATH_REMOVE_DIRECTORY = 21,
+  FS_PATH_RENAME = 22,
 }
 
 // ─── Response tags ─────────────────────────────────────────────────────────
@@ -178,6 +201,120 @@ function readUtf8(src: Uint8Array, offset: number, length: number): string {
   return textDecoder.decode(owned);
 }
 
+/**
+ * Length-prefixed UTF-8 string write: `u32 length | <bytes>`. Returns the
+ * total bytes written (4 + length).
+ */
+function writeLpString(
+  dst: Uint8Array,
+  view: DataView,
+  offset: number,
+  value: string,
+): number {
+  const written = writeUtf8(dst, offset + 4, value);
+  view.setUint32(offset, written, true);
+  return 4 + written;
+}
+
+/**
+ * Length-prefixed UTF-8 string read. Returns `[value, bytesConsumed]`.
+ */
+function readLpString(
+  src: Uint8Array,
+  view: DataView,
+  offset: number,
+): [string, number] {
+  const length = view.getUint32(offset, true);
+  return [readUtf8(src, offset + 4, length), 4 + length];
+}
+
+/** Write a `Uint8Array` blob with a u32 length prefix. */
+function writeLpBytes(
+  dst: Uint8Array,
+  view: DataView,
+  offset: number,
+  value: Uint8Array,
+): number {
+  if (offset + 4 + value.byteLength > dst.byteLength) {
+    throw new Error(
+      `bridge: payload exceeds region (${offset + 4 + value.byteLength} > ${dst.byteLength})`,
+    );
+  }
+  view.setUint32(offset, value.byteLength, true);
+  dst.set(value, offset + 4);
+  return 4 + value.byteLength;
+}
+
+/** Read a length-prefixed blob. Returns `[bytes, bytesConsumed]`. The
+ *  returned `Uint8Array` is a copy so the caller may keep it past the next
+ *  bridge round trip. */
+function readLpBytes(
+  src: Uint8Array,
+  view: DataView,
+  offset: number,
+): [Uint8Array, number] {
+  const length = view.getUint32(offset, true);
+  const bytes = new Uint8Array(length);
+  bytes.set(src.subarray(offset + 4, offset + 4 + length));
+  return [bytes, 4 + length];
+}
+
+/**
+ * Fdstat is a flat 24-byte LE record:
+ *   u8  filetype | 1 byte pad to 2
+ *   u16 fsFlags  | 4 bytes pad to 8
+ *   u64 fsRightsBase
+ *   u64 fsRightsInheriting
+ */
+const FDSTAT_BYTES = 24;
+function writeFdstat(view: DataView, offset: number, stat: Fdstat): number {
+  view.setUint8(offset, stat.filetype);
+  view.setUint16(offset + 2, stat.fsFlags, true);
+  view.setBigUint64(offset + 8, stat.fsRightsBase, true);
+  view.setBigUint64(offset + 16, stat.fsRightsInheriting, true);
+  return FDSTAT_BYTES;
+}
+function readFdstat(view: DataView, offset: number): Fdstat {
+  return {
+    filetype: view.getUint8(offset) as FileType,
+    fsFlags: view.getUint16(offset + 2, true),
+    fsRightsBase: view.getBigUint64(offset + 8, true),
+    fsRightsInheriting: view.getBigUint64(offset + 16, true),
+  };
+}
+
+/**
+ * Filestat is a flat 64-byte LE record:
+ *   u64 dev | u64 ino | u8 filetype | 7 bytes pad | u64 nlink | u64 size
+ *   u64 atim | u64 mtim | u64 ctim
+ */
+const FILESTAT_BYTES = 64;
+function writeFilestat(view: DataView, offset: number, stat: Filestat): number {
+  view.setBigUint64(offset + 0, stat.dev, true);
+  view.setBigUint64(offset + 8, stat.ino, true);
+  view.setUint8(offset + 16, stat.filetype);
+  view.setBigUint64(offset + 24, stat.nlink, true);
+  view.setBigUint64(offset + 32, stat.size, true);
+  view.setBigUint64(offset + 40, stat.timestamps.access, true);
+  view.setBigUint64(offset + 48, stat.timestamps.modification, true);
+  view.setBigUint64(offset + 56, stat.timestamps.change, true);
+  return FILESTAT_BYTES;
+}
+function readFilestat(view: DataView, offset: number): Filestat {
+  return {
+    dev: view.getBigUint64(offset + 0, true),
+    ino: view.getBigUint64(offset + 8, true),
+    filetype: view.getUint8(offset + 16) as FileType,
+    nlink: view.getBigUint64(offset + 24, true),
+    size: view.getBigUint64(offset + 32, true),
+    timestamps: {
+      access: view.getBigUint64(offset + 40, true),
+      modification: view.getBigUint64(offset + 48, true),
+      change: view.getBigUint64(offset + 56, true),
+    },
+  };
+}
+
 // ─── Per-opcode request / response shapes ──────────────────────────────────
 
 export type DebugRequest = { message: string };
@@ -210,13 +347,102 @@ export type TTYGetResponse = { state: TTYStateWire };
 export type TTYSetRequest = { state: TTYStateWire };
 export type TTYSetResponse = { result: Result };
 
+// ─── Filesystem request / response shapes ──────────────────────────────────
+//
+// The bridge encoding is host↔worker only — it doesn't need to match the
+// guest preview1 ABI. Shapes mirror `FileSystemProvider` signatures verbatim,
+// with one wrinkle for the buffer-list reads/writes: guest-side `Uint8Array`
+// buffers don't survive a SAB round trip individually, so the worker shim
+// concatenates writes and splits reads back out from a single payload.
+
+export type FsFdReadRequest = { fd: number; sizes: number[] };
+export type FsFdReadResponse = { bytes: Uint8Array };
+
+export type FsFdWriteRequest = { fd: number; bytes: Uint8Array };
+export type FsFdWriteResponse = { written: number };
+
+export type FsFdSeekRequest = { fd: number; offset: bigint; whence: number };
+export type FsFdSeekResponse = { position: bigint };
+
+export type FsFdCloseRequest = { fd: number };
+export type FsVoidResponse = Record<string, never>;
+
+export type FsFdFdstatGetRequest = { fd: number };
+export type FsFdFdstatGetResponse = { fdstat: Fdstat };
+
+export type FsFdFdstatSetFlagsRequest = { fd: number; flags: number };
+
+export type FsFdFilestatGetRequest = { fd: number };
+export type FsFdFilestatGetResponse = { filestat: Filestat };
+
+export type FsFdPrestatGetRequest = { fd: number };
+export type FsFdPrestatGetResponse = { prestat: PreopenInfo | null };
+
+export type FsFdPrestatDirNameRequest = { fd: number };
+export type FsFdPrestatDirNameResponse = { name: string };
+
+export type FsFdReaddirRequest = { fd: number; cookie: bigint };
+export type FsFdReaddirResponse = { entries: DirEntry[] };
+
+export type FsPathOpenRequest = {
+  fdDir: number;
+  dirflags: number;
+  path: string;
+  oflags: number;
+  rightsBase: bigint;
+  rightsInheriting: bigint;
+  fdflags: number;
+};
+export type FsPathOpenResponse = { fd: number };
+
+export type FsPathFilestatGetRequest = {
+  fdDir: number;
+  dirflags: number;
+  path: string;
+};
+export type FsPathFilestatGetResponse = { filestat: Filestat };
+
+export type FsPathCreateDirectoryRequest = { fdDir: number; path: string };
+export type FsPathUnlinkFileRequest = { fdDir: number; path: string };
+export type FsPathRemoveDirectoryRequest = { fdDir: number; path: string };
+
+export type FsPathRenameRequest = {
+  fdDir: number;
+  oldPath: string;
+  fdNewDir: number;
+  newPath: string;
+};
+
+
 export type BridgeRequest =
   | { opcode: Opcode.DEBUG; args: DebugRequest }
   | { opcode: Opcode.STDIN_READ; args: StdinReadRequest }
   | { opcode: Opcode.CLOCK_NOW; args: ClockNowRequest }
   | { opcode: Opcode.RANDOM_FILL; args: RandomFillRequest }
   | { opcode: Opcode.TTY_GET; args: TTYGetRequest }
-  | { opcode: Opcode.TTY_SET; args: TTYSetRequest };
+  | { opcode: Opcode.TTY_SET; args: TTYSetRequest }
+  | { opcode: Opcode.FS_FD_READ; args: FsFdReadRequest }
+  | { opcode: Opcode.FS_FD_WRITE; args: FsFdWriteRequest }
+  | { opcode: Opcode.FS_FD_SEEK; args: FsFdSeekRequest }
+  | { opcode: Opcode.FS_FD_CLOSE; args: FsFdCloseRequest }
+  | { opcode: Opcode.FS_FD_FDSTAT_GET; args: FsFdFdstatGetRequest }
+  | { opcode: Opcode.FS_FD_FDSTAT_SET_FLAGS; args: FsFdFdstatSetFlagsRequest }
+  | { opcode: Opcode.FS_FD_FILESTAT_GET; args: FsFdFilestatGetRequest }
+  | { opcode: Opcode.FS_FD_PRESTAT_GET; args: FsFdPrestatGetRequest }
+  | { opcode: Opcode.FS_FD_PRESTAT_DIR_NAME; args: FsFdPrestatDirNameRequest }
+  | { opcode: Opcode.FS_FD_READDIR; args: FsFdReaddirRequest }
+  | { opcode: Opcode.FS_PATH_OPEN; args: FsPathOpenRequest }
+  | { opcode: Opcode.FS_PATH_FILESTAT_GET; args: FsPathFilestatGetRequest }
+  | {
+      opcode: Opcode.FS_PATH_CREATE_DIRECTORY;
+      args: FsPathCreateDirectoryRequest;
+    }
+  | { opcode: Opcode.FS_PATH_UNLINK_FILE; args: FsPathUnlinkFileRequest }
+  | {
+      opcode: Opcode.FS_PATH_REMOVE_DIRECTORY;
+      args: FsPathRemoveDirectoryRequest;
+    }
+  | { opcode: Opcode.FS_PATH_RENAME; args: FsPathRenameRequest };
 
 export type BridgeResponse =
   | { opcode: Opcode.DEBUG; result: DebugResponse }
@@ -224,7 +450,26 @@ export type BridgeResponse =
   | { opcode: Opcode.CLOCK_NOW; result: ClockNowResponse }
   | { opcode: Opcode.RANDOM_FILL; result: RandomFillResponse }
   | { opcode: Opcode.TTY_GET; result: TTYGetResponse }
-  | { opcode: Opcode.TTY_SET; result: TTYSetResponse };
+  | { opcode: Opcode.TTY_SET; result: TTYSetResponse }
+  | { opcode: Opcode.FS_FD_READ; result: FsFdReadResponse }
+  | { opcode: Opcode.FS_FD_WRITE; result: FsFdWriteResponse }
+  | { opcode: Opcode.FS_FD_SEEK; result: FsFdSeekResponse }
+  | { opcode: Opcode.FS_FD_CLOSE; result: FsVoidResponse }
+  | { opcode: Opcode.FS_FD_FDSTAT_GET; result: FsFdFdstatGetResponse }
+  | { opcode: Opcode.FS_FD_FDSTAT_SET_FLAGS; result: FsVoidResponse }
+  | { opcode: Opcode.FS_FD_FILESTAT_GET; result: FsFdFilestatGetResponse }
+  | { opcode: Opcode.FS_FD_PRESTAT_GET; result: FsFdPrestatGetResponse }
+  | {
+      opcode: Opcode.FS_FD_PRESTAT_DIR_NAME;
+      result: FsFdPrestatDirNameResponse;
+    }
+  | { opcode: Opcode.FS_FD_READDIR; result: FsFdReaddirResponse }
+  | { opcode: Opcode.FS_PATH_OPEN; result: FsPathOpenResponse }
+  | { opcode: Opcode.FS_PATH_FILESTAT_GET; result: FsPathFilestatGetResponse }
+  | { opcode: Opcode.FS_PATH_CREATE_DIRECTORY; result: FsVoidResponse }
+  | { opcode: Opcode.FS_PATH_UNLINK_FILE; result: FsVoidResponse }
+  | { opcode: Opcode.FS_PATH_REMOVE_DIRECTORY; result: FsVoidResponse }
+  | { opcode: Opcode.FS_PATH_RENAME; result: FsVoidResponse };
 
 // ─── Region accessors ──────────────────────────────────────────────────────
 
@@ -363,6 +608,81 @@ export function encodeRequest(
     case Opcode.TTY_SET: {
       return 1 + encodeTTYState(view, region, 1, request.args.state);
     }
+    case Opcode.FS_FD_READ: {
+      const { fd, sizes } = request.args;
+      view.setUint32(1, fd, true);
+      view.setUint32(5, sizes.length, true);
+      let cursor = 9;
+      for (const size of sizes) {
+        view.setUint32(cursor, size, true);
+        cursor += 4;
+      }
+      return cursor;
+    }
+    case Opcode.FS_FD_WRITE: {
+      view.setUint32(1, request.args.fd, true);
+      const consumed = writeLpBytes(region, view, 5, request.args.bytes);
+      return 5 + consumed;
+    }
+    case Opcode.FS_FD_SEEK: {
+      view.setUint32(1, request.args.fd, true);
+      view.setBigInt64(5, request.args.offset, true);
+      view.setUint32(13, request.args.whence, true);
+      return 17;
+    }
+    case Opcode.FS_FD_CLOSE:
+    case Opcode.FS_FD_FDSTAT_GET:
+    case Opcode.FS_FD_FILESTAT_GET:
+    case Opcode.FS_FD_PRESTAT_GET:
+    case Opcode.FS_FD_PRESTAT_DIR_NAME: {
+      view.setUint32(1, request.args.fd, true);
+      return 5;
+    }
+    case Opcode.FS_FD_FDSTAT_SET_FLAGS: {
+      view.setUint32(1, request.args.fd, true);
+      view.setUint32(5, request.args.flags, true);
+      return 9;
+    }
+    case Opcode.FS_FD_READDIR: {
+      view.setUint32(1, request.args.fd, true);
+      view.setBigUint64(5, request.args.cookie, true);
+      return 13;
+    }
+    case Opcode.FS_PATH_OPEN: {
+      view.setUint32(1, request.args.fdDir, true);
+      view.setUint32(5, request.args.dirflags, true);
+      view.setUint32(9, request.args.oflags, true);
+      view.setBigUint64(13, request.args.rightsBase, true);
+      view.setBigUint64(21, request.args.rightsInheriting, true);
+      view.setUint32(29, request.args.fdflags, true);
+      const consumed = writeLpString(region, view, 33, request.args.path);
+      return 33 + consumed;
+    }
+    case Opcode.FS_PATH_FILESTAT_GET: {
+      view.setUint32(1, request.args.fdDir, true);
+      view.setUint32(5, request.args.dirflags, true);
+      const consumed = writeLpString(region, view, 9, request.args.path);
+      return 9 + consumed;
+    }
+    case Opcode.FS_PATH_CREATE_DIRECTORY:
+    case Opcode.FS_PATH_UNLINK_FILE:
+    case Opcode.FS_PATH_REMOVE_DIRECTORY: {
+      view.setUint32(1, request.args.fdDir, true);
+      const consumed = writeLpString(region, view, 5, request.args.path);
+      return 5 + consumed;
+    }
+    case Opcode.FS_PATH_RENAME: {
+      view.setUint32(1, request.args.fdDir, true);
+      view.setUint32(5, request.args.fdNewDir, true);
+      const oldConsumed = writeLpString(region, view, 9, request.args.oldPath);
+      const newConsumed = writeLpString(
+        region,
+        view,
+        9 + oldConsumed,
+        request.args.newPath,
+      );
+      return 9 + oldConsumed + newConsumed;
+    }
   }
 }
 
@@ -407,6 +727,85 @@ export function decodeRequest(
     case Opcode.TTY_SET: {
       const state = decodeTTYState(view, region, 1);
       return { opcode, args: { state } };
+    }
+    case Opcode.FS_FD_READ: {
+      const fd = view.getUint32(1, true);
+      const count = view.getUint32(5, true);
+      const sizes: number[] = [];
+      for (let i = 0; i < count; i++) {
+        sizes.push(view.getUint32(9 + i * 4, true));
+      }
+      return { opcode, args: { fd, sizes } };
+    }
+    case Opcode.FS_FD_WRITE: {
+      const fd = view.getUint32(1, true);
+      const [bytes] = readLpBytes(region, view, 5);
+      return { opcode, args: { fd, bytes } };
+    }
+    case Opcode.FS_FD_SEEK: {
+      const fd = view.getUint32(1, true);
+      const offset = view.getBigInt64(5, true);
+      const whence = view.getUint32(13, true);
+      return { opcode, args: { fd, offset, whence } };
+    }
+    case Opcode.FS_FD_CLOSE:
+    case Opcode.FS_FD_FDSTAT_GET:
+    case Opcode.FS_FD_FILESTAT_GET:
+    case Opcode.FS_FD_PRESTAT_GET:
+    case Opcode.FS_FD_PRESTAT_DIR_NAME: {
+      const fd = view.getUint32(1, true);
+      return { opcode, args: { fd } };
+    }
+    case Opcode.FS_FD_FDSTAT_SET_FLAGS: {
+      const fd = view.getUint32(1, true);
+      const flags = view.getUint32(5, true);
+      return { opcode, args: { fd, flags } };
+    }
+    case Opcode.FS_FD_READDIR: {
+      const fd = view.getUint32(1, true);
+      const cookie = view.getBigUint64(5, true);
+      return { opcode, args: { fd, cookie } };
+    }
+    case Opcode.FS_PATH_OPEN: {
+      const fdDir = view.getUint32(1, true);
+      const dirflags = view.getUint32(5, true);
+      const oflags = view.getUint32(9, true);
+      const rightsBase = view.getBigUint64(13, true);
+      const rightsInheriting = view.getBigUint64(21, true);
+      const fdflags = view.getUint32(29, true);
+      const [path] = readLpString(region, view, 33);
+      return {
+        opcode,
+        args: {
+          fdDir,
+          dirflags,
+          path,
+          oflags,
+          rightsBase,
+          rightsInheriting,
+          fdflags,
+        },
+      };
+    }
+    case Opcode.FS_PATH_FILESTAT_GET: {
+      const fdDir = view.getUint32(1, true);
+      const dirflags = view.getUint32(5, true);
+      const [path] = readLpString(region, view, 9);
+      return { opcode, args: { fdDir, dirflags, path } };
+    }
+    case Opcode.FS_PATH_CREATE_DIRECTORY:
+    case Opcode.FS_PATH_UNLINK_FILE:
+    case Opcode.FS_PATH_REMOVE_DIRECTORY: {
+      const fdDir = view.getUint32(1, true);
+      const [path] = readLpString(region, view, 5);
+      return { opcode, args: { fdDir, path } };
+    }
+    case Opcode.FS_PATH_RENAME: {
+      const fdDir = view.getUint32(1, true);
+      const fdNewDir = view.getUint32(5, true);
+      const [oldPath, oldConsumed] = readLpString(region, view, 9);
+      const [newPath] = readLpString(region, view, 9 + oldConsumed);
+      return { opcode, args: { fdDir, oldPath, fdNewDir, newPath } };
     }
     default: {
       const neverCheck: never = opcode;
@@ -471,6 +870,69 @@ export function encodeResponse(
     }
     case Opcode.TTY_SET: {
       view.setUint32(1, response.result.result, true);
+      return 5;
+    }
+    case Opcode.FS_FD_READ: {
+      const consumed = writeLpBytes(region, view, 1, response.result.bytes);
+      return 1 + consumed;
+    }
+    case Opcode.FS_FD_WRITE: {
+      view.setUint32(1, response.result.written, true);
+      return 5;
+    }
+    case Opcode.FS_FD_SEEK: {
+      view.setBigInt64(1, response.result.position, true);
+      return 9;
+    }
+    case Opcode.FS_FD_CLOSE:
+    case Opcode.FS_FD_FDSTAT_SET_FLAGS:
+    case Opcode.FS_PATH_CREATE_DIRECTORY:
+    case Opcode.FS_PATH_UNLINK_FILE:
+    case Opcode.FS_PATH_REMOVE_DIRECTORY:
+    case Opcode.FS_PATH_RENAME: {
+      return 1;
+    }
+    case Opcode.FS_FD_FDSTAT_GET: {
+      writeFdstat(view, 1, response.result.fdstat);
+      return 1 + FDSTAT_BYTES;
+    }
+    case Opcode.FS_FD_FILESTAT_GET:
+    case Opcode.FS_PATH_FILESTAT_GET: {
+      writeFilestat(view, 1, response.result.filestat);
+      return 1 + FILESTAT_BYTES;
+    }
+    case Opcode.FS_FD_PRESTAT_GET: {
+      if (response.result.prestat === null) {
+        region[1] = 0;
+        return 2;
+      }
+      region[1] = 1;
+      const consumed = writeLpString(
+        region,
+        view,
+        2,
+        response.result.prestat.name,
+      );
+      return 2 + consumed;
+    }
+    case Opcode.FS_FD_PRESTAT_DIR_NAME: {
+      const consumed = writeLpString(region, view, 1, response.result.name);
+      return 1 + consumed;
+    }
+    case Opcode.FS_FD_READDIR: {
+      view.setUint32(1, response.result.entries.length, true);
+      let cursor = 5;
+      for (const entry of response.result.entries) {
+        view.setBigUint64(cursor, entry.next, true);
+        view.setBigUint64(cursor + 8, entry.ino, true);
+        view.setUint8(cursor + 16, entry.filetype);
+        cursor += 17;
+        cursor += writeLpString(region, view, cursor, entry.name);
+      }
+      return cursor;
+    }
+    case Opcode.FS_PATH_OPEN: {
+      view.setUint32(1, response.result.fd, true);
       return 5;
     }
   }
@@ -590,6 +1052,66 @@ export function decodeResponse(
     case Opcode.TTY_SET: {
       const result = view.getUint32(1, true) as Result;
       return { opcode, result: { result } };
+    }
+    case Opcode.FS_FD_READ: {
+      const [bytes] = readLpBytes(region, view, 1);
+      return { opcode, result: { bytes } };
+    }
+    case Opcode.FS_FD_WRITE: {
+      const written = view.getUint32(1, true);
+      return { opcode, result: { written } };
+    }
+    case Opcode.FS_FD_SEEK: {
+      const position = view.getBigInt64(1, true);
+      return { opcode, result: { position } };
+    }
+    case Opcode.FS_FD_CLOSE:
+    case Opcode.FS_FD_FDSTAT_SET_FLAGS:
+    case Opcode.FS_PATH_CREATE_DIRECTORY:
+    case Opcode.FS_PATH_UNLINK_FILE:
+    case Opcode.FS_PATH_REMOVE_DIRECTORY:
+    case Opcode.FS_PATH_RENAME: {
+      return { opcode, result: {} };
+    }
+    case Opcode.FS_FD_FDSTAT_GET: {
+      const fdstat = readFdstat(view, 1);
+      return { opcode, result: { fdstat } };
+    }
+    case Opcode.FS_FD_FILESTAT_GET:
+    case Opcode.FS_PATH_FILESTAT_GET: {
+      const filestat = readFilestat(view, 1);
+      return { opcode, result: { filestat } };
+    }
+    case Opcode.FS_FD_PRESTAT_GET: {
+      const hasPrestat = region[1];
+      if (hasPrestat === 0) {
+        return { opcode, result: { prestat: null } };
+      }
+      const [name] = readLpString(region, view, 2);
+      return { opcode, result: { prestat: { name } } };
+    }
+    case Opcode.FS_FD_PRESTAT_DIR_NAME: {
+      const [name] = readLpString(region, view, 1);
+      return { opcode, result: { name } };
+    }
+    case Opcode.FS_FD_READDIR: {
+      const count = view.getUint32(1, true);
+      const entries: DirEntry[] = [];
+      let cursor = 5;
+      for (let i = 0; i < count; i++) {
+        const next = view.getBigUint64(cursor, true);
+        const ino = view.getBigUint64(cursor + 8, true);
+        const filetype = view.getUint8(cursor + 16) as FileType;
+        cursor += 17;
+        const [name, consumed] = readLpString(region, view, cursor);
+        cursor += consumed;
+        entries.push({ next, ino, filetype, name });
+      }
+      return { opcode, result: { entries } };
+    }
+    case Opcode.FS_PATH_OPEN: {
+      const fd = view.getUint32(1, true);
+      return { opcode, result: { fd } };
     }
     default: {
       const neverCheck: never = opcode;

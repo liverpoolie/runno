@@ -7,6 +7,7 @@
 
 import {
   ClockProvider,
+  FileSystemProvider,
   FutexProvider,
   ProcProvider,
   RandomProvider,
@@ -23,6 +24,7 @@ export type AsyncCapable<T> = {
 };
 
 export type AsyncClockProvider = AsyncCapable<ClockProvider>;
+export type AsyncFileSystemProvider = AsyncCapable<FileSystemProvider>;
 export type AsyncRandomProvider = AsyncCapable<RandomProvider>;
 export type AsyncTTYProvider = AsyncCapable<TTYProvider>;
 export type AsyncThreadsProvider = AsyncCapable<ThreadsProvider>;

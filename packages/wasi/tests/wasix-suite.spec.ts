@@ -407,6 +407,61 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               return { exitCode: wasiResult.exitCode, stdout, stderr };
             }
 
+            if (input.mode === "worker-fs-async") {
+              // Same `fs` data, but wrapped in an async proxy that runs on
+              // the main thread. Every FS call routes through the bridge.
+              const sync = new w.WASIDriveFileSystemProvider(fs, {
+                preopens,
+              });
+              const asyncFs = {} as Record<
+                string,
+                (...args: unknown[]) => unknown
+              >;
+              const syncRecord = sync as unknown as Record<
+                string,
+                (...args: unknown[]) => unknown
+              >;
+              for (const key of [
+                "fdRead",
+                "fdWrite",
+                "fdSeek",
+                "fdClose",
+                "fdFdstatGet",
+                "fdFdstatSetFlags",
+                "fdFilestatGet",
+                "fdPrestatGet",
+                "fdPrestatDirName",
+                "fdReaddir",
+                "pathOpen",
+                "pathFilestatGet",
+                "pathCreateDirectory",
+                "pathUnlinkFile",
+                "pathRemoveDirectory",
+                "pathRename",
+              ]) {
+                asyncFs[key] = async (...args: unknown[]) => {
+                  await Promise.resolve();
+                  return syncRecord[key].call(sync, ...args);
+                };
+              }
+              // Cast — the proxy implements every method by hand, and the
+              // host accepts an AsyncFileSystemProvider on this slot.
+              const asyncHost = new w.WASIXWorkerHost(fetch(p.wasmUrl), {
+                args: p.args,
+                env: { PWD: "/home" },
+                fs: asyncFs as unknown as WASIFS,
+                stdout: (out: string) => {
+                  stdout += out;
+                },
+                stderr: (err: string) => {
+                  stderr += err;
+                },
+                stdin: () => null,
+              });
+              const asyncResult = await asyncHost.start();
+              return { exitCode: asyncResult.exitCode, stdout, stderr };
+            }
+
             // worker mode — WASIXWorkerHost spawns a dedicated worker and
             // drives it through the bridge. fs and preopens cross postMessage
             // as plain data; the worker reconstructs the
