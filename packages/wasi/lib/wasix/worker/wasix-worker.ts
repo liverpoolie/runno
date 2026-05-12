@@ -33,7 +33,7 @@ import type {
   TTYProvider,
   TTYState,
 } from "../providers.js";
-import { ClockId, Result } from "../wasix-32v1.js";
+import { ClockId, Result, WASIXError } from "../wasix-32v1.js";
 import {
   Opcode,
   callBridgeSync,
