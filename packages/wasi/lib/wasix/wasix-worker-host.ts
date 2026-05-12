@@ -119,7 +119,15 @@ export type WASIXWorkerHostOptions = {
   proc?: ProcProvider | AsyncProcProvider;
 };
 
-export class WASIXWorkerHostKilledError extends Error {}
+export class WASIXWorkerHostKilledError extends Error {
+  constructor(message?: string) {
+    super(message);
+    // Name defaults to "Error" without this — `instanceof` works in-realm
+    // but cross-realm (e.g. worker → main) or structured-clone callers
+    // need a stable `name` to identify the class.
+    this.name = "WASIXWorkerHostKilledError";
+  }
+}
 
 /**
  * Single-use host. Construct one per guest invocation; `.start()` is a
@@ -410,9 +418,18 @@ export class WASIXWorkerHost {
           this.options.stdin(request.args.maxByteLength),
           signal,
         );
+        // Defensive clamp: a host whose stdin callback ignores
+        // maxByteLength and returns a 100 KiB string would otherwise blow
+        // encodeResponse's region check. The dispatcher's catch arm would
+        // ship a GENERIC_ERROR back, but the worker-side inner-WASI
+        // fd_read doesn't catch stdin throws, so the worker crashes.
+        // Clamping here keeps WASI semantics (a short-read is allowed —
+        // the guest will call fd_read again) and matches the worker
+        // shim's maxByteLength promise.
+        const clamped = clampStdinText(text, request.args.maxByteLength);
         writeBridgeResponse(sharedBuffer, {
           opcode: Opcode.STDIN_READ,
-          result: { text },
+          result: { text: clamped },
         });
         return;
       }
@@ -582,6 +599,31 @@ function assertAsyncSlotsSupported(options: WASIXWorkerHostOptions): void {
  * settled. The original promise is left to settle on its own (we cannot
  * cancel an arbitrary host callback).
  */
+/**
+ * Clamp a host stdin response to the worker's requested maxByteLength.
+ *
+ * The contract: stdin's `maxByteLength` is an upper bound, not a target —
+ * hosts are encouraged to return less. WASI short-reads are a normal
+ * fd_read outcome (the guest re-issues). The clamp protects the bridge
+ * from a host that ignores the limit and returns megabytes — without it,
+ * encodeResponse trips its region-overflow check and the dispatcher
+ * compensates with a GENERIC_ERROR that the worker-side inner-WASI
+ * fd_read doesn't catch (it propagates as a worker crash).
+ *
+ * Clamps in UTF-8 code-unit space (JS string `length`), not byte space —
+ * the inner-WASI fd_read re-encodes to UTF-8 and chops to iov.byteLength
+ * itself, so being conservative with code units is sufficient and avoids
+ * splitting a multi-byte sequence here.
+ */
+function clampStdinText(
+  text: string | null,
+  maxByteLength: number,
+): string | null {
+  if (text === null) return null;
+  if (text.length <= maxByteLength) return text;
+  return text.slice(0, maxByteLength);
+}
+
 function raceSignal<T>(value: T | Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     if (signal.aborted) {

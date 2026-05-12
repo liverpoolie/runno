@@ -11,7 +11,9 @@ import {
   SeededRandomProvider,
   WASIDriveFileSystemProvider,
   HTTPProvider,
+  WASIX32v1,
 } from "../lib/main.js";
+import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
 
 (window as any)["WASI"] = WASI;
 (window as any)["WASIContext"] = WASIContext;
@@ -24,6 +26,13 @@ import {
 (window as any)["SeededRandomProvider"] = SeededRandomProvider;
 (window as any)["WASIDriveFileSystemProvider"] = WASIDriveFileSystemProvider;
 (window as any)["HTTPProvider"] = HTTPProvider;
+
+// Test-only: expose the bridge protocol primitives and `Result` / `WASIXError`
+// for the targeted bridge spec. `src/main.ts` is dev-server-only (not part of
+// the published package, only `lib/main.ts` is), so attaching internals here
+// pollutes nothing user-visible.
+(window as any)["__BRIDGE_TEST_API__"] = BridgeTestApi;
+(window as any)["__WASIX32v1__"] = WASIX32v1;
 
 const programSelect = document.getElementById("program")! as HTMLSelectElement;
 const argsInput = document.getElementById("args")! as HTMLInputElement;

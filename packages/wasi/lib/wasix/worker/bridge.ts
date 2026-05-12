@@ -168,7 +168,14 @@ function writeUtf8(dst: Uint8Array, offset: number, value: string): number {
 }
 
 function readUtf8(src: Uint8Array, offset: number, length: number): string {
-  return textDecoder.decode(src.subarray(offset, offset + length));
+  // Chromium throws "The provided ArrayBufferView value must not be shared"
+  // when `TextDecoder.decode` is handed a Uint8Array view of a
+  // SharedArrayBuffer. Both sides of the bridge run on SAB-backed regions,
+  // so copy into an owned ArrayBuffer first. Cheap — the bridge regions
+  // hand-process payloads in the dozens-to-low-thousands of bytes.
+  const owned = new Uint8Array(length);
+  owned.set(src.subarray(offset, offset + length));
+  return textDecoder.decode(owned);
 }
 
 // ─── Per-opcode request / response shapes ──────────────────────────────────

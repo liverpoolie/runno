@@ -1125,7 +1125,14 @@ export function parseEnvImportDescriptors(bytes: Uint8Array): ParsedEnvImports {
       }
     }
 
-    return out;
+    // The WebAssembly spec guarantees at most one import section (id=2)
+    // per module. Once we've finished walking it, there cannot be more
+    // env-import descriptors to discover further into the binary, so
+    // break the section walk rather than wasting cycles. Using `break`
+    // here (over `return out`) keeps the function's exit path single
+    // and the post-loop tail acts as the canonical "no import section
+    // seen" return.
+    break;
   }
 
   return out;
