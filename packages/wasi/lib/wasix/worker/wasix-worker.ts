@@ -24,16 +24,17 @@ import {
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
 import type {
   ClockProvider,
-  FutexProvider,
-  ProcProvider,
   RandomProvider,
-  SignalsProvider,
-  SocketsProvider,
-  ThreadsProvider,
   TTYProvider,
+  TTYState,
 } from "../providers.js";
-import { ClockId, Result, WASIXError } from "../wasix-32v1.js";
-import { Opcode, callBridgeSync, type BridgeResponse } from "./bridge.js";
+import { ClockId, Result } from "../wasix-32v1.js";
+import {
+  Opcode,
+  callBridgeSync,
+  type BridgeResponse,
+  type TTYStateWire,
+} from "./bridge.js";
 
 // ─── Messages ──────────────────────────────────────────────────────────────
 
@@ -46,6 +47,11 @@ import { Opcode, callBridgeSync, type BridgeResponse } from "./bridge.js";
  * (currently, only `contextConfig.stdin`-stream intent flag). In practice
  * this slice wires the bridge for anything async on the host side, and
  * leaves sync-only slots to later refactors.
+ *
+ * The host rejects at startup any slot listed here whose opcode set hasn't
+ * landed yet (see `assertAsyncSlotsSupported` in `wasix-worker-host.ts`),
+ * so by the time the worker reads `asyncSlots` every entry maps to a
+ * bridge-backed shim below.
  */
 export type AsyncBridgedSlot =
   | "clock"
@@ -119,16 +125,39 @@ export type WASIXWorkerHostMessage =
 
 // ─── Provider shims ────────────────────────────────────────────────────────
 
+/**
+ * Assert the bridge response's opcode matches what the shim requested. The
+ * encoded request and the encoded response carry the opcode independently;
+ * a protocol-drift bug on either side would otherwise be silently
+ * misinterpreted (we'd decode a CLOCK_NOW response into a STDIN_READ shape
+ * because the type system erased the union narrowing). This runtime check
+ * surfaces it as a clear error.
+ */
+function expectOpcode<O extends Opcode>(
+  response: BridgeResponse,
+  opcode: O,
+): Extract<BridgeResponse, { opcode: O }> {
+  if (response.opcode !== opcode) {
+    throw new Error(
+      `bridge: mismatched response opcode (got ${response.opcode}, expected ${opcode})`,
+    );
+  }
+  return response as Extract<BridgeResponse, { opcode: O }>;
+}
+
 function bridgeClockProvider(
   sharedBuffer: SharedArrayBuffer,
   cachedResolutions: Partial<Record<ClockId, bigint>>,
 ): ClockProvider {
   return {
     now(id: ClockId): bigint {
-      const response = callBridgeSync(sharedBuffer, {
-        opcode: Opcode.CLOCK_NOW,
-        args: { clockId: id },
-      }) as Extract<BridgeResponse, { opcode: Opcode.CLOCK_NOW }>;
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.CLOCK_NOW,
+          args: { clockId: id },
+        }),
+        Opcode.CLOCK_NOW,
+      );
       return response.result.timeNs;
     },
     resolution(id: ClockId): bigint {
@@ -144,6 +173,81 @@ function bridgeClockProvider(
   };
 }
 
+function bridgeRandomProvider(sharedBuffer: SharedArrayBuffer): RandomProvider {
+  return {
+    fill(buf: Uint8Array): void {
+      // The bridge response region caps a single fill at < region byte size.
+      // We chunk so a guest-side fill of >region bytes still works — the
+      // shim issues multiple round trips and stitches them together.
+      let offset = 0;
+      while (offset < buf.byteLength) {
+        // Conservative chunk size: 16 KiB. Smaller than the 64 KiB region,
+        // leaves headroom for tag + length header, and avoids pathologically
+        // large host allocations for a runaway guest.
+        const chunk = Math.min(buf.byteLength - offset, 16 * 1024);
+        const response = expectOpcode(
+          callBridgeSync(sharedBuffer, {
+            opcode: Opcode.RANDOM_FILL,
+            args: { byteLength: chunk },
+          }),
+          Opcode.RANDOM_FILL,
+        );
+        buf.set(response.result.bytes, offset);
+        offset += chunk;
+      }
+    },
+  };
+}
+
+function bridgeTTYProvider(sharedBuffer: SharedArrayBuffer): TTYProvider {
+  return {
+    get(): TTYState {
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.TTY_GET,
+          args: {},
+        }),
+        Opcode.TTY_GET,
+      );
+      return wireToTTYState(response.result.state);
+    },
+    set(state: TTYState): Result {
+      const response = expectOpcode(
+        callBridgeSync(sharedBuffer, {
+          opcode: Opcode.TTY_SET,
+          args: { state: ttyStateToWire(state) },
+        }),
+        Opcode.TTY_SET,
+      );
+      return response.result.result;
+    },
+  };
+}
+
+function ttyStateToWire(state: TTYState): TTYStateWire {
+  return {
+    cols: state.cols,
+    rows: state.rows,
+    pixelWidth: state.pixelWidth,
+    pixelHeight: state.pixelHeight,
+    echo: state.echo,
+    lineBuffered: state.lineBuffered,
+    raw: state.raw,
+  };
+}
+
+function wireToTTYState(wire: TTYStateWire): TTYState {
+  return {
+    cols: wire.cols,
+    rows: wire.rows,
+    pixelWidth: wire.pixelWidth,
+    pixelHeight: wire.pixelHeight,
+    echo: wire.echo,
+    lineBuffered: wire.lineBuffered,
+    raw: wire.raw,
+  };
+}
+
 /**
  * Build a sync stdin callback out of the STDIN_READ opcode. The inner WASI
  * (inside the inner WASIX) calls stdin on every read — each call is one
@@ -153,10 +257,13 @@ function bridgeStdin(
   sharedBuffer: SharedArrayBuffer,
 ): (maxByteLength: number) => string | null {
   return (maxByteLength: number): string | null => {
-    const response = callBridgeSync(sharedBuffer, {
-      opcode: Opcode.STDIN_READ,
-      args: { maxByteLength },
-    }) as Extract<BridgeResponse, { opcode: Opcode.STDIN_READ }>;
+    const response = expectOpcode(
+      callBridgeSync(sharedBuffer, {
+        opcode: Opcode.STDIN_READ,
+        args: { maxByteLength },
+      }),
+      Opcode.STDIN_READ,
+    );
     return response.result.text;
   };
 }
@@ -199,37 +306,20 @@ async function runGuest(
   // install the bridge-backed sync shim. Non-async slots remain undefined —
   // the inner WASIX will lazy-init defaults (e.g. SystemClockProvider) as
   // today.
+  //
+  // Slots without bridge opcodes (threads / futex / signals / sockets /
+  // proc) cannot appear here — the host's `assertAsyncSlotsSupported`
+  // rejects them at startup with ENOSYS, so they never reach the worker.
   const asyncSet = new Set<AsyncBridgedSlot>(msg.asyncSlots);
 
   const clock: ClockProvider | undefined = asyncSet.has("clock")
     ? bridgeClockProvider(msg.sharedBuffer, msg.clockResolutions ?? {})
     : undefined;
-
-  // Remaining slots — no opcodes defined this slice. If the host declared
-  // any of these as async-capable, we surface ENOSYS-equivalent provider
-  // shims that throw WASIXError(ENOSYS) so the guest sees the correct errno
-  // instead of the bridge panicking on an unknown opcode. Later slices add
-  // real opcodes and remove these stubs.
   const random: RandomProvider | undefined = asyncSet.has("random")
-    ? stubRandomProvider()
+    ? bridgeRandomProvider(msg.sharedBuffer)
     : undefined;
   const tty: TTYProvider | undefined = asyncSet.has("tty")
-    ? stubTTYProvider()
-    : undefined;
-  const threads: ThreadsProvider | undefined = asyncSet.has("threads")
-    ? stubThreadsProvider()
-    : undefined;
-  const futex: FutexProvider | undefined = asyncSet.has("futex")
-    ? stubFutexProvider()
-    : undefined;
-  const signals: SignalsProvider | undefined = asyncSet.has("signals")
-    ? stubSignalsProvider()
-    : undefined;
-  const sockets: SocketsProvider | undefined = asyncSet.has("sockets")
-    ? stubSocketsProvider()
-    : undefined;
-  const proc: ProcProvider | undefined = asyncSet.has("proc")
-    ? stubProcProvider()
+    ? bridgeTTYProvider(msg.sharedBuffer)
     : undefined;
 
   // Reconstruct the WASIXContext. `stdin` — if the host configured one — is
@@ -270,11 +360,6 @@ async function runGuest(
     clock,
     random,
     tty,
-    threads,
-    futex,
-    signals,
-    sockets,
-    proc,
   });
 
   const wasix = new WASIX(context);
@@ -301,62 +386,4 @@ async function runGuest(
 
 function sendMessage(message: WASIXWorkerHostMessage): void {
   self.postMessage(message);
-}
-
-// ─── ENOSYS stubs for async slots with no opcode this slice ────────────────
-
-function throwEnosys(): never {
-  // ENOSYS — no bridge opcode wired yet for this slot. The guest sees the
-  // appropriate errno via wasix.ts's WASIXError → Result path.
-  throw new WASIXError(Result.ENOSYS);
-}
-
-function stubRandomProvider(): RandomProvider {
-  return { fill: () => throwEnosys() };
-}
-function stubTTYProvider(): TTYProvider {
-  return { get: () => throwEnosys(), set: () => throwEnosys() };
-}
-function stubThreadsProvider(): ThreadsProvider {
-  return {
-    spawn: () => throwEnosys(),
-    join: () => throwEnosys(),
-    exit: () => throwEnosys(),
-    sleep: () => throwEnosys(),
-    id: () => throwEnosys(),
-    parallelism: () => throwEnosys(),
-    signal: () => throwEnosys(),
-  };
-}
-function stubFutexProvider(): FutexProvider {
-  return { wait: () => throwEnosys(), wake: () => throwEnosys() };
-}
-function stubSignalsProvider(): SignalsProvider {
-  return {
-    register: () => throwEnosys(),
-    raiseInterval: () => throwEnosys(),
-  };
-}
-function stubSocketsProvider(): SocketsProvider {
-  return {
-    open: () => throwEnosys(),
-    bind: () => throwEnosys(),
-    connect: () => throwEnosys(),
-    listen: () => throwEnosys(),
-    accept: () => throwEnosys(),
-    send: () => throwEnosys(),
-    recv: () => throwEnosys(),
-    shutdown: () => throwEnosys(),
-    addrResolve: () => throwEnosys(),
-  };
-}
-function stubProcProvider(): ProcProvider {
-  return {
-    id: () => throwEnosys(),
-    parentId: () => throwEnosys(),
-    fork: () => throwEnosys(),
-    spawn: () => throwEnosys(),
-    exec: () => throwEnosys(),
-    join: () => throwEnosys(),
-  };
 }

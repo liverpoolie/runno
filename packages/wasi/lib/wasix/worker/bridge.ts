@@ -76,9 +76,21 @@ export const STATE_IDLE = 0;
 export const STATE_REQUEST_PENDING = 1;
 export const STATE_RESPONSE_READY = 2;
 
+/**
+ * Smallest viable per-region byte length. CLOCK_NOW's response is 9 bytes
+ * (tag + u64), TTY_GET's response is 20 bytes (tag + 4×u32 + 3×u8), and
+ * RANDOM_FILL is variable up to the region cap. 32 bytes leaves a defensible
+ * floor for every opcode landed this slice and gives room for an error tag
+ * payload (tag + u32 length + ~20 bytes of message) on the smallest legal
+ * configuration. Hosts allocating their own buffer below this floor get a
+ * construction-time error rather than a wedged worker on first dispatch.
+ */
+export const MIN_REGION_BYTES = 32;
+
 /** Default region sizes — 64 KiB each is plenty for every opcode landed
- *  this slice (debug strings + stdin chunks). Later slices that need bigger
- *  payloads can bump this without a protocol break. */
+ *  this slice (debug strings + stdin chunks + a single random-fill chunk).
+ *  Later slices that need bigger payloads can bump this without a protocol
+ *  break. */
 export const DEFAULT_REQUEST_REGION_BYTES = 64 * 1024;
 export const DEFAULT_RESPONSE_REGION_BYTES = 64 * 1024;
 
@@ -91,9 +103,8 @@ export const DEFAULT_BRIDGE_BUFFER_BYTES =
 /**
  * Opcodes enumerated here are the minimal set needed to exercise the bridge
  * this slice. Adding an opcode is cheap — append a new enum member, bump the
- * encoder/decoder tables in `bridge-codec.ts`, and plumb it through the
- * worker-side sync shim. DO NOT register opcodes for syscalls that don't
- * exist yet.
+ * encoder/decoder tables, and plumb it through the worker-side sync shim.
+ * DO NOT register opcodes for syscalls that don't exist yet.
  *
  * - `DEBUG` — smoke-test round trip. Guest sends a UTF-8 string, main thread
  *   echoes its length back. Used by the targeted bridge unit spec.
@@ -103,11 +114,19 @@ export const DEFAULT_BRIDGE_BUFFER_BYTES =
  * - `CLOCK_NOW` — async-capable `ClockProvider.now(clockId) -> bigint`. The
  *   targeted unit spec uses this to prove the async → sync round trip works
  *   end-to-end with a real Promise-returning provider on the main thread.
+ * - `RANDOM_FILL` — async-capable `RandomProvider.fill(buf)`. The host fills
+ *   `byteLength` random bytes and returns them; the worker shim copies them
+ *   into the caller's buffer (chunking when the buffer exceeds the region
+ *   cap).
+ * - `TTY_GET` / `TTY_SET` — async-capable `TTYProvider.get()` / `.set(state)`.
  */
 export enum Opcode {
   DEBUG = 1,
   STDIN_READ = 2,
   CLOCK_NOW = 3,
+  RANDOM_FILL = 4,
+  TTY_GET = 5,
+  TTY_SET = 6,
 }
 
 // ─── Response tags ─────────────────────────────────────────────────────────
@@ -164,15 +183,41 @@ export type StdinReadResponse = { text: string | null };
 export type ClockNowRequest = { clockId: number };
 export type ClockNowResponse = { timeNs: bigint };
 
+export type RandomFillRequest = { byteLength: number };
+/** Random bytes filled by the host. Length is implicit in `bytes.byteLength`. */
+export type RandomFillResponse = { bytes: Uint8Array };
+
+export type TTYStateWire = {
+  cols: number;
+  rows: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  echo: boolean;
+  lineBuffered: boolean;
+  raw: boolean;
+};
+
+export type TTYGetRequest = Record<string, never>;
+export type TTYGetResponse = { state: TTYStateWire };
+
+export type TTYSetRequest = { state: TTYStateWire };
+export type TTYSetResponse = { result: Result };
+
 export type BridgeRequest =
   | { opcode: Opcode.DEBUG; args: DebugRequest }
   | { opcode: Opcode.STDIN_READ; args: StdinReadRequest }
-  | { opcode: Opcode.CLOCK_NOW; args: ClockNowRequest };
+  | { opcode: Opcode.CLOCK_NOW; args: ClockNowRequest }
+  | { opcode: Opcode.RANDOM_FILL; args: RandomFillRequest }
+  | { opcode: Opcode.TTY_GET; args: TTYGetRequest }
+  | { opcode: Opcode.TTY_SET; args: TTYSetRequest };
 
 export type BridgeResponse =
   | { opcode: Opcode.DEBUG; result: DebugResponse }
   | { opcode: Opcode.STDIN_READ; result: StdinReadResponse }
-  | { opcode: Opcode.CLOCK_NOW; result: ClockNowResponse };
+  | { opcode: Opcode.CLOCK_NOW; result: ClockNowResponse }
+  | { opcode: Opcode.RANDOM_FILL; result: RandomFillResponse }
+  | { opcode: Opcode.TTY_GET; result: TTYGetResponse }
+  | { opcode: Opcode.TTY_SET; result: TTYSetResponse };
 
 // ─── Region accessors ──────────────────────────────────────────────────────
 
@@ -201,23 +246,40 @@ export function responseRegion(buffer: SharedArrayBuffer): Uint8Array {
  * The request region is always `(buffer.byteLength - HEADER_BYTES) / 2`
  * rounded down to a 4-byte boundary. Symmetric halves keep reasoning simple
  * — we don't have opcodes this slice with asymmetric payload sizes.
+ *
+ * Throws if the resulting region would be smaller than `MIN_REGION_BYTES` —
+ * a host mis-sizing the buffer at construction is much easier to debug as a
+ * constructor error than as a wedged worker on first dispatch.
  */
 export function requestRegionByteLength(buffer: SharedArrayBuffer): number {
   const usable = buffer.byteLength - HEADER_BYTES;
   const half = Math.floor(usable / 2);
-  return half - (half % 4);
+  const aligned = half - (half % 4);
+  if (aligned < MIN_REGION_BYTES) {
+    throw new Error(
+      `bridge: per-region size (${aligned} bytes) below MIN_REGION_BYTES (${MIN_REGION_BYTES})`,
+    );
+  }
+  return aligned;
 }
 
 /**
  * Create a bridge buffer with default region sizes. Hosts that need more
  * room per region can allocate their own `SharedArrayBuffer` of the right
  * size — the layout logic above only depends on the total byte length.
+ *
+ * Enforces a floor of `HEADER_BYTES + 2 * MIN_REGION_BYTES` so each region
+ * is at least `MIN_REGION_BYTES` wide. Catch host misconfiguration here,
+ * not at first opcode dispatch.
  */
 export function createBridgeBuffer(
   totalBytes: number = DEFAULT_BRIDGE_BUFFER_BYTES,
 ): SharedArrayBuffer {
-  if (totalBytes < HEADER_BYTES + 16) {
-    throw new Error(`bridge: buffer too small (${totalBytes} bytes)`);
+  const minTotal = HEADER_BYTES + 2 * MIN_REGION_BYTES;
+  if (totalBytes < minTotal) {
+    throw new Error(
+      `bridge: buffer too small (${totalBytes} bytes; needs at least ${minTotal})`,
+    );
   }
   return new SharedArrayBuffer(totalBytes);
 }
@@ -232,9 +294,12 @@ export function createBridgeBuffer(
  *   [0]      RequestTag.ARGS
  *   [1..]    opcode-specific args
  *
- *   DEBUG      | u32 length | UTF-8 bytes
- *   STDIN_READ | u32 maxByteLength
- *   CLOCK_NOW  | u32 clockId
+ *   DEBUG       | u32 length | UTF-8 bytes
+ *   STDIN_READ  | u32 maxByteLength
+ *   CLOCK_NOW   | u32 clockId
+ *   RANDOM_FILL | u32 byteLength
+ *   TTY_GET     | (no args)
+ *   TTY_SET     | TTYStateWire (4×u32 + 3×u8)
  */
 export function encodeRequest(
   region: Uint8Array,
@@ -253,12 +318,43 @@ export function encodeRequest(
       return 5 + written;
     }
     case Opcode.STDIN_READ: {
+      // The wire is u32. Anything bigger than that is misuse — the bridge
+      // can't honour the request, so fail loudly rather than silently
+      // truncating to the low 32 bits.
+      if (
+        request.args.maxByteLength < 0 ||
+        request.args.maxByteLength > 0xffffffff ||
+        !Number.isFinite(request.args.maxByteLength)
+      ) {
+        throw new Error(
+          `bridge: STDIN_READ maxByteLength out of u32 range (${request.args.maxByteLength})`,
+        );
+      }
       view.setUint32(1, request.args.maxByteLength, true);
       return 5;
     }
     case Opcode.CLOCK_NOW: {
       view.setUint32(1, request.args.clockId, true);
       return 5;
+    }
+    case Opcode.RANDOM_FILL: {
+      if (
+        request.args.byteLength < 0 ||
+        request.args.byteLength > 0xffffffff ||
+        !Number.isFinite(request.args.byteLength)
+      ) {
+        throw new Error(
+          `bridge: RANDOM_FILL byteLength out of u32 range (${request.args.byteLength})`,
+        );
+      }
+      view.setUint32(1, request.args.byteLength, true);
+      return 5;
+    }
+    case Opcode.TTY_GET: {
+      return 1;
+    }
+    case Opcode.TTY_SET: {
+      return 1 + encodeTTYState(view, region, 1, request.args.state);
     }
   }
 }
@@ -294,6 +390,17 @@ export function decodeRequest(
       const clockId = view.getUint32(1, true);
       return { opcode, args: { clockId } };
     }
+    case Opcode.RANDOM_FILL: {
+      const byteLength = view.getUint32(1, true);
+      return { opcode, args: { byteLength } };
+    }
+    case Opcode.TTY_GET: {
+      return { opcode, args: {} };
+    }
+    case Opcode.TTY_SET: {
+      const state = decodeTTYState(view, region, 1);
+      return { opcode, args: { state } };
+    }
     default: {
       const neverCheck: never = opcode;
       throw new Error(`bridge: unknown opcode (${String(neverCheck)})`);
@@ -305,9 +412,12 @@ export function decodeRequest(
  * Encode a successful response into the response region. Returns bytes
  * written.
  *
- *   DEBUG      | u32 length
- *   STDIN_READ | u8 hasText (0 = null/EOF, 1 = string) | u32 length? | UTF-8?
- *   CLOCK_NOW  | u64 timeNs
+ *   DEBUG       | u32 length
+ *   STDIN_READ  | u8 hasText (0 = null/EOF, 1 = string) | u32 length? | UTF-8?
+ *   CLOCK_NOW   | u64 timeNs
+ *   RANDOM_FILL | u32 byteLength | raw bytes
+ *   TTY_GET     | TTYStateWire (4×u32 + 3×u8)
+ *   TTY_SET     | u32 result
  */
 export function encodeResponse(
   region: Uint8Array,
@@ -338,6 +448,24 @@ export function encodeResponse(
       view.setBigUint64(1, response.result.timeNs, true);
       return 9;
     }
+    case Opcode.RANDOM_FILL: {
+      const bytes = response.result.bytes;
+      if (5 + bytes.byteLength > region.byteLength) {
+        throw new Error(
+          `bridge: RANDOM_FILL response exceeds region (${5 + bytes.byteLength} > ${region.byteLength})`,
+        );
+      }
+      view.setUint32(1, bytes.byteLength, true);
+      region.set(bytes, 5);
+      return 5 + bytes.byteLength;
+    }
+    case Opcode.TTY_GET: {
+      return 1 + encodeTTYState(view, region, 1, response.result.state);
+    }
+    case Opcode.TTY_SET: {
+      view.setUint32(1, response.result.result, true);
+      return 5;
+    }
   }
 }
 
@@ -364,6 +492,11 @@ export function encodeWasixError(region: Uint8Array, result: Result): number {
  *   [0] ResponseTag.GENERIC_ERROR
  *   [1..5] u32 message length
  *   [5..]  UTF-8 message
+ *
+ * The message is silently truncated to fit the region. A long error message
+ * is not worth wedging the worker over — the truncated prefix is still more
+ * useful than a generic-error-encoding-failure that escapes the dispatcher's
+ * catch and parks the worker in REQUEST_PENDING forever.
  */
 export function encodeGenericError(
   region: Uint8Array,
@@ -375,9 +508,14 @@ export function encodeGenericError(
     region.byteOffset,
     region.byteLength,
   );
-  const written = writeUtf8(region, 5, message);
-  view.setUint32(1, written, true);
-  return 5 + written;
+  const maxBytes = Math.max(0, region.byteLength - 5);
+  let bytes = textEncoder.encode(message);
+  if (bytes.byteLength > maxBytes) {
+    bytes = bytes.subarray(0, maxBytes);
+  }
+  region.set(bytes, 5);
+  view.setUint32(1, bytes.byteLength, true);
+  return 5 + bytes.byteLength;
 }
 
 /**
@@ -430,11 +568,64 @@ export function decodeResponse(
       const timeNs = view.getBigUint64(1, true);
       return { opcode, result: { timeNs } };
     }
+    case Opcode.RANDOM_FILL: {
+      const byteLength = view.getUint32(1, true);
+      // Copy out — the response region is shared with the next round trip,
+      // so we don't hand the caller a view into a buffer about to be reused.
+      const bytes = new Uint8Array(byteLength);
+      bytes.set(region.subarray(5, 5 + byteLength));
+      return { opcode, result: { bytes } };
+    }
+    case Opcode.TTY_GET: {
+      const state = decodeTTYState(view, region, 1);
+      return { opcode, result: { state } };
+    }
+    case Opcode.TTY_SET: {
+      const result = view.getUint32(1, true) as Result;
+      return { opcode, result: { result } };
+    }
     default: {
       const neverCheck: never = opcode;
       throw new Error(`bridge: unknown opcode (${String(neverCheck)})`);
     }
   }
+}
+
+/**
+ * TTYState wire format — 4 little-endian u32s (cols, rows, pixelWidth,
+ * pixelHeight) followed by 3 u8 flags (echo, lineBuffered, raw). Returns
+ * bytes written (always 19).
+ */
+function encodeTTYState(
+  view: DataView,
+  region: Uint8Array,
+  offset: number,
+  state: TTYStateWire,
+): number {
+  view.setUint32(offset, state.cols, true);
+  view.setUint32(offset + 4, state.rows, true);
+  view.setUint32(offset + 8, state.pixelWidth, true);
+  view.setUint32(offset + 12, state.pixelHeight, true);
+  region[offset + 16] = state.echo ? 1 : 0;
+  region[offset + 17] = state.lineBuffered ? 1 : 0;
+  region[offset + 18] = state.raw ? 1 : 0;
+  return 19;
+}
+
+function decodeTTYState(
+  view: DataView,
+  region: Uint8Array,
+  offset: number,
+): TTYStateWire {
+  return {
+    cols: view.getUint32(offset, true),
+    rows: view.getUint32(offset + 4, true),
+    pixelWidth: view.getUint32(offset + 8, true),
+    pixelHeight: view.getUint32(offset + 12, true),
+    echo: region[offset + 16] !== 0,
+    lineBuffered: region[offset + 17] !== 0,
+    raw: region[offset + 18] !== 0,
+  };
 }
 
 // ─── Sync / async call primitives ──────────────────────────────────────────
@@ -474,11 +665,32 @@ export function callBridgeSync(
   try {
     return decodeResponse(request.opcode, respRegion, respLen);
   } finally {
-    // Reset to idle so the next request finds a clean slate.
+    // Reset to idle so the next request finds a clean slate. We also zero
+    // the OPCODE / ARG_LEN / RESP_LEN words: those are only meaningful when
+    // STATE != IDLE, but a peer reading them during IDLE for debugging
+    // (or a future opcode that reuses the header) should see a clean zero
+    // rather than the previous request's residue.
+    Atomics.store(state, OPCODE_INDEX, 0);
+    Atomics.store(state, ARG_LEN_INDEX, 0);
+    Atomics.store(state, RESP_LEN_INDEX, 0);
     Atomics.store(state, STATE_INDEX, STATE_IDLE);
     Atomics.notify(state, STATE_INDEX);
   }
 }
+
+/**
+ * Result of `awaitBridgeRequest` — discriminated so the dispatcher can
+ * distinguish a normal request from a decode failure (the worker wrote
+ * garbage / an unknown opcode) without letting the throw escape its
+ * try/catch and wedge the bridge in REQUEST_PENDING.
+ *
+ * `kind: "aborted"` is returned when the abort signal fires before a request
+ * arrives. The dispatcher's loop reads it as "stop cleanly".
+ */
+export type AwaitedBridgeRequest =
+  | { kind: "request"; request: BridgeRequest }
+  | { kind: "decode-error"; opcode: number; message: string }
+  | { kind: "aborted" };
 
 /**
  * Main-thread side: wait until the worker posts a request (non-blocking — uses
@@ -489,25 +701,36 @@ export function callBridgeSync(
  * one event-loop turn of `signal.abort()`, not at the next idle-poll
  * boundary.
  *
- * Returns the decoded request. The caller is responsible for dispatching to
- * its provider, then calling `writeBridgeResponse` / `writeBridgeWasixError`
- * / `writeBridgeGenericError` and notifying.
+ * Decoding the request happens inside this function, so malformed payloads
+ * or unknown opcodes surface as `{ kind: "decode-error" }` rather than
+ * throwing through the dispatcher and leaving the state word stuck at
+ * REQUEST_PENDING.
  */
 export async function awaitBridgeRequest(
   buffer: SharedArrayBuffer,
   signal: AbortSignal,
-): Promise<BridgeRequest | null> {
+): Promise<AwaitedBridgeRequest> {
   const state = new Int32Array(buffer);
   while (!signal.aborted) {
     const current = Atomics.load(state, STATE_INDEX);
     if (current === STATE_REQUEST_PENDING) {
-      const opcode = Atomics.load(state, OPCODE_INDEX) as Opcode;
+      const opcode = Atomics.load(state, OPCODE_INDEX);
       const argLen = Atomics.load(state, ARG_LEN_INDEX);
-      return decodeRequest(opcode, requestRegion(buffer), argLen);
+      try {
+        const request = decodeRequest(
+          opcode as Opcode,
+          requestRegion(buffer),
+          argLen,
+        );
+        return { kind: "request", request };
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return { kind: "decode-error", opcode, message };
+      }
     }
     await raceAbort(waitAsync(state, STATE_INDEX, current), signal);
   }
-  return null;
+  return { kind: "aborted" };
 }
 
 /**

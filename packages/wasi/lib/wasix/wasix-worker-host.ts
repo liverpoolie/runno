@@ -38,6 +38,7 @@ import type {
   SocketsProvider,
   ThreadsProvider,
   TTYProvider,
+  TTYState,
 } from "./providers.js";
 import type { ProviderPreopen } from "./providers/ergonomic/filesystem-provider.js";
 import type {
@@ -61,6 +62,7 @@ import {
   writeBridgeResponse,
   writeBridgeWasixError,
   type BridgeRequest,
+  type TTYStateWire,
 } from "./worker/bridge.js";
 import type {
   AsyncBridgedSlot,
@@ -71,9 +73,21 @@ import type {
 
 import WASIXWorkerEntry from "./worker/wasix-worker?worker&inline";
 
-/** The main-thread counterpart to `WASIXContextOptions`. Accepts
- *  async-capable providers on every slot, and also accepts an async stdin
- *  callback (host may return a Promise from its stdin handler). */
+/**
+ * The main-thread counterpart to `WASIXContextOptions`. Accepts
+ * async-capable providers on every slot, and also accepts an async stdin
+ * callback (host may return a Promise from its stdin handler).
+ *
+ * stdout / stderr are intentionally **sync-only** (no `Promise<void>`).
+ * They run on the main thread inside a `postMessage` event handler — the
+ * worker's stdout/stderr emissions are fire-and-forget `postMessage`s, not
+ * bridge round trips, so there is no back-pressure channel for an async
+ * sink to feed back into the guest. If your sink is async (e.g. you want
+ * to await a network write), call it and fire-and-forget the Promise from
+ * inside the sync callback; expect to lose any unflushed output if the
+ * page unloads. If you need back-pressure, buffer in your callback and
+ * drain externally.
+ */
 export type WASIXWorkerHostOptions = {
   fs?: WASIFS;
   /** Preopens beyond the implicit fd 3 = ".". Crosses postMessage as plain
@@ -83,7 +97,9 @@ export type WASIXWorkerHostOptions = {
   args?: string[];
   env?: Record<string, string>;
   stdin?: (maxByteLength: number) => string | null | Promise<string | null>;
+  /** Sync callback. See class-level JSDoc above for async-sink guidance. */
   stdout?: (out: string) => void;
+  /** Sync callback. See class-level JSDoc above for async-sink guidance. */
   stderr?: (err: string) => void;
   debug?: (
     name: string,
@@ -105,6 +121,14 @@ export type WASIXWorkerHostOptions = {
 
 export class WASIXWorkerHostKilledError extends Error {}
 
+/**
+ * Single-use host. Construct one per guest invocation; `.start()` is a
+ * one-shot — a second call (or a retry after `start()` rejected on
+ * compile failure) throws. If you need to retry, instantiate a new
+ * `WASIXWorkerHost`. This avoids an entire class of "did the previous
+ * dispatcher / worker get cleaned up?" reasoning at the cost of one
+ * cheap allocation per attempt.
+ */
 export class WASIXWorkerHost {
   private options: WASIXWorkerHostOptions;
   private moduleSource: Response | PromiseLike<Response> | WebAssembly.Module;
@@ -114,6 +138,7 @@ export class WASIXWorkerHost {
   private dispatcherAbort?: AbortController;
   private result?: Promise<WASIXExecutionResult>;
   private rejectResult?: (reason?: unknown) => void;
+  private killed = false;
 
   /**
    * @param moduleSource  Either a fetch `Response` (or `Promise<Response>`)
@@ -136,26 +161,45 @@ export class WASIXWorkerHost {
    * Compile the module, spawn the worker, start the guest, start the
    * dispatcher loop. Resolves when the guest exits (or rejects on crash
    * or kill()).
+   *
+   * **Single-use:** calling `start()` twice throws, even after a previous
+   * compile-time rejection. Construct a new `WASIXWorkerHost` to retry.
    */
   async start(): Promise<WASIXExecutionResult> {
     if (this.result) {
-      throw new Error("WASIXWorkerHost can only be started once");
+      throw new Error(
+        "WASIXWorkerHost is single-use; construct a new instance to retry",
+      );
     }
     this.result = this.runOnce();
     return this.result;
   }
 
   private async runOnce(): Promise<WASIXExecutionResult> {
-    const { module, envDescriptors } = await this.compileModule();
+    // Validate provider slots before doing any expensive work — a host that
+    // configured an unsupported async slot gets ENOSYS at construction
+    // time, not after a worker has been spawned and parked.
+    assertAsyncSlotsSupported(this.options);
+
+    const compiled = await this.compileModule();
+    if (this.killed) {
+      throw new WASIXWorkerHostKilledError("WASIX worker was killed");
+    }
+    const { module, envDescriptors } = compiled;
     this.sharedBuffer = createBridgeBuffer(DEFAULT_BRIDGE_BUFFER_BYTES);
     const sharedBuffer = this.sharedBuffer;
 
     const { worker, completion } = this.spawnWorker();
     this.worker = worker;
 
+    if (this.killed) {
+      worker.terminate();
+      throw new WASIXWorkerHostKilledError("WASIX worker was killed");
+    }
+
     // Launch the dispatcher loop — awaits requests, dispatches them to the
-    // host's providers, posts responses. It runs until `stop()` triggers
-    // the abort or the worker completes.
+    // host's providers, posts responses. It runs until kill() / abort or
+    // the worker completes.
     this.dispatcherAbort = new AbortController();
     const dispatcher = this.runDispatcher(
       sharedBuffer,
@@ -169,6 +213,11 @@ export class WASIXWorkerHost {
     // tolerated (a clock id the provider doesn't support throws — we omit
     // it from the cache and the worker shim falls back to 1µs).
     const clockResolutions = await resolveClockResolutions(this.options.clock);
+    if (this.killed) {
+      this.dispatcherAbort.abort();
+      worker.terminate();
+      throw new WASIXWorkerHostKilledError("WASIX worker was killed");
+    }
 
     // Send the start message. Transfer the module when available to avoid
     // a re-compile in the worker.
@@ -197,15 +246,16 @@ export class WASIXWorkerHost {
   }
 
   /**
-   * Kill the worker. The outstanding Promise returned from `.start()` is
-   * rejected with `WASIXWorkerHostKilledError`.
+   * Kill the worker. Idempotent — safe to call before `start()`, during
+   * compilation, mid-bridge-call, or after the guest has already exited.
+   * The outstanding Promise returned from `.start()` (if any) is rejected
+   * with `WASIXWorkerHostKilledError`.
    */
   kill(): void {
-    if (!this.worker) {
-      throw new Error("WASIXWorkerHost has not started");
-    }
+    if (this.killed) return;
+    this.killed = true;
     this.dispatcherAbort?.abort();
-    this.worker.terminate();
+    this.worker?.terminate();
     this.rejectResult?.(
       new WASIXWorkerHostKilledError("WASIX worker was killed"),
     );
@@ -297,12 +347,31 @@ export class WASIXWorkerHost {
     signal: AbortSignal,
   ): Promise<void> {
     while (!signal.aborted) {
-      const request = await awaitBridgeRequest(sharedBuffer, signal);
-      if (request === null) return;
+      const awaited = await awaitBridgeRequest(sharedBuffer, signal);
+      if (awaited.kind === "aborted") return;
+      if (awaited.kind === "decode-error") {
+        // Worker sent malformed bytes or an unknown opcode. Surface a
+        // generic error so the guest unblocks; the bridge stays usable for
+        // the next request.
+        writeBridgeGenericError(
+          sharedBuffer,
+          `bridge: decode failure (opcode=${awaited.opcode}): ${awaited.message}`,
+        );
+        continue;
+      }
 
       try {
-        await this.handleRequest(sharedBuffer, request);
+        await this.handleRequest(sharedBuffer, awaited.request, signal);
       } catch (e) {
+        if (signal.aborted) {
+          // Provider call lost the race against `kill()`. Worker is about
+          // to be terminated — writing a response is unnecessary and risks
+          // racing against the terminate.
+          return;
+        }
+        // Order matters: WASIXError extends Error, so the WASIXError arm
+        // must come first or every WASIXError would fall into the generic
+        // arm and lose its `Result` payload.
         if (e instanceof WASIXError) {
           writeBridgeWasixError(sharedBuffer, e.result);
         } else if (e instanceof Error) {
@@ -317,6 +386,7 @@ export class WASIXWorkerHost {
   private async handleRequest(
     sharedBuffer: SharedArrayBuffer,
     request: BridgeRequest,
+    signal: AbortSignal,
   ): Promise<void> {
     switch (request.opcode) {
       case Opcode.DEBUG: {
@@ -336,7 +406,10 @@ export class WASIXWorkerHost {
           });
           return;
         }
-        const text = await this.options.stdin(request.args.maxByteLength);
+        const text = await raceSignal(
+          this.options.stdin(request.args.maxByteLength),
+          signal,
+        );
         writeBridgeResponse(sharedBuffer, {
           opcode: Opcode.STDIN_READ,
           result: { text },
@@ -350,12 +423,50 @@ export class WASIXWorkerHost {
           // treat as ENOSYS.
           throw new WASIXError(Result.ENOSYS);
         }
-        const value = await this.options.clock.now(
-          request.args.clockId as ClockId,
+        const value = await raceSignal(
+          this.options.clock.now(request.args.clockId as ClockId),
+          signal,
         );
         writeBridgeResponse(sharedBuffer, {
           opcode: Opcode.CLOCK_NOW,
           result: { timeNs: value },
+        });
+        return;
+      }
+      case Opcode.RANDOM_FILL: {
+        if (!this.options.random) {
+          throw new WASIXError(Result.ENOSYS);
+        }
+        const tmp = new Uint8Array(request.args.byteLength);
+        await raceSignal(this.options.random.fill(tmp), signal);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.RANDOM_FILL,
+          result: { bytes: tmp },
+        });
+        return;
+      }
+      case Opcode.TTY_GET: {
+        if (!this.options.tty) {
+          throw new WASIXError(Result.ENOSYS);
+        }
+        const state = await raceSignal(this.options.tty.get(), signal);
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.TTY_GET,
+          result: { state: ttyStateToWire(state) },
+        });
+        return;
+      }
+      case Opcode.TTY_SET: {
+        if (!this.options.tty) {
+          throw new WASIXError(Result.ENOSYS);
+        }
+        const result = await raceSignal(
+          this.options.tty.set(wireToTTYState(request.args.state)),
+          signal,
+        );
+        writeBridgeResponse(sharedBuffer, {
+          opcode: Opcode.TTY_SET,
+          result: { result },
         });
         return;
       }
@@ -431,4 +542,100 @@ function detectAsyncSlots(options: WASIXWorkerHostOptions): AsyncBridgedSlot[] {
   if (options.sockets) slots.push("sockets");
   if (options.proc) slots.push("proc");
   return slots;
+}
+
+/**
+ * The set of provider slots that have bridge opcodes wired this slice. A
+ * host can configure any slot the type system allows, but if a slot has no
+ * opcode plumbed, dispatching a guest call against it would hit the
+ * default-arm of the dispatcher switch and wedge the worker. Reject the
+ * configuration at startup with a named ENOSYS instead.
+ *
+ * Each later slice that lands its opcode set adds its slot to this list.
+ * Slice 4: clock, random, tty.
+ * Slice 5+ (planned): threads, futex, signals, sockets, proc.
+ */
+const SLICE_4_SUPPORTED_SLOTS: ReadonlySet<AsyncBridgedSlot> = new Set([
+  "clock",
+  "random",
+  "tty",
+]);
+
+function assertAsyncSlotsSupported(options: WASIXWorkerHostOptions): void {
+  const slots = detectAsyncSlots(options);
+  for (const slot of slots) {
+    if (!SLICE_4_SUPPORTED_SLOTS.has(slot)) {
+      throw new WASIXError(
+        Result.ENOSYS,
+        `WASIXWorkerHost: provider slot "${slot}" has no bridge opcode this slice`,
+      );
+    }
+  }
+}
+
+/**
+ * Race a (possibly-Promise) value against the dispatcher abort signal.
+ *
+ * If the signal fires before the value settles, the returned promise
+ * rejects so the dispatcher's loop unwinds — without this, a hung
+ * provider would hold `runOnce()` open past `kill()` until it eventually
+ * settled. The original promise is left to settle on its own (we cannot
+ * cancel an arbitrary host callback).
+ */
+function raceSignal<T>(value: T | Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("dispatcher: aborted"));
+      return;
+    }
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(new Error("dispatcher: aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(value).then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Wire ↔ TTYState conversion. The two types are structurally identical;
+ *  this exists so a future TTYState additions doesn't silently misalign
+ *  the bridge encoding. */
+function ttyStateToWire(state: TTYState): TTYStateWire {
+  return {
+    cols: state.cols,
+    rows: state.rows,
+    pixelWidth: state.pixelWidth,
+    pixelHeight: state.pixelHeight,
+    echo: state.echo,
+    lineBuffered: state.lineBuffered,
+    raw: state.raw,
+  };
+}
+
+function wireToTTYState(wire: TTYStateWire): TTYState {
+  return {
+    cols: wire.cols,
+    rows: wire.rows,
+    pixelWidth: wire.pixelWidth,
+    pixelHeight: wire.pixelHeight,
+    echo: wire.echo,
+    lineBuffered: wire.lineBuffered,
+    raw: wire.raw,
+  };
 }
