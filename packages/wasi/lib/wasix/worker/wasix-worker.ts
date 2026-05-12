@@ -31,7 +31,7 @@ import type {
   PreopenInfo,
   RandomProvider,
 } from "../providers.js";
-import { ClockId } from "../wasix-32v1.js";
+import { ClockId, Result, WASIXError } from "../wasix-32v1.js";
 import {
   Opcode,
   callBridgeSync,
