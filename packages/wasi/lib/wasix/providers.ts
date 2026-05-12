@@ -165,16 +165,41 @@ export interface SignalsProvider {
   raiseInterval(signo: number, intervalNs: bigint): Result;
 }
 
+export type SockAcceptResult = {
+  fd: number;
+  addr: SockAddr;
+};
+
 export interface SocketsProvider {
   open(af: number, type: number, proto: number): number;
   bind(fd: number, addr: SockAddr): Result;
   connect(fd: number, addr: SockAddr): Result;
   listen(fd: number, backlog: number): Result;
-  accept(fd: number): number;
+  accept(fd: number): SockAcceptResult;
   send(fd: number, bufs: Uint8Array[], flags: number): number;
   recv(fd: number, bufs: Uint8Array[], flags: number): SockRecvResult;
   shutdown(fd: number, how: number): Result;
   addrResolve(host: string, port: number, hints: AddrHints): SockAddr[];
+
+  // Socket option triplet — wasix splits options into flag/size/time variants
+  // by argument shape. Providers translate (level, name) → the appropriate
+  // typed value; WASIX marshals it in/out of guest memory.
+  getOptFlag(fd: number, level: number, name: number): boolean;
+  getOptSize(fd: number, level: number, name: number): number;
+  getOptTime(fd: number, level: number, name: number): bigint | null;
+  setOptFlag(fd: number, level: number, name: number, value: boolean): Result;
+  setOptSize(fd: number, level: number, name: number, value: number): Result;
+  setOptTime(
+    fd: number,
+    level: number,
+    name: number,
+    value: bigint | null,
+  ): Result;
+
+  // Local / peer address + status accessors.
+  addrLocal(fd: number): SockAddr;
+  addrPeer(fd: number): SockAddr;
+  status(fd: number): number;
 }
 
 export interface ProcProvider {
