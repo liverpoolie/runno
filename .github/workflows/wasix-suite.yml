@@ -23,29 +23,20 @@ jobs:
       - name: Install root dependencies
         run: npm run bootstrap
 
-      # Cache the vendored wasmer tarball extract + the built wasix-libc
-      # sysroot. Both are keyed on the pinned SHA and the suite constants
-      # file (bumping the SHA invalidates the cache automatically). The
-      # built .wasm artifacts under `public/bin/wasix-tests/` are keyed on
-      # the vendored tree hash and the build script itself, so a wasixcc
-      # toolchain bump forces a rebuild.
-      - name: Cache wasix-libc toolchain
-        id: cache-wasix-libc
-        uses: actions/cache@v4
-        with:
-          path: ~/.wasix
-          key: >-
-            wasix-libc-v12-${{ runner.os }}-${{
-              hashFiles('.github/workflows/wasix-suite.yml')
-            }}
-
+      # Cache the vendored wasmer tarball extract and the built .wasm
+      # artifacts. The vendor checkout is keyed on the pinned SHA (held in
+      # the constants module), so bumping the SHA invalidates it. The
+      # built binaries under `public/bin/wasix-tests/` are keyed on the
+      # constants + build script + this workflow, so a toolchain or
+      # include-list bump forces a rebuild. The wasixcc toolchain itself
+      # is cached internally by the `wasix-org/wasixcc` action.
       - name: Cache vendored wasmer checkout
         uses: actions/cache@v4
         with:
           path: packages/wasi/tests/wasix-vendor
           key: >-
             wasmer-vendor-${{
-              hashFiles('packages/wasi/tests/wasix-suite.constants.mjs')
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts')
             }}
 
       - name: Cache built wasix-suite binaries
@@ -54,52 +45,38 @@ jobs:
           path: packages/wasi/public/bin/wasix-tests
           key: >-
             wasix-bins-${{ runner.os }}-${{
-              hashFiles('packages/wasi/tests/wasix-suite.constants.mjs',
-                        'packages/wasi/tests/build-wasix-suite.mjs')
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts',
+                        'packages/wasi/tests/build-wasix-suite.ts',
+                        '.github/workflows/wasix-suite.yml')
             }}
 
       - name: Install wasixcc toolchain
-        # Pulls the prebuilt wasix-libc sysroot + wrapper scripts.
-        # Exposes `wasixcc` on PATH for the build harness.
-        if: steps.cache-wasix-libc.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          WASIX_LIBC_VERSION="v12"
-          WASIX_SDK_URL="https://github.com/wasix-org/wasix-libc/releases/download/${WASIX_LIBC_VERSION}/wasix-libc-${WASIX_LIBC_VERSION}-linux.tar.gz"
-          INSTALL_DIR="$HOME/.wasix"
-          mkdir -p "$INSTALL_DIR"
-          if ! curl --fail --location --retry 3 --output /tmp/wasix-libc.tar.gz "$WASIX_SDK_URL"; then
-            echo "::warning::failed to download wasix-libc ${WASIX_LIBC_VERSION} — wasix-suite will skip."
-            exit 0
-          fi
-          tar -xzf /tmp/wasix-libc.tar.gz -C "$INSTALL_DIR" --strip-components=1 || {
-            echo "::warning::failed to extract wasix-libc — wasix-suite will skip."
-            exit 0
-          }
-
-      - name: Expose wasixcc on PATH
-        run: |
-          if [ -d "$HOME/.wasix/bin" ]; then
-            echo "$HOME/.wasix/bin" >> "$GITHUB_PATH"
-          fi
+        # Pulls a pinned wasixcc binary, the wasix-libc sysroot and the
+        # WASIX-aware LLVM toolchain into a managed cache, then puts
+        # `wasixcc` on PATH for the build harness. `sysroot-tag` is pinned
+        # to a real wasix-org/wasix-libc release (verified to exist) so
+        # the slice-5 test binaries build deterministically.
+        uses: wasix-org/wasixcc@v0.4.3
+        with:
+          version: v0.4.3
+          sysroot-tag: v2026-05-21.1
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Probe wasixcc
-        id: probe
+        # Hard-fail if the toolchain didn't land — a missing wasixcc means
+        # zero binaries build, which must turn the job RED, not skip it.
         run: |
-          if command -v wasixcc >/dev/null 2>&1; then
-            echo "available=1" >> "$GITHUB_OUTPUT"
-            wasixcc --version || true
-          else
-            echo "available=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::wasixcc not on PATH — the suite job will run with no built binaries."
+          set -euxo pipefail
+          if ! command -v wasixcc >/dev/null 2>&1; then
+            echo "::error::wasixcc not on PATH after install."
+            exit 1
           fi
+          wasixcc --version || true
 
       - name: Fetch + build wasix suite binaries
-        # Only build when wasixcc is actually on PATH. The probe above
-        # already decided this is a graceful-skip run ("no built
-        # binaries") when the toolchain is unavailable; without this
-        # gate the build harder-fails the job, contradicting that path.
-        if: steps.probe.outputs.available == '1'
+        # `build-wasix-suite.ts` exits non-zero if wasixcc is missing, the
+        # vendor dir is absent, any per-test build fails, or zero binaries
+        # are produced. A real build failure fails the job honestly.
         working-directory: packages/wasi
         run: |
           npm run test:prepare:wasix-suite
@@ -112,10 +89,12 @@ jobs:
         working-directory: packages/wasi
         # Add the JSON reporter alongside the existing html reporter so
         # the next step can count pass/skip/fail without parsing HTML.
+        # A non-zero Playwright exit fails the job — failures are not
+        # swallowed. The summary step below runs `if: always()` so the
+        # pass/skip/fail counts are still published on a red run.
         run: |
           npx playwright test tests/wasix-suite.spec.ts \
-            --reporter=list,html,json \
-            || echo "::notice::wasix-suite playwright exited non-zero — see summary for counts."
+            --reporter=list,html,json
         env:
           PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-report/wasix-suite.json
 
