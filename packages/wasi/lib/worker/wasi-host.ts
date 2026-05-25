@@ -1,6 +1,19 @@
 import type { WASIContextOptions } from "../wasi/wasi-context.js";
 import type { WASIExecutionResult } from "../types.js";
 import type { HostMessage, WorkerMessage } from "./wasi-worker.js";
+import type {
+  ClockProvider,
+  FileSystemProvider,
+  RandomProvider,
+  SocketsProvider,
+  TTYProvider,
+} from "../wasix/providers.js";
+import type {
+  AsyncClockProvider,
+  AsyncRandomProvider,
+  AsyncSocketsProvider,
+  AsyncTTYProvider,
+} from "../wasix/providers/async.js";
 
 import WASIWorker from "./wasi-worker?worker&inline";
 
@@ -8,7 +21,26 @@ function sendMessage(worker: Worker, message: WorkerMessage) {
   worker.postMessage(message);
 }
 
-type WASIWorkerHostContext = Partial<Omit<WASIContextOptions, "stdin">>;
+/**
+ * Main-thread context shape accepted by `WASIWorkerHost`. Provider slots
+ * accept either their sync variant (which is what the in-process `WASI`
+ * runtime consumes today) or their async-capable counterpart. Async
+ * providers passed here are reserved for a future worker-bridge follow-up
+ * and are currently not forwarded into the worker — sync providers
+ * continue to work via the existing postMessage protocol.
+ */
+type WASIWorkerHostContext = Partial<
+  Omit<
+    WASIContextOptions,
+    "stdin" | "clock" | "random" | "tty" | "fsProvider" | "sockets"
+  >
+> & {
+  clock?: ClockProvider | AsyncClockProvider;
+  random?: RandomProvider | AsyncRandomProvider;
+  tty?: TTYProvider | AsyncTTYProvider;
+  fsProvider?: FileSystemProvider;
+  sockets?: SocketsProvider | AsyncSocketsProvider;
+};
 
 export class WASIWorkerHostKilledError extends Error {}
 
@@ -52,7 +84,7 @@ export class WASIWorkerHost {
               message.name,
               message.args,
               message.ret,
-              message.data
+              message.data,
             );
             break;
           case "result":
