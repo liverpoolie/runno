@@ -1242,13 +1242,14 @@ export class WASI implements SnapshotPreview1 {
    * since this is error-prone in multi-threaded contexts. The returned file
    * descriptor is guaranteed to be less than 2**31.
    * Note: This is similar to openat in POSIX.
-   * @param fd: fd
-   * @param dirflags: lookupflags Flags determining the method of how the path
+   * @param fd directory fd to resolve `path` against.
+   * @param dirflags lookupflags Flags determining the method of how the path
    *                  is resolved. Not supported by Runno (symlinks)
-   * @param path: string The relative path of the file or directory to open,
-   *              relative to the path_open::fd directory.
-   * @param oflags: oflags The method by which to open the file.
-   * @param fs_rights_base: rights The initial rights of the newly created file
+   * @param path_ptr pointer to the relative path of the file or directory to
+   *              open, relative to the path_open::fd directory.
+   * @param path_len byte length of `path_ptr`.
+   * @param oflags The method by which to open the file.
+   * @param rights_base The initial rights of the newly created file
    *                        descriptor. The implementation is allowed to return
    *                        a file descriptor with fewer rights than specified,
    *                        if and only if those rights do not apply to the type
@@ -1257,8 +1258,10 @@ export class WASI implements SnapshotPreview1 {
    *                        descriptor itself, while the inheriting rights are
    *                        rights that apply to file descriptors derived from
    *                        it.
-   * @param fs_rights_inheriting: rights
-   * @param fdflags: fdflags
+   * @param rights_inheriting rights inherited by descriptors derived from
+   *                              the returned fd.
+   * @param fdflags fd-level flags (APPEND / DSYNC / NONBLOCK / RSYNC / SYNC).
+   * @param retptr0 u32 retptr — the runtime writes the new fd here.
    *
    */
   path_open(
