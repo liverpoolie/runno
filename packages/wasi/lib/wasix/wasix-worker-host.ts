@@ -850,11 +850,13 @@ function detectAsyncSlots(options: WASIXWorkerHostOptions): AsyncBridgedSlot[] {
  *
  * Each later slice that lands its opcode set adds its slot to this list.
  * Slice 4: clock, random.
+ * Slice 4.1: fs (the FS_FD_* / FS_PATH_* opcodes are wired in the dispatcher).
  * Slice 5+ (planned): tty, threads, futex, signals, sockets, proc.
  */
 const SLICE_4_SUPPORTED_SLOTS: ReadonlySet<AsyncBridgedSlot> = new Set([
   "clock",
   "random",
+  "fs",
 ]);
 
 function assertAsyncSlotsSupported(options: WASIXWorkerHostOptions): void {
