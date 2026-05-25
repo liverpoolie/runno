@@ -242,9 +242,61 @@ export const FUTEX_WAIT_OK = 0;
 export const FUTEX_WAIT_TIMEOUT = 1;
 export const FUTEX_WAIT_MISMATCH = 2;
 
+/**
+ * Sync signal handler invoked by `SignalsProvider.raise` or by the
+ * pending-queue drain on a `signalThread` target. The provider does
+ * not know about wasm internals — `wasix.ts` builds the closure that
+ * resolves an `__indirect_function_table` slot or named export and
+ * calls into the guest, then hands the closure here.
+ *
+ * Handlers run synchronously inside the syscall frame. Anything they
+ * throw propagates out the way every other syscall throw does (a
+ * `WASIXError` becomes an errno; a `WebAssembly.RuntimeError` traps
+ * the guest, etc.).
+ */
+export type SignalHandler = (signo: number) => void;
+
+/**
+ * Raw synchronous signals provider.
+ *
+ * Backs the wasix `proc_raise` / `signal_register` / `callback_signal`
+ * / `proc_raise_interval` / `thread_signal` syscalls. All methods are
+ * synchronous; an `AsyncSignalsProvider` variant exists for hosts that
+ * back signals with an async source on the main thread.
+ *
+ * Conventions:
+ *
+ * - `signo === 0` is the **universal callback** slot, used by
+ *   `callback_signal` (a single string-named export that wasix-libc
+ *   registers as the global signal dispatcher). Per-signal handlers
+ *   take precedence; the universal callback fires when no per-signal
+ *   handler is present for the raised signo.
+ * - `register(signo, null)` clears whichever slot `signo` selects
+ *   (matches POSIX `SIG_DFL`). The provider returns `SUCCESS`.
+ * - `raise(signo)` invokes the registered handler synchronously
+ *   inside the syscall frame; with no handler it returns `SUCCESS`
+ *   and the signal is treated as default-ignored. `wasix.ts` maps
+ *   provider throws to errnos through the standard `mapError` path.
+ * - `raiseInterval(signo, intervalNs, repeat)` schedules a host-side
+ *   timer; delivery is deferred to the next cooperative yield point
+ *   (this slice does not preempt running guest code).
+ * - `signalThread(tid, signo)` posts a pending-signal record on the
+ *   target TID; delivery happens when that TID next yields, via the
+ *   same registered handlers. Routes the wasix `thread_signal` ABI.
+ */
 export interface SignalsProvider {
-  register(signo: number, handler: number): Result;
-  raiseInterval(signo: number, intervalNs: bigint): Result;
+  register(signo: number, handler: SignalHandler | null): Result;
+  raise(signo: number): Result;
+  raiseInterval(signo: number, intervalNs: bigint, repeat: boolean): Result;
+  signalThread(tid: number, signo: number): Result;
+  /**
+   * Optional: drain pending signals enqueued via `signalThread` for
+   * `tid`. The cooperative scheduler from Slice 6 calls this hook at
+   * yield points before resuming a thread, so per-TID delivery
+   * happens at the next runnable transition. Providers that don't
+   * track per-TID queues may omit this.
+   */
+  drainPending?(tid: number): void;
 }
 
 export type SockAcceptResult = {

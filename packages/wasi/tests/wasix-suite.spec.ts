@@ -32,6 +32,7 @@ import { test, expect } from "@playwright/test";
 
 import type {
   CooperativeThreadsProvider,
+  SelfSignalProvider,
   SimulatedFutexProvider,
   WASIX,
   WASIXContext,
@@ -377,6 +378,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
               WASIDriveFileSystemProvider: typeof WASIDriveFileSystemProvider;
               CooperativeThreadsProvider: typeof CooperativeThreadsProvider;
               SimulatedFutexProvider: typeof SimulatedFutexProvider;
+              SelfSignalProvider: typeof SelfSignalProvider;
             };
 
             // Seed a fresh WASIFS under /home for this run — the wasmer
@@ -429,6 +431,11 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
             // resolved.
             const threads = new w.CooperativeThreadsProvider();
             const futex = new w.SimulatedFutexProvider({ threads });
+            // Slice 7: SelfSignalProvider serves the synchronous signal
+            // surface (`proc_raise`, `signal_register`, `callback_signal`,
+            // `proc_raise_interval`, `thread_signal`). Default-ignored
+            // for tests that never register a handler — costs nothing.
+            const signals = new w.SelfSignalProvider();
 
             if (input.mode === "main") {
               const wasiResult = await w.WASIX.start(
@@ -446,6 +453,7 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
                   fs: new w.WASIDriveFileSystemProvider(fs, { preopens }),
                   threads,
                   futex,
+                  signals,
                 }),
               );
               return { exitCode: wasiResult.exitCode, stdout, stderr };
@@ -473,6 +481,12 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
                 stderr += err;
               },
               stdin: () => null,
+              // Slice 7: opt the worker into installing a local
+              // SelfSignalProvider in its own realm. The host-side
+              // instance is a sentinel — handler dispatch happens
+              // inside the worker because it must call back into the
+              // guest's `__indirect_function_table`.
+              signals: new w.SelfSignalProvider(),
             });
             const workerResult = await host.start();
             return { exitCode: workerResult.exitCode, stdout, stderr };
