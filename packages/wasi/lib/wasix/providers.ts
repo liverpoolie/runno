@@ -145,6 +145,45 @@ export interface TTYProvider {
   set(state: TTYState): Result;
 }
 
+/**
+ * Raw threads provider.
+ *
+ * Synchronous JS-native API for the wasix thread syscalls (`thread_*`).
+ * TID 0 is reserved per WASIX convention and never returned; allocation
+ * is monotonic starting at 2 (the thread that ran `_start` is TID 1).
+ *
+ * - `spawn(startArg)` — returns a fresh TID. The provider arranges for
+ *   `wasi_thread_start(tid, startArg)` to run on that thread; for the
+ *   cooperative simulator this is driven by the scheduler at the next
+ *   yield point. The host only sees the integer `startArg` — wasix-libc
+ *   passes a pointer to its `__wasi_threadstartargs_t` struct here, but
+ *   the runtime never dereferences it (the guest's `wasi_thread_start`
+ *   does that on its side).
+ * - `join(tid)` — block the caller until `tid` exits, return its exit
+ *   code. Returns `-1` if the tid is unknown.
+ * - `exit(code)` — terminate the calling thread. The cooperative
+ *   provider throws an internal sentinel to unwind the wasm call stack
+ *   and report `code` to any joiner.
+ * - `sleep(durationNs)` — yield for `durationNs` nanoseconds. The
+ *   cooperative provider advances its virtual clock as the run queue
+ *   drains, so guests sleeping across the same scheduler interval wake
+ *   in the right order.
+ * - `id()` — current thread's TID.
+ * - `parallelism()` — honest count of host-parallel slots. The
+ *   cooperative provider returns `1`.
+ * - `signal(tid, signo)` — record a pending signal on the target thread
+ *   and return `Result.SUCCESS` (or `ESRCH` for an unknown tid). Actual
+ *   signal *delivery* / handler invocation is Slice 7's concern; this
+ *   slice only tracks the pending queue so guest code observing
+ *   self-state sees the signal.
+ *
+ * Optional members:
+ * - `setThreadStart(fn)` — wired by `WASIX.start` once the guest's
+ *   `wasi_thread_start` export is available. The cooperative provider
+ *   uses this to invoke spawned threads reentrantly during yield points.
+ *   Multi-worker / real-thread providers that own their own instances
+ *   can ignore this hook.
+ */
 export interface ThreadsProvider {
   spawn(startArg: number): number;
   join(tid: number): number;
@@ -153,12 +192,55 @@ export interface ThreadsProvider {
   id(): number;
   parallelism(): number;
   signal(tid: number, signo: number): Result;
+  /** Optional: receive the guest's `wasi_thread_start` export at load time. */
+  setThreadStart?(fn: (tid: number, startArg: number) => void): void;
 }
 
+/**
+ * Raw futex provider.
+ *
+ * Synchronous backing for `futex_wait` / `futex_wake` / `futex_wake_all`.
+ * The address is a u32-aligned offset into the linear memory shared with
+ * the guest; providers that need the underlying buffer receive it via
+ * the optional `setMemory` hook (called by `WASIX.start` once the memory
+ * is resolved).
+ *
+ * - `wait(addr, expected, timeoutNs)` — atomically check `mem[addr]`
+ *   against `expected`; if equal, park the caller. Returns one of:
+ *   - `WOKEN`     (matches `FutexWaitResult.WOKEN`) — woken by a `wake`.
+ *   - `TIMEOUT`   (matches `FutexWaitResult.TIMEOUT`) — deadline hit.
+ *   - `MISMATCH`  — value at addr was not `expected`. The runtime
+ *     translates this to `Result.EAGAIN` for the guest.
+ *   `timeoutNs === null` means "no timeout" (block indefinitely).
+ * - `wake(addr, count)` — wake up to `count` waiters parked on `addr`.
+ *   For `futex_wake_all`, the runtime calls `wake(addr, MAX_SAFE_INTEGER)`.
+ *   Returns the number of waiters actually woken.
+ *
+ * Optional:
+ * - `setMemory(memory)` — receive the resolved `WebAssembly.Memory` so
+ *   the provider can read `mem[addr]` against `expected`. Called by
+ *   `WASIX.start` after auto-detection / instantiation. The simulated
+ *   provider uses this hook; host-supplied providers that already know
+ *   their memory at construction can ignore it.
+ */
 export interface FutexProvider {
   wait(addr: number, expected: number, timeoutNs: bigint | null): number;
   wake(addr: number, count: number): number;
+  /** Optional: receive the resolved guest memory at load time. */
+  setMemory?(memory: WebAssembly.Memory): void;
 }
+
+/**
+ * `FutexProvider.wait` provider-return contract — internal to the
+ * runtime / provider boundary. `wasix.ts` translates these into the
+ * wasix `futex_wait` ABI (`ret_woken` byte + errno):
+ *   `OK`       → `ret_woken=1`, errno = SUCCESS
+ *   `TIMEOUT`  → `ret_woken=0`, errno = SUCCESS
+ *   `MISMATCH` → ret_woken untouched, errno = EAGAIN
+ */
+export const FUTEX_WAIT_OK = 0;
+export const FUTEX_WAIT_TIMEOUT = 1;
+export const FUTEX_WAIT_MISMATCH = 2;
 
 export interface SignalsProvider {
   register(signo: number, handler: number): Result;

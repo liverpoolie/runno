@@ -143,6 +143,20 @@ export enum Opcode {
   TTY_GET = 5,
   TTY_SET = 6,
 
+  // Threads + Futex — Slice 6. Cooperative threads are sync, so they
+  // never use the bridge — these opcodes exist for hosts wiring an
+  // async-capable threads / futex provider against `WASIXWorkerHost`
+  // (e.g. a multi-worker provider on the main thread).
+  THREAD_SPAWN = 10,
+  THREAD_JOIN = 11,
+  THREAD_EXIT = 12,
+  THREAD_SLEEP = 13,
+  THREAD_ID = 14,
+  THREAD_PARALLELISM = 15,
+  THREAD_SIGNAL = 16,
+  FUTEX_WAIT = 17,
+  FUTEX_WAKE = 18,
+
   // Sockets — Slice 5.
   SOCK_OPEN = 30,
   SOCK_BIND = 31,
@@ -348,6 +362,40 @@ export type TTYGetResponse = { state: TTYStateWire };
 export type TTYSetRequest = { state: TTYStateWire };
 export type TTYSetResponse = { result: Result };
 
+// ─── Threads + Futex opcodes ─────────────────────────────────────────────
+
+export type ThreadSpawnRequest = { startArg: number };
+export type ThreadSpawnResponse = { tid: number };
+
+export type ThreadJoinRequest = { tid: number };
+export type ThreadJoinResponse = { exitCode: number };
+
+export type ThreadExitRequest = { code: number };
+export type ThreadExitResponse = Record<string, never>;
+
+export type ThreadSleepRequest = { durationNs: bigint };
+export type ThreadSleepResponse = Record<string, never>;
+
+export type ThreadIdRequest = Record<string, never>;
+export type ThreadIdResponse = { tid: number };
+
+export type ThreadParallelismRequest = Record<string, never>;
+export type ThreadParallelismResponse = { value: number };
+
+export type ThreadSignalRequest = { tid: number; signo: number };
+export type ThreadSignalResponse = { result: Result };
+
+export type FutexWaitRequest = {
+  addr: number;
+  expected: number;
+  /** `null` when no timeout was supplied (block indefinitely). */
+  timeoutNs: bigint | null;
+};
+export type FutexWaitResponse = { value: number };
+
+export type FutexWakeRequest = { addr: number; count: number };
+export type FutexWakeResponse = { woken: number };
+
 // ─── Sockets opcodes ──────────────────────────────────────────────────────
 
 export type SockOpenRequest = {
@@ -439,6 +487,15 @@ export type BridgeRequest =
   | { opcode: Opcode.RANDOM_FILL; args: RandomFillRequest }
   | { opcode: Opcode.TTY_GET; args: TTYGetRequest }
   | { opcode: Opcode.TTY_SET; args: TTYSetRequest }
+  | { opcode: Opcode.THREAD_SPAWN; args: ThreadSpawnRequest }
+  | { opcode: Opcode.THREAD_JOIN; args: ThreadJoinRequest }
+  | { opcode: Opcode.THREAD_EXIT; args: ThreadExitRequest }
+  | { opcode: Opcode.THREAD_SLEEP; args: ThreadSleepRequest }
+  | { opcode: Opcode.THREAD_ID; args: ThreadIdRequest }
+  | { opcode: Opcode.THREAD_PARALLELISM; args: ThreadParallelismRequest }
+  | { opcode: Opcode.THREAD_SIGNAL; args: ThreadSignalRequest }
+  | { opcode: Opcode.FUTEX_WAIT; args: FutexWaitRequest }
+  | { opcode: Opcode.FUTEX_WAKE; args: FutexWakeRequest }
   | { opcode: Opcode.SOCK_OPEN; args: SockOpenRequest }
   | { opcode: Opcode.SOCK_BIND; args: SockBindRequest }
   | { opcode: Opcode.SOCK_CONNECT; args: SockConnectRequest }
@@ -461,6 +518,15 @@ export type BridgeResponse =
   | { opcode: Opcode.RANDOM_FILL; result: RandomFillResponse }
   | { opcode: Opcode.TTY_GET; result: TTYGetResponse }
   | { opcode: Opcode.TTY_SET; result: TTYSetResponse }
+  | { opcode: Opcode.THREAD_SPAWN; result: ThreadSpawnResponse }
+  | { opcode: Opcode.THREAD_JOIN; result: ThreadJoinResponse }
+  | { opcode: Opcode.THREAD_EXIT; result: ThreadExitResponse }
+  | { opcode: Opcode.THREAD_SLEEP; result: ThreadSleepResponse }
+  | { opcode: Opcode.THREAD_ID; result: ThreadIdResponse }
+  | { opcode: Opcode.THREAD_PARALLELISM; result: ThreadParallelismResponse }
+  | { opcode: Opcode.THREAD_SIGNAL; result: ThreadSignalResponse }
+  | { opcode: Opcode.FUTEX_WAIT; result: FutexWaitResponse }
+  | { opcode: Opcode.FUTEX_WAKE; result: FutexWakeResponse }
   | { opcode: Opcode.SOCK_OPEN; result: SockOpenResponse }
   | { opcode: Opcode.SOCK_BIND; result: SockBindResponse }
   | { opcode: Opcode.SOCK_CONNECT; result: SockConnectResponse }
@@ -615,6 +681,48 @@ export function encodeRequest(
     case Opcode.TTY_SET: {
       return 1 + encodeTTYState(view, region, 1, request.args.state);
     }
+    case Opcode.THREAD_SPAWN: {
+      view.setUint32(1, request.args.startArg >>> 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_JOIN: {
+      view.setUint32(1, request.args.tid >>> 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_EXIT: {
+      view.setInt32(1, request.args.code | 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_SLEEP: {
+      view.setBigInt64(1, request.args.durationNs, true);
+      return 9;
+    }
+    case Opcode.THREAD_ID:
+    case Opcode.THREAD_PARALLELISM: {
+      return 1;
+    }
+    case Opcode.THREAD_SIGNAL: {
+      view.setUint32(1, request.args.tid >>> 0, true);
+      view.setInt32(5, request.args.signo | 0, true);
+      return 9;
+    }
+    case Opcode.FUTEX_WAIT: {
+      view.setUint32(1, request.args.addr >>> 0, true);
+      view.setInt32(5, request.args.expected | 0, true);
+      // Layout: [tag u8][_pad u8 × 7][value i64 LE]. tag=0 → null timeout.
+      region[9] = request.args.timeoutNs === null ? 0 : 1;
+      view.setBigInt64(17, request.args.timeoutNs ?? 0n, true);
+      return 25;
+    }
+    case Opcode.FUTEX_WAKE: {
+      view.setUint32(1, request.args.addr >>> 0, true);
+      // count fits in i32 in practice; futex_wake_all sends MAX_SAFE_INTEGER
+      // which we clamp to UINT32_MAX over the wire (the host re-treats
+      // any non-positive value as zero).
+      const c = Math.min(request.args.count, 0xffffffff) >>> 0;
+      view.setUint32(5, c, true);
+      return 9;
+    }
     case Opcode.SOCK_OPEN: {
       view.setUint32(1, request.args.af, true);
       view.setUint32(5, request.args.type, true);
@@ -738,6 +846,43 @@ export function decodeRequest(
     case Opcode.TTY_SET: {
       const state = decodeTTYState(view, region, 1);
       return { opcode, args: { state } };
+    }
+    case Opcode.THREAD_SPAWN: {
+      const startArg = view.getUint32(1, true);
+      return { opcode, args: { startArg } };
+    }
+    case Opcode.THREAD_JOIN: {
+      const tid = view.getUint32(1, true);
+      return { opcode, args: { tid } };
+    }
+    case Opcode.THREAD_EXIT: {
+      const code = view.getInt32(1, true);
+      return { opcode, args: { code } };
+    }
+    case Opcode.THREAD_SLEEP: {
+      const durationNs = view.getBigInt64(1, true);
+      return { opcode, args: { durationNs } };
+    }
+    case Opcode.THREAD_ID:
+    case Opcode.THREAD_PARALLELISM: {
+      return { opcode, args: {} };
+    }
+    case Opcode.THREAD_SIGNAL: {
+      const tid = view.getUint32(1, true);
+      const signo = view.getInt32(5, true);
+      return { opcode, args: { tid, signo } };
+    }
+    case Opcode.FUTEX_WAIT: {
+      const addr = view.getUint32(1, true);
+      const expected = view.getInt32(5, true);
+      const hasTimeout = region[9] !== 0;
+      const timeoutNs = hasTimeout ? view.getBigInt64(17, true) : null;
+      return { opcode, args: { addr, expected, timeoutNs } };
+    }
+    case Opcode.FUTEX_WAKE: {
+      const addr = view.getUint32(1, true);
+      const count = view.getUint32(5, true);
+      return { opcode, args: { addr, count } };
     }
     case Opcode.SOCK_OPEN: {
       const af = view.getUint32(1, true);
@@ -894,6 +1039,38 @@ export function encodeResponse(
     }
     case Opcode.TTY_SET: {
       view.setUint32(1, response.result.result, true);
+      return 5;
+    }
+    case Opcode.THREAD_SPAWN: {
+      view.setUint32(1, response.result.tid >>> 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_JOIN: {
+      view.setInt32(1, response.result.exitCode | 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_EXIT:
+    case Opcode.THREAD_SLEEP: {
+      return 1;
+    }
+    case Opcode.THREAD_ID: {
+      view.setUint32(1, response.result.tid >>> 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_PARALLELISM: {
+      view.setUint32(1, response.result.value >>> 0, true);
+      return 5;
+    }
+    case Opcode.THREAD_SIGNAL: {
+      view.setUint32(1, response.result.result, true);
+      return 5;
+    }
+    case Opcode.FUTEX_WAIT: {
+      view.setUint32(1, response.result.value >>> 0, true);
+      return 5;
+    }
+    case Opcode.FUTEX_WAKE: {
+      view.setUint32(1, response.result.woken >>> 0, true);
       return 5;
     }
     case Opcode.SOCK_OPEN: {
@@ -1080,6 +1257,38 @@ export function decodeResponse(
     case Opcode.TTY_SET: {
       const result = view.getUint32(1, true) as Result;
       return { opcode, result: { result } };
+    }
+    case Opcode.THREAD_SPAWN: {
+      const tid = view.getUint32(1, true);
+      return { opcode, result: { tid } };
+    }
+    case Opcode.THREAD_JOIN: {
+      const exitCode = view.getInt32(1, true);
+      return { opcode, result: { exitCode } };
+    }
+    case Opcode.THREAD_EXIT:
+    case Opcode.THREAD_SLEEP: {
+      return { opcode, result: {} };
+    }
+    case Opcode.THREAD_ID: {
+      const tid = view.getUint32(1, true);
+      return { opcode, result: { tid } };
+    }
+    case Opcode.THREAD_PARALLELISM: {
+      const value = view.getUint32(1, true);
+      return { opcode, result: { value } };
+    }
+    case Opcode.THREAD_SIGNAL: {
+      const result = view.getUint32(1, true) as Result;
+      return { opcode, result: { result } };
+    }
+    case Opcode.FUTEX_WAIT: {
+      const value = view.getUint32(1, true);
+      return { opcode, result: { value } };
+    }
+    case Opcode.FUTEX_WAKE: {
+      const woken = view.getUint32(1, true);
+      return { opcode, result: { woken } };
     }
     case Opcode.SOCK_OPEN: {
       const fd = view.getUint32(1, true);
