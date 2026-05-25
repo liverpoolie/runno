@@ -95,6 +95,11 @@ jobs:
           fi
 
       - name: Fetch + build wasix suite binaries
+        # Only build when wasixcc is actually on PATH. The probe above
+        # already decided this is a graceful-skip run ("no built
+        # binaries") when the toolchain is unavailable; without this
+        # gate the build harder-fails the job, contradicting that path.
+        if: steps.probe.outputs.available == '1'
         working-directory: packages/wasi
         run: |
           npm run test:prepare:wasix-suite
