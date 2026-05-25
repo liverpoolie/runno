@@ -36,25 +36,85 @@ export type TTYState = {
   raw: boolean;
 };
 
-export type ProcForkResult = {
-  pid: number;
-  isChild: boolean;
+/**
+ * Result of `ProcProvider.fork()`.
+ *
+ * The runtime never observes the post-fork-guest path in v1 — the
+ * `InProcessProcProvider` returns `{ kind: "unsupported" }` from `fork()`,
+ * which the `proc_fork` syscall handler maps to `ENOSYS`. The other two
+ * variants exist so a future Asyncify-backed provider can surface the
+ * real fork shape: the parent observes `{ kind: "parent"; childPid }`,
+ * the (asyncify-resumed) child observes `{ kind: "child"; pid }`.
+ */
+export type ProcForkResult =
+  | { kind: "unsupported" }
+  | { kind: "child"; pid: number }
+  | { kind: "parent"; childPid: number };
+
+/**
+ * Plain-data fd-table entry handed across the proc-spawn boundary.
+ *
+ * The provider never sees a live `WebAssembly.Memory`, a live `WASIX`
+ * instance, or any pointer; all fd inheritance flows through this
+ * discriminated union of opaque references:
+ *
+ * - `stdin` / `stdout` / `stderr` — child receives the host's stdio
+ *   callbacks at fd 0/1/2.
+ * - `fs` — the parent's fd `parentFd` is dup-shared with the child.
+ *   Default semantics: the underlying `FileSystemProvider` is shared
+ *   between parent and child (issue: "shared FS, isolated fd-table"),
+ *   so the child can access the same drive entry through its own fd
+ *   number.
+ * - `pipe-read` / `pipe-write` — one end of a pipe pair allocated
+ *   inside the syscall handler. `pipeId` indexes into a realm-local
+ *   pipe registry the proc provider holds; the child's runtime
+ *   resolves `pipeId` back into a live `PipeEnd` at startup.
+ */
+export type ProcFdTableEntry =
+  | { kind: "stdin" }
+  | { kind: "stdout" }
+  | { kind: "stderr" }
+  | { kind: "fs"; parentFd: number }
+  | { kind: "pipe-read"; pipeId: number }
+  | { kind: "pipe-write"; pipeId: number };
+
+/** A single (childFd, entry) pair the child should install at startup. */
+export type ProcFdTableSlot = {
+  childFd: number;
+  entry: ProcFdTableEntry;
 };
 
 export type ProcSpawnRequest = {
+  /**
+   * Module URL the child should load. Empty string ("") means "same
+   * module as parent" — the in-process simulation re-runs the parent's
+   * compiled module against the child's fresh context.
+   */
   path: string;
   args: string[];
   env: Record<string, string>;
+  /** fd-table the child inherits at startup. */
+  fdTable: ProcFdTableSlot[];
+  /** Working directory for the child (informational; in-process simulation does not chdir). */
+  cwd?: string;
+  /** PID of the parent issuing the spawn. */
+  parentPid: number;
 };
 
 export type ProcExecRequest = {
+  /** Module URL the replacement guest should load. */
   path: string;
   args: string[];
   env: Record<string, string>;
+  /** fd-table the replacement guest inherits. */
+  fdTable: ProcFdTableSlot[];
+  cwd?: string;
 };
 
 export type ProcExitInfo = {
   exitCode: number;
+  /** Signal number that caused the exit, if killed by signal. */
+  signal?: number;
 };
 
 // ─── Filesystem supporting shapes ────────────────────────────────────────────
@@ -336,6 +396,45 @@ export interface SocketsProvider {
   status(fd: number): number;
 }
 
+/**
+ * Raw synchronous proc provider.
+ *
+ * Backs the wasix `proc_id` / `proc_parent` / `proc_fork` / `proc_spawn` /
+ * `proc_exec` / `proc_join` syscalls and the cross-pid `kill()` path that
+ * Slice 7's `SignalsProvider.signalThread` cannot reach on its own.
+ *
+ * The provider receives JS-native plain-data shapes — never a live
+ * `WASIX` instance, never a `WebAssembly.Memory`. The runtime serialises
+ * each spawn / exec request into `ProcSpawnRequest` / `ProcExecRequest`
+ * before invoking the provider so an out-of-realm host (a future async
+ * variant routed through the worker bridge) can replay the request
+ * verbatim.
+ *
+ * Conventions:
+ *
+ * - `id()` / `parentId()` — process and parent-process ids visible to
+ *   the guest. The root process sees `parentId() === 0`.
+ * - `fork()` — return `{ kind: "unsupported" }` to surface the wasmer
+ *   semantics for `ENOSYS` at the syscall boundary; an Asyncify-backed
+ *   provider may return `{ kind: "parent"; childPid }` or
+ *   `{ kind: "child"; pid }` to walk the post-fork code-path.
+ * - `spawn(req)` — construct a fresh child guest, return its pid.
+ * - `exec(req)` — replace the current guest with a fresh one bound to
+ *   the same pid. The runtime treats `exec` as terminal: after the
+ *   provider returns success, the calling guest's syscall frame
+ *   unwinds via the existing `proc_exit` path so the new guest's exit
+ *   becomes the effective exit of the original instance. Returning
+ *   `Result` lets the provider surface a pre-execve error (bad path,
+ *   etc) without unwinding.
+ * - `join(pid)` — block until `pid` exits and return its exit info.
+ *   "Block" here means cooperatively yield via the threads provider's
+ *   yield hooks — the in-process simulation drains the run queue
+ *   instead of holding the main JS event loop.
+ * - `kill(pid, signo)` — deliver `signo` to the target pid's signals
+ *   provider. This is the **single cross-provider interaction** in v1:
+ *   `InProcessProcProvider` looks up the target's `SignalsProvider`
+ *   from its proc table. Returns `ESRCH` for an unknown pid.
+ */
 export interface ProcProvider {
   id(): number;
   parentId(): number;
@@ -343,6 +442,7 @@ export interface ProcProvider {
   spawn(req: ProcSpawnRequest): number;
   exec(req: ProcExecRequest): Result;
   join(pid: number): ProcExitInfo;
+  kill(pid: number, signo: number): Result;
 }
 
 /**

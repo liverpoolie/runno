@@ -377,6 +377,88 @@ export const WASIX_TID_INVALID = 0;
 export const FUTEX_RET_WOKEN = 1;
 export const FUTEX_RET_TIMEOUT = 0;
 
+// ─── Proc ABI (Slice 8) ──────────────────────────────────────────────────────
+//
+// Mirrors the wasix-libc `proc_*` syscall layouts. Only the constants the
+// runtime actually marshals this slice are listed here; future slices append
+// as needed. See `wasix-org/wasix` (`wasix/witx/wasix_v1.witx`) for the
+// authoritative source.
+
+/**
+ * `__wasi_proc_spawn_fd_op_t` — per-child-fd action carried by `proc_spawn`.
+ *
+ * The wasix-libc struct is:
+ *
+ *   struct __wasi_proc_spawn_fd_op_t {
+ *     u32   fd;                    // child-side fd
+ *     u8    action;                // ProcSpawnFdAction value
+ *     u32   target_fd;             // for COPY: parent fd to dup
+ *   };
+ *
+ * Layout assumed by the wasix-libc generators is 12 bytes (alignment 4):
+ *   - fd          offset 0, size 4
+ *   - action      offset 4, size 1 + 3 padding
+ *   - target_fd   offset 8, size 4 (also doubles as the host-allocated
+ *                                   parent-fd that the runtime writes back
+ *                                   for PIPE_READ / PIPE_WRITE actions)
+ *
+ * The PIPE_READ / PIPE_WRITE actions instruct the runtime to allocate a
+ * fresh pipe pair: one end is installed in the child's fd-table at
+ * `fd`, the matching end is installed in the parent's fd-table and its
+ * fd-number written back into `target_fd` so the calling guest can use
+ * the parent end after `proc_spawn` returns.
+ */
+export const PROC_SPAWN_FD_OP_SIZE = 12;
+export const PROC_SPAWN_FD_OP_FD_OFFSET = 0;
+export const PROC_SPAWN_FD_OP_ACTION_OFFSET = 4;
+export const PROC_SPAWN_FD_OP_TARGET_FD_OFFSET = 8;
+
+export enum ProcSpawnFdAction {
+  /** Mark the child's fd as closed at startup. */
+  CLOSE = 0,
+  /** dup `target_fd` from the parent into the child at `fd`. */
+  COPY = 1,
+  /** Allocate a pipe pair; child gets the read end at `fd`. */
+  PIPE_READ = 2,
+  /** Allocate a pipe pair; child gets the write end at `fd`. */
+  PIPE_WRITE = 3,
+}
+
+/**
+ * `__wasi_exit_status_t` — packed exit-status word returned from `proc_join`.
+ *
+ * Convention mirrors POSIX `wait(2)`:
+ *   - low 8 bits: exit code (when not killed by signal)
+ *   - bits 8..15: signal number (when killed by signal; low bits = 0)
+ *   - bit 7    : "killed by signal" flag (set when a signal terminated)
+ *
+ * The runtime packs `ProcExitInfo.{exitCode, signal}` into this layout
+ * before writing it to the guest. Wasix-libc decodes it back the same way
+ * it decodes a POSIX `wait` status word.
+ */
+export const PROC_EXIT_STATUS_SIZE = 4;
+export function packExitStatus(exitCode: number, signal?: number): number {
+  if (signal && signal > 0) {
+    return ((signal & 0xff) << 8) | 0x80;
+  }
+  return exitCode & 0xff;
+}
+
+/**
+ * `__wasi_pipe_t` — fd pair returned from `fd_pipe`.
+ *
+ * Layout (size 8, alignment 4):
+ *   - read_fd   offset 0, size 4
+ *   - write_fd  offset 4, size 4
+ *
+ * Matches the wasix-libc generated struct order: the read end comes first
+ * so a guest C declaration `int rfd, wfd; fd_pipe(&rfd, &wfd)` lines up
+ * with a single `__wasi_pipe_t` write at the same address.
+ */
+export const PIPE_FDS_SIZE = 8;
+export const PIPE_FDS_READ_OFFSET = 0;
+export const PIPE_FDS_WRITE_OFFSET = 4;
+
 // ─── Error class ─────────────────────────────────────────────────────────────
 
 // Thrown by provider implementations to signal a specific WASIX errno.

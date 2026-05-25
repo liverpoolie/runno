@@ -17,6 +17,8 @@ import {
   CooperativeThreadsProvider,
   SimulatedFutexProvider,
   SelfSignalProvider,
+  InProcessProcProvider,
+  createPipe,
   startThread,
 } from "../lib/main.js";
 import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
@@ -37,6 +39,8 @@ import * as BridgeTestApi from "../lib/wasix/worker/bridge.js";
 (window as any)["CooperativeThreadsProvider"] = CooperativeThreadsProvider;
 (window as any)["SimulatedFutexProvider"] = SimulatedFutexProvider;
 (window as any)["SelfSignalProvider"] = SelfSignalProvider;
+(window as any)["InProcessProcProvider"] = InProcessProcProvider;
+(window as any)["createPipe"] = createPipe;
 (window as any)["startThread"] = startThread;
 
 // Test-only: expose the bridge protocol primitives and `Result` / `WASIXError`
