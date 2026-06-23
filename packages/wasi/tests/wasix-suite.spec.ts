@@ -33,10 +33,16 @@ import { test, expect } from "@playwright/test";
 import type {
   WASIX,
   WASIXContext,
+  WASIXWorkerHost,
   WASIDriveFileSystemProvider,
   WASIFS,
 } from "../lib/main";
-import { WASIX_SUITE_BIN_DIR, WASIX_VENDOR_DIR } from "./wasix-suite.constants";
+import {
+  WASIX_SUITE_BIN_DIR,
+  WASIX_SUITE_MODES,
+  WASIX_VENDOR_DIR,
+  type WASIXSuiteMode,
+} from "./wasix-suite.constants";
 import type { SkipEntry } from "./wasix-suite.skip";
 import { WASIX_SUITE_SKIPS } from "./wasix-suite.skip";
 
@@ -313,103 +319,124 @@ test.describe("wasix integration suite (wasmer/tests/wasix)", () => {
 
     const plan = planForTest(name);
 
-    test(`wasix-suite: ${name}`, async ({ page }) => {
-      if (skip) {
-        test.info().annotations.push({
-          type: "wasix-skip",
-          description: skip.note
-            ? `${skip.reason} — ${skip.note}`
-            : skip.reason,
-        });
-        test.fixme(true, `wasix-skip:${skip.reason}`);
-      }
-
-      const result = await page.evaluate(async (p: TestPlan) => {
-        while (
-          (window as unknown as { WASIX?: unknown })["WASIX"] === undefined
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
+    for (const mode of WASIX_SUITE_MODES) {
+      test(`wasix-suite [${mode}]: ${name}`, async ({ page }) => {
+        if (skip) {
+          test.info().annotations.push({
+            type: "wasix-skip",
+            description: skip.note
+              ? `${skip.reason} — ${skip.note}`
+              : skip.reason,
+          });
+          test.fixme(true, `wasix-skip:${skip.reason}`);
         }
 
-        const w = window as unknown as {
-          WASIX: typeof WASIX;
-          WASIXContext: typeof WASIXContext;
-          WASIDriveFileSystemProvider: typeof WASIDriveFileSystemProvider;
-        };
-        const W = w.WASIX;
-        const WC = w.WASIXContext;
-        const WD = w.WASIDriveFileSystemProvider;
+        const result = await page.evaluate(
+          async (input: { plan: TestPlan; mode: WASIXSuiteMode }) => {
+            const p = input.plan;
+            while (
+              (window as unknown as { WASIX?: unknown })["WASIX"] === undefined
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
 
-        // Seed a fresh WASIFS under /home for this run — the wasmer
-        // runner mounts `--volume .` at /home (wasix-libc's default
-        // cwd), so per-test inputs land at /home/<rel-path>. The
-        // provider exposes /home as a preopen at fd 4 alongside the
-        // implicit fd 3 = ".", and PWD primes the libc startup
-        // resolver before it falls back to getcwd().
-        const now = new Date();
-        const fs: WASIFS = {};
-        for (const input of p.inputs) {
-          const guestPath = `/home/${input.path}`;
-          fs[guestPath] = {
-            path: guestPath,
-            timestamps: { access: now, modification: now, change: now },
-            mode: "binary",
-            content: new Uint8Array(input.bytes),
-          };
-        }
+            const w = window as unknown as {
+              WASIX: typeof WASIX;
+              WASIXContext: typeof WASIXContext;
+              WASIXWorkerHost: typeof WASIXWorkerHost;
+              WASIDriveFileSystemProvider: typeof WASIDriveFileSystemProvider;
+            };
 
-        // Pre-seed each `--volume host:guest` target plus the implicit
-        // `/tmp` MemFS mount as empty directories. The WASIDrive uses
-        // `.runno` sentinel files to model directory presence, so the
-        // mount points appear as real dirs to subsequent path ops
-        // (POSIX parent-exists checks). Mirrors what the wasmer runner
-        // provides without requiring per-test harness wiring.
-        for (const guest of ["/tmp", ...p.mounts]) {
-          const trimmed = guest.endsWith("/") ? guest.slice(0, -1) : guest;
-          if (!trimmed) continue;
-          const marker = `${trimmed}/.runno`;
-          fs[marker] = {
-            path: marker,
-            timestamps: { access: now, modification: now, change: now },
-            mode: "string",
-            content: "",
-          };
-        }
+            // Seed a fresh WASIFS under /home for this run — the wasmer
+            // runner mounts `--volume .` at /home (wasix-libc's default
+            // cwd), so per-test inputs land at /home/<rel-path>. The
+            // provider exposes /home as a preopen at fd 4 alongside the
+            // implicit fd 3 = ".", and PWD primes the libc startup
+            // resolver before it falls back to getcwd().
+            const now = new Date();
+            const fs: WASIFS = {};
+            for (const input of p.inputs) {
+              const guestPath = `/home/${input.path}`;
+              fs[guestPath] = {
+                path: guestPath,
+                timestamps: { access: now, modification: now, change: now },
+                mode: "binary",
+                content: new Uint8Array(input.bytes),
+              };
+            }
 
-        let stdout = "";
-        let stderr = "";
+            // Pre-seed each `--volume host:guest` target plus the implicit
+            // `/tmp` MemFS mount as empty directories. The WASIDrive uses
+            // `.runno` sentinel files to model directory presence, so the
+            // mount points appear as real dirs to subsequent path ops
+            // (POSIX parent-exists checks). Mirrors what the wasmer runner
+            // provides without requiring per-test harness wiring.
+            for (const guest of ["/tmp", ...p.mounts]) {
+              const trimmed = guest.endsWith("/") ? guest.slice(0, -1) : guest;
+              if (!trimmed) continue;
+              const marker = `${trimmed}/.runno`;
+              fs[marker] = {
+                path: marker,
+                timestamps: { access: now, modification: now, change: now },
+                mode: "string",
+                content: "",
+              };
+            }
 
-        const wasiResult = await W.start(
-          fetch(p.wasmUrl),
-          new WC({
-            args: p.args,
-            env: { PWD: "/home" },
-            stdout: (out: string) => {
-              stdout += out;
-            },
-            stderr: (err: string) => {
-              stderr += err;
-            },
-            stdin: () => null,
-            fs: new WD(fs, {
-              preopens: [{ name: "/home", prefix: "/home/" }],
-            }),
-          }),
+            const preopens = [{ name: "/home", prefix: "/home/" }];
+
+            let stdout = "";
+            let stderr = "";
+
+            if (input.mode === "main") {
+              const wasiResult = await w.WASIX.start(
+                fetch(p.wasmUrl),
+                new w.WASIXContext({
+                  args: p.args,
+                  env: { PWD: "/home" },
+                  stdout: (out: string) => {
+                    stdout += out;
+                  },
+                  stderr: (err: string) => {
+                    stderr += err;
+                  },
+                  stdin: () => null,
+                  fs: new w.WASIDriveFileSystemProvider(fs, { preopens }),
+                }),
+              );
+              return { exitCode: wasiResult.exitCode, stdout, stderr };
+            }
+
+            // worker mode — WASIXWorkerHost spawns a dedicated worker and
+            // drives it through the bridge. fs and preopens cross postMessage
+            // as plain data; the worker reconstructs the
+            // WASIDriveFileSystemProvider with the same preopen config.
+            const host = new w.WASIXWorkerHost(fetch(p.wasmUrl), {
+              args: p.args,
+              env: { PWD: "/home" },
+              fs,
+              preopens,
+              stdout: (out: string) => {
+                stdout += out;
+              },
+              stderr: (err: string) => {
+                stderr += err;
+              },
+              stdin: () => null,
+            });
+            const workerResult = await host.start();
+            return { exitCode: workerResult.exitCode, stdout, stderr };
+          },
+          { plan, mode },
         );
 
-        return {
-          exitCode: wasiResult.exitCode,
-          stdout,
-          stderr,
-        };
-      }, plan);
-
-      expect(
-        result.exitCode,
-        `args: ${JSON.stringify(plan.args)}\ninputs: ${plan.inputs
-          .map((i) => i.path)
-          .join(", ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-      ).toBe(0);
-    });
+        expect(
+          result.exitCode,
+          `mode: ${mode}\nargs: ${JSON.stringify(plan.args)}\ninputs: ${plan.inputs
+            .map((i) => i.path)
+            .join(", ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+        ).toBe(0);
+      });
+    }
   }
 });
