@@ -22,19 +22,9 @@ import {
   type ProviderPreopen,
 } from "../providers/ergonomic/filesystem-provider.js";
 import type { WASIFS, WASIXExecutionResult } from "../../types.js";
-import type {
-  ClockProvider,
-  RandomProvider,
-  TTYProvider,
-  TTYState,
-} from "../providers.js";
-import { ClockId, Result } from "../wasix-32v1.js";
-import {
-  Opcode,
-  callBridgeSync,
-  type BridgeResponse,
-  type TTYStateWire,
-} from "./bridge.js";
+import type { ClockProvider, RandomProvider } from "../providers.js";
+import { ClockId } from "../wasix-32v1.js";
+import { Opcode, callBridgeSync, type BridgeResponse } from "./bridge.js";
 
 // ─── Messages ──────────────────────────────────────────────────────────────
 
@@ -199,55 +189,6 @@ function bridgeRandomProvider(sharedBuffer: SharedArrayBuffer): RandomProvider {
   };
 }
 
-function bridgeTTYProvider(sharedBuffer: SharedArrayBuffer): TTYProvider {
-  return {
-    get(): TTYState {
-      const response = expectOpcode(
-        callBridgeSync(sharedBuffer, {
-          opcode: Opcode.TTY_GET,
-          args: {},
-        }),
-        Opcode.TTY_GET,
-      );
-      return wireToTTYState(response.result.state);
-    },
-    set(state: TTYState): Result {
-      const response = expectOpcode(
-        callBridgeSync(sharedBuffer, {
-          opcode: Opcode.TTY_SET,
-          args: { state: ttyStateToWire(state) },
-        }),
-        Opcode.TTY_SET,
-      );
-      return response.result.result;
-    },
-  };
-}
-
-function ttyStateToWire(state: TTYState): TTYStateWire {
-  return {
-    cols: state.cols,
-    rows: state.rows,
-    pixelWidth: state.pixelWidth,
-    pixelHeight: state.pixelHeight,
-    echo: state.echo,
-    lineBuffered: state.lineBuffered,
-    raw: state.raw,
-  };
-}
-
-function wireToTTYState(wire: TTYStateWire): TTYState {
-  return {
-    cols: wire.cols,
-    rows: wire.rows,
-    pixelWidth: wire.pixelWidth,
-    pixelHeight: wire.pixelHeight,
-    echo: wire.echo,
-    lineBuffered: wire.lineBuffered,
-    raw: wire.raw,
-  };
-}
-
 /**
  * Build a sync stdin callback out of the STDIN_READ opcode. The inner WASI
  * (inside the inner WASIX) calls stdin on every read — each call is one
@@ -318,9 +259,6 @@ async function runGuest(
   const random: RandomProvider | undefined = asyncSet.has("random")
     ? bridgeRandomProvider(msg.sharedBuffer)
     : undefined;
-  const tty: TTYProvider | undefined = asyncSet.has("tty")
-    ? bridgeTTYProvider(msg.sharedBuffer)
-    : undefined;
 
   // Reconstruct the WASIXContext. `stdin` — if the host configured one — is
   // wired through the bridge; stdout/stderr/debug stream back via
@@ -359,7 +297,6 @@ async function runGuest(
     },
     clock,
     random,
-    tty,
   });
 
   const wasix = new WASIX(context);

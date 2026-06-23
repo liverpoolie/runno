@@ -38,7 +38,6 @@ import type {
   SocketsProvider,
   ThreadsProvider,
   TTYProvider,
-  TTYState,
 } from "./providers.js";
 import type { ProviderPreopen } from "./providers/ergonomic/filesystem-provider.js";
 import type {
@@ -62,7 +61,6 @@ import {
   writeBridgeResponse,
   writeBridgeWasixError,
   type BridgeRequest,
-  type TTYStateWire,
 } from "./worker/bridge.js";
 import type {
   AsyncBridgedSlot,
@@ -462,31 +460,6 @@ export class WASIXWorkerHost {
         });
         return;
       }
-      case Opcode.TTY_GET: {
-        if (!this.options.tty) {
-          throw new WASIXError(Result.ENOSYS);
-        }
-        const state = await raceSignal(this.options.tty.get(), signal);
-        writeBridgeResponse(sharedBuffer, {
-          opcode: Opcode.TTY_GET,
-          result: { state: ttyStateToWire(state) },
-        });
-        return;
-      }
-      case Opcode.TTY_SET: {
-        if (!this.options.tty) {
-          throw new WASIXError(Result.ENOSYS);
-        }
-        const result = await raceSignal(
-          this.options.tty.set(wireToTTYState(request.args.state)),
-          signal,
-        );
-        writeBridgeResponse(sharedBuffer, {
-          opcode: Opcode.TTY_SET,
-          result: { result },
-        });
-        return;
-      }
     }
   }
 }
@@ -569,13 +542,12 @@ function detectAsyncSlots(options: WASIXWorkerHostOptions): AsyncBridgedSlot[] {
  * configuration at startup with a named ENOSYS instead.
  *
  * Each later slice that lands its opcode set adds its slot to this list.
- * Slice 4: clock, random, tty.
- * Slice 5+ (planned): threads, futex, signals, sockets, proc.
+ * Slice 4: clock, random.
+ * Slice 5+ (planned): tty, threads, futex, signals, sockets, proc.
  */
 const SLICE_4_SUPPORTED_SLOTS: ReadonlySet<AsyncBridgedSlot> = new Set([
   "clock",
   "random",
-  "tty",
 ]);
 
 function assertAsyncSlotsSupported(options: WASIXWorkerHostOptions): void {
@@ -653,31 +625,4 @@ function raceSignal<T>(value: T | Promise<T>, signal: AbortSignal): Promise<T> {
       },
     );
   });
-}
-
-/** Wire ↔ TTYState conversion. The two types are structurally identical;
- *  this exists so a future TTYState additions doesn't silently misalign
- *  the bridge encoding. */
-function ttyStateToWire(state: TTYState): TTYStateWire {
-  return {
-    cols: state.cols,
-    rows: state.rows,
-    pixelWidth: state.pixelWidth,
-    pixelHeight: state.pixelHeight,
-    echo: state.echo,
-    lineBuffered: state.lineBuffered,
-    raw: state.raw,
-  };
-}
-
-function wireToTTYState(wire: TTYStateWire): TTYState {
-  return {
-    cols: wire.cols,
-    rows: wire.rows,
-    pixelWidth: wire.pixelWidth,
-    pixelHeight: wire.pixelHeight,
-    echo: wire.echo,
-    lineBuffered: wire.lineBuffered,
-    raw: wire.raw,
-  };
 }

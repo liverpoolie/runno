@@ -78,8 +78,8 @@ export const STATE_RESPONSE_READY = 2;
 
 /**
  * Smallest viable per-region byte length. CLOCK_NOW's response is 9 bytes
- * (tag + u64), TTY_GET's response is 20 bytes (tag + 4×u32 + 3×u8), and
- * RANDOM_FILL is variable up to the region cap. 32 bytes leaves a defensible
+ * (tag + u64) and RANDOM_FILL is variable up to the region cap. 32 bytes
+ * leaves a defensible
  * floor for every opcode landed this slice and gives room for an error tag
  * payload (tag + u32 length + ~20 bytes of message) on the smallest legal
  * configuration. Hosts allocating their own buffer below this floor get a
@@ -118,15 +118,12 @@ export const DEFAULT_BRIDGE_BUFFER_BYTES =
  *   `byteLength` random bytes and returns them; the worker shim copies them
  *   into the caller's buffer (chunking when the buffer exceeds the region
  *   cap).
- * - `TTY_GET` / `TTY_SET` — async-capable `TTYProvider.get()` / `.set(state)`.
  */
 export enum Opcode {
   DEBUG = 1,
   STDIN_READ = 2,
   CLOCK_NOW = 3,
   RANDOM_FILL = 4,
-  TTY_GET = 5,
-  TTY_SET = 6,
 }
 
 // ─── Response tags ─────────────────────────────────────────────────────────
@@ -194,37 +191,17 @@ export type RandomFillRequest = { byteLength: number };
 /** Random bytes filled by the host. Length is implicit in `bytes.byteLength`. */
 export type RandomFillResponse = { bytes: Uint8Array };
 
-export type TTYStateWire = {
-  cols: number;
-  rows: number;
-  pixelWidth: number;
-  pixelHeight: number;
-  echo: boolean;
-  lineBuffered: boolean;
-  raw: boolean;
-};
-
-export type TTYGetRequest = Record<string, never>;
-export type TTYGetResponse = { state: TTYStateWire };
-
-export type TTYSetRequest = { state: TTYStateWire };
-export type TTYSetResponse = { result: Result };
-
 export type BridgeRequest =
   | { opcode: Opcode.DEBUG; args: DebugRequest }
   | { opcode: Opcode.STDIN_READ; args: StdinReadRequest }
   | { opcode: Opcode.CLOCK_NOW; args: ClockNowRequest }
-  | { opcode: Opcode.RANDOM_FILL; args: RandomFillRequest }
-  | { opcode: Opcode.TTY_GET; args: TTYGetRequest }
-  | { opcode: Opcode.TTY_SET; args: TTYSetRequest };
+  | { opcode: Opcode.RANDOM_FILL; args: RandomFillRequest };
 
 export type BridgeResponse =
   | { opcode: Opcode.DEBUG; result: DebugResponse }
   | { opcode: Opcode.STDIN_READ; result: StdinReadResponse }
   | { opcode: Opcode.CLOCK_NOW; result: ClockNowResponse }
-  | { opcode: Opcode.RANDOM_FILL; result: RandomFillResponse }
-  | { opcode: Opcode.TTY_GET; result: TTYGetResponse }
-  | { opcode: Opcode.TTY_SET; result: TTYSetResponse };
+  | { opcode: Opcode.RANDOM_FILL; result: RandomFillResponse };
 
 // ─── Region accessors ──────────────────────────────────────────────────────
 
@@ -305,8 +282,6 @@ export function createBridgeBuffer(
  *   STDIN_READ  | u32 maxByteLength
  *   CLOCK_NOW   | u32 clockId
  *   RANDOM_FILL | u32 byteLength
- *   TTY_GET     | (no args)
- *   TTY_SET     | TTYStateWire (4×u32 + 3×u8)
  */
 export function encodeRequest(
   region: Uint8Array,
@@ -357,12 +332,6 @@ export function encodeRequest(
       view.setUint32(1, request.args.byteLength, true);
       return 5;
     }
-    case Opcode.TTY_GET: {
-      return 1;
-    }
-    case Opcode.TTY_SET: {
-      return 1 + encodeTTYState(view, region, 1, request.args.state);
-    }
   }
 }
 
@@ -401,13 +370,6 @@ export function decodeRequest(
       const byteLength = view.getUint32(1, true);
       return { opcode, args: { byteLength } };
     }
-    case Opcode.TTY_GET: {
-      return { opcode, args: {} };
-    }
-    case Opcode.TTY_SET: {
-      const state = decodeTTYState(view, region, 1);
-      return { opcode, args: { state } };
-    }
     default: {
       const neverCheck: never = opcode;
       throw new Error(`bridge: unknown opcode (${String(neverCheck)})`);
@@ -423,8 +385,6 @@ export function decodeRequest(
  *   STDIN_READ  | u8 hasText (0 = null/EOF, 1 = string) | u32 length? | UTF-8?
  *   CLOCK_NOW   | u64 timeNs
  *   RANDOM_FILL | u32 byteLength | raw bytes
- *   TTY_GET     | TTYStateWire (4×u32 + 3×u8)
- *   TTY_SET     | u32 result
  */
 export function encodeResponse(
   region: Uint8Array,
@@ -465,13 +425,6 @@ export function encodeResponse(
       view.setUint32(1, bytes.byteLength, true);
       region.set(bytes, 5);
       return 5 + bytes.byteLength;
-    }
-    case Opcode.TTY_GET: {
-      return 1 + encodeTTYState(view, region, 1, response.result.state);
-    }
-    case Opcode.TTY_SET: {
-      view.setUint32(1, response.result.result, true);
-      return 5;
     }
   }
 }
@@ -583,56 +536,11 @@ export function decodeResponse(
       bytes.set(region.subarray(5, 5 + byteLength));
       return { opcode, result: { bytes } };
     }
-    case Opcode.TTY_GET: {
-      const state = decodeTTYState(view, region, 1);
-      return { opcode, result: { state } };
-    }
-    case Opcode.TTY_SET: {
-      const result = view.getUint32(1, true) as Result;
-      return { opcode, result: { result } };
-    }
     default: {
       const neverCheck: never = opcode;
       throw new Error(`bridge: unknown opcode (${String(neverCheck)})`);
     }
   }
-}
-
-/**
- * TTYState wire format — 4 little-endian u32s (cols, rows, pixelWidth,
- * pixelHeight) followed by 3 u8 flags (echo, lineBuffered, raw). Returns
- * bytes written (always 19).
- */
-function encodeTTYState(
-  view: DataView,
-  region: Uint8Array,
-  offset: number,
-  state: TTYStateWire,
-): number {
-  view.setUint32(offset, state.cols, true);
-  view.setUint32(offset + 4, state.rows, true);
-  view.setUint32(offset + 8, state.pixelWidth, true);
-  view.setUint32(offset + 12, state.pixelHeight, true);
-  region[offset + 16] = state.echo ? 1 : 0;
-  region[offset + 17] = state.lineBuffered ? 1 : 0;
-  region[offset + 18] = state.raw ? 1 : 0;
-  return 19;
-}
-
-function decodeTTYState(
-  view: DataView,
-  region: Uint8Array,
-  offset: number,
-): TTYStateWire {
-  return {
-    cols: view.getUint32(offset, true),
-    rows: view.getUint32(offset + 4, true),
-    pixelWidth: view.getUint32(offset + 8, true),
-    pixelHeight: view.getUint32(offset + 12, true),
-    echo: region[offset + 16] !== 0,
-    lineBuffered: region[offset + 17] !== 0,
-    raw: region[offset + 18] !== 0,
-  };
 }
 
 // ─── Sync / async call primitives ──────────────────────────────────────────
