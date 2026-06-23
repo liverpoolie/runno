@@ -34,7 +34,7 @@ export type Sync<T> = {
 
 export type WASIXContextOptions = {
   // File / process basics — same semantics as WASIContext
-  fs: FileSystemProvider;
+  fs: Sync<FileSystemProvider>;
   args: string[];
   env: Record<string, string>;
   stdin: (maxByteLength: number) => string | null;

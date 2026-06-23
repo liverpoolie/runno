@@ -16,6 +16,7 @@ import type { WASIXContextOptions } from "./wasix-context.js";
 import type { WASIXWorkerHostOptions } from "./wasix-worker-host.js";
 import type {
   ClockProvider,
+  FileSystemProvider,
   RandomProvider,
   TTYProvider,
   ThreadsProvider,
@@ -26,6 +27,7 @@ import type {
 } from "./providers.js";
 import type {
   AsyncClockProvider,
+  AsyncFileSystemProvider,
   AsyncRandomProvider,
   AsyncTTYProvider,
   AsyncThreadsProvider,
@@ -37,6 +39,7 @@ import type {
 
 // ─── Positive cases — sync providers on both entry points ──────────────────
 
+declare const syncFs: FileSystemProvider;
 declare const syncClock: ClockProvider;
 declare const syncRandom: RandomProvider;
 declare const syncTTY: TTYProvider;
@@ -47,6 +50,7 @@ declare const syncSockets: SocketsProvider;
 declare const syncProc: ProcProvider;
 
 const mainSync: Partial<WASIXContextOptions> = {
+  fs: syncFs,
   clock: syncClock,
   random: syncRandom,
   tty: syncTTY,
@@ -58,6 +62,7 @@ const mainSync: Partial<WASIXContextOptions> = {
 };
 
 const workerSync: WASIXWorkerHostOptions = {
+  fs: syncFs,
   clock: syncClock,
   random: syncRandom,
   tty: syncTTY,
@@ -70,6 +75,7 @@ const workerSync: WASIXWorkerHostOptions = {
 
 // ─── Positive cases — async-capable on WASIXWorkerHost ─────────────────────
 
+declare const asyncFs: AsyncFileSystemProvider;
 declare const asyncClock: AsyncClockProvider;
 declare const asyncRandom: AsyncRandomProvider;
 declare const asyncTTY: AsyncTTYProvider;
@@ -80,6 +86,7 @@ declare const asyncSockets: AsyncSocketsProvider;
 declare const asyncProc: AsyncProcProvider;
 
 const workerAsync: WASIXWorkerHostOptions = {
+  fs: asyncFs,
   clock: asyncClock,
   random: asyncRandom,
   tty: asyncTTY,
@@ -107,6 +114,8 @@ const workerAsync: WASIXWorkerHostOptions = {
 // purely a missing compile-time error on the main-thread `WASIX(...)`
 // constructor when an `AsyncRandomProvider` is passed.
 
+// @ts-expect-error — AsyncFileSystemProvider rejected (fdRead() returns number)
+const badFs: Partial<WASIXContextOptions> = { fs: asyncFs };
 // @ts-expect-error — AsyncClockProvider is not assignable to Sync<ClockProvider>
 const badClock: Partial<WASIXContextOptions> = { clock: asyncClock };
 // @ts-expect-error — AsyncTTYProvider rejected (get() returns TTYState)
@@ -131,6 +140,7 @@ export const _types = {
   // asyncRandom is structurally compatible with the sync slot due to
   // void-subtyping; see the comment block above.
   asyncRandomOk: { random: asyncRandom } satisfies Partial<WASIXContextOptions>,
+  badFs,
   badClock,
   badTTY,
   badThreads,

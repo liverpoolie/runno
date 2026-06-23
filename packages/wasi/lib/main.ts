@@ -42,6 +42,7 @@ export type {
 export type {
   AsyncCapable,
   AsyncClockProvider,
+  AsyncFileSystemProvider,
   AsyncRandomProvider,
   AsyncTTYProvider,
   AsyncThreadsProvider,

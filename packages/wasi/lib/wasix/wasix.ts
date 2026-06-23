@@ -8,6 +8,7 @@ import {
   PreopenType,
   Result,
   WASIXError,
+  Whence,
 } from "./wasix-32v1.js";
 import { WASIXContext, WASIXContextOptions } from "./wasix-context.js";
 import {
@@ -230,12 +231,31 @@ export class WASIX {
     // (e.g. ENOTCAPABLE for "not present") and don't synthesize the
     // POSIX-shaped readdir entries (`.` / `..`, no `.runno`). Route
     // them through the WASIX provider so the translation is uniform.
+    // The preview1 impls in wasi.ts use a SEPARATE `WASIDrive` instance
+    // owned by `this.wasi`. We only point `this.wasi.drive` at the
+    // provider's drive when the host hands us a `WASIDriveFileSystemProvider`
+    // (see constructor) — for any other provider, including the worker-side
+    // SAB bridge shim used by WASIXWorkerHost in async-fs mode, the inner
+    // preview1 drive stays empty. wasix-libc reaches into preview1 for
+    // most fd-level ops (fd_close / fd_filestat_get / fd_fdstat_get /
+    // fd_read / fd_write / fd_seek / fd_pwrite), so without these
+    // overrides those calls hit the empty drive and fail with EBADF on
+    // any fd the provider opened. Route them through `this.fs` so a
+    // bridged provider sees the same syscalls a colocated drive does.
     const preview1Overrides = {
       ...preview1,
       proc_exit: procExit,
+      fd_close: this.wasix_fd_close.bind(this),
+      fd_fdstat_get: this.wasix_fd_fdstat_get.bind(this),
+      fd_fdstat_set_flags: this.wasix_fd_fdstat_set_flags.bind(this),
+      fd_filestat_get: this.wasix_fd_filestat_get.bind(this),
       fd_prestat_get: this.wasix_fd_prestat_get.bind(this),
       fd_prestat_dir_name: this.wasix_fd_prestat_dir_name.bind(this),
+      fd_pwrite: this.wasix_fd_pwrite.bind(this),
+      fd_read: this.wasix_fd_read.bind(this),
       fd_readdir: this.wasix_fd_readdir.bind(this),
+      fd_seek: this.wasix_fd_seek.bind(this),
+      fd_write: this.wasix_fd_write.bind(this),
       path_filestat_get: this.wasix_path_filestat_get.bind(this),
       path_open: this.wasix_path_open.bind(this),
       path_create_directory: this.wasix_path_create_directory.bind(this),
@@ -418,6 +438,44 @@ export class WASIX {
       return Result.SUCCESS;
     } catch (e) {
       return mapError(e, this.context.debug, "fd_write");
+    }
+  }
+
+  /**
+   * Preview1 fd_pwrite emulated via fdSeek + fdWrite + fdSeek so the
+   * provider doesn't need a dedicated `pwrite` method. POSIX pwrite is
+   * not supposed to perturb the file's seek position; we save the
+   * position with SEEK_CUR before writing and restore it after. Single
+   * guest, single thread, so no concurrent-callers race to worry about.
+   *
+   * wasix_32v1.fd_pwrite stays ENOSYS — wasix-libc 0.4.3 binaries reach
+   * for the preview1 entry, and a real wasix-32v1 implementation lands
+   * with the fd-table extraction.
+   */
+  private wasix_fd_pwrite(
+    fd: number,
+    ciovsPtr: number,
+    ciovsLen: number,
+    offset: bigint,
+    retptr: number,
+  ): number {
+    try {
+      if (fd === 0) return Result.ENOTSUP;
+      // STDOUT/STDERR ignore the offset, matching libc emulation when
+      // pwrite is issued against a stream.
+      if (fd === 1 || fd === 2) {
+        return this.wasi.fd_write(fd, ciovsPtr, ciovsLen, retptr);
+      }
+      const view = new DataView(this.memory.buffer);
+      const iovs = readIOVectors(view, ciovsPtr, ciovsLen);
+      const savedPos = this.fs.fdSeek(fd, 0n, Whence.CUR);
+      this.fs.fdSeek(fd, offset, Whence.SET);
+      const bytesWritten = this.fs.fdWrite(fd, iovs);
+      this.fs.fdSeek(fd, savedPos, Whence.SET);
+      view.setUint32(retptr, bytesWritten, true);
+      return Result.SUCCESS;
+    } catch (e) {
+      return mapError(e, this.context.debug, "fd_pwrite");
     }
   }
 
