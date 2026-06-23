@@ -1,0 +1,162 @@
+name: wasix integration suite
+"on":
+  pull_request:
+    paths:
+      - "packages/wasi/**"
+      - ".github/workflows/wasix-suite.yml"
+  push:
+    branches:
+      - main
+      - "wasix/**"
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install root dependencies
+        run: npm run bootstrap
+
+      # Cache the vendored wasmer tarball extract and the built .wasm
+      # artifacts. The vendor checkout is keyed on the pinned SHA (held in
+      # the constants module), so bumping the SHA invalidates it. The
+      # built binaries under `public/bin/wasix-tests/` are keyed on the
+      # constants + build script + this workflow, so a toolchain or
+      # include-list bump forces a rebuild. The wasixcc toolchain itself
+      # is cached internally by the `wasix-org/wasixcc` action.
+      - name: Cache vendored wasmer checkout
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/tests/wasix-vendor
+          key: >-
+            wasmer-vendor-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts')
+            }}
+
+      - name: Cache built wasix-suite binaries
+        uses: actions/cache@v4
+        with:
+          path: packages/wasi/public/bin/wasix-tests
+          key: >-
+            wasix-bins-${{ runner.os }}-${{
+              hashFiles('packages/wasi/tests/wasix-suite.constants.ts',
+                        'packages/wasi/tests/build-wasix-suite.ts',
+                        '.github/workflows/wasix-suite.yml')
+            }}
+
+      - name: Install wasixcc toolchain
+        # Pulls a pinned wasixcc binary, the wasix-libc sysroot and the
+        # WASIX-aware LLVM toolchain into a managed cache, then puts
+        # `wasixcc` on PATH for the build harness. `sysroot-tag` is pinned
+        # to a real wasix-org/wasix-libc release (verified to exist) so
+        # the slice-5 test binaries build deterministically.
+        uses: wasix-org/wasixcc@v0.4.3
+        with:
+          version: v0.4.3
+          sysroot-tag: v2026-05-21.1
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe wasixcc
+        # Hard-fail if the toolchain didn't land — a missing wasixcc means
+        # zero binaries build, which must turn the job RED, not skip it.
+        run: |
+          set -euxo pipefail
+          if ! command -v wasixcc >/dev/null 2>&1; then
+            echo "::error::wasixcc not on PATH after install."
+            exit 1
+          fi
+          wasixcc --version || true
+
+      - name: Fetch + build wasix suite binaries
+        # `build-wasix-suite.ts` exits non-zero if wasixcc is missing, the
+        # vendor dir is absent, any per-test build fails, or zero binaries
+        # are produced. A real build failure fails the job honestly.
+        working-directory: packages/wasi
+        run: |
+          npm run test:prepare:wasix-suite
+
+      - name: Install Playwright browsers
+        working-directory: packages/wasi
+        run: npx playwright install --with-deps
+
+      - name: Run wasix-suite Playwright tests
+        working-directory: packages/wasi
+        # Add the JSON reporter alongside the existing html reporter so
+        # the next step can count pass/skip/fail without parsing HTML.
+        # A non-zero Playwright exit fails the job — failures are not
+        # swallowed. The summary step below runs `if: always()` so the
+        # pass/skip/fail counts are still published on a red run.
+        run: |
+          npx playwright test tests/wasix-suite.spec.ts \
+            --reporter=list,html,json
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-report/wasix-suite.json
+
+      - name: Publish pass/skip counts to job summary
+        if: always()
+        working-directory: packages/wasi
+        run: |
+          set -euo pipefail
+          REPORT="playwright-report/wasix-suite.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "::warning::no wasix-suite JSON report at $REPORT"
+            {
+              echo "## wasix integration suite"
+              echo
+              echo "_No Playwright JSON report produced._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # jq aggregates Playwright's per-test-status counts across the
+          # whole suite (stats.{expected,unexpected,skipped,flaky}).
+          STATS=$(jq '{expected: .stats.expected,
+                       unexpected: .stats.unexpected,
+                       skipped: .stats.skipped,
+                       flaky: .stats.flaky}' "$REPORT")
+          PASSED=$(echo "$STATS" | jq -r '.expected')
+          FAILED=$(echo "$STATS" | jq -r '.unexpected')
+          SKIPPED=$(echo "$STATS" | jq -r '.skipped')
+          FLAKY=$(echo "$STATS" | jq -r '.flaky')
+          {
+            echo "## wasix integration suite"
+            echo
+            echo "| result | count |"
+            echo "| --- | --- |"
+            echo "| passed | ${PASSED} |"
+            echo "| failed | ${FAILED} |"
+            echo "| skipped | ${SKIPPED} |"
+            echo "| flaky | ${FLAKY} |"
+            echo
+            echo "### Skip breakdown"
+            echo
+            # Group by skip reason annotation (set in wasix-suite.spec.ts).
+            jq -r '
+              [.suites[]?.suites[]?.specs[]?.tests[]?.annotations[]?
+               | select(.type == "wasix-skip") | .description]
+              | group_by(.)
+              | map({reason: .[0], count: length})
+              | sort_by(-.count)
+              | .[]
+              | "| \(.reason) | \(.count) |"
+            ' "$REPORT" > /tmp/skip-breakdown.md || true
+            if [ -s /tmp/skip-breakdown.md ]; then
+              echo "| reason | count |"
+              echo "| --- | --- |"
+              cat /tmp/skip-breakdown.md
+            else
+              echo "_no categorised skips recorded_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasix-suite-playwright-report
+          path: packages/wasi/playwright-report

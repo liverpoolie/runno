@@ -299,6 +299,59 @@ export const DIRENT_SIZE = 24;
  */
 export const PRESTAT_SIZE = 8;
 
+// ─── Sockets ABI ─────────────────────────────────────────────────────────────
+//
+// Constants needed by the Slice 5 socket syscalls. Numeric values mirror
+// `wasix-org/wasix` (NOT POSIX) — see `wasix-libc` headers. Providers receive
+// these as plain `number`s; only the syscall marshalling layer in `wasix.ts`
+// reads them from guest memory.
+
+/** Address family tags (`__wasi_addr_type_t`). */
+export enum AddressFamily {
+  UNSPEC = 0,
+  INET4 = 1,
+  INET6 = 2,
+  UNIX = 3,
+}
+
+/** Socket type (`__wasi_sock_type_t`). */
+export enum SockType {
+  STREAM = 1,
+  DGRAM = 2,
+  RAW = 3,
+  SEQPACKET = 4,
+}
+
+/** Transport protocol (`__wasi_sock_proto_t`). */
+export enum SockProto {
+  TCP = 6,
+  UDP = 17,
+}
+
+/** `sock_shutdown` direction. */
+export enum ShutdownHow {
+  RD = 1,
+  WR = 2,
+  RDWR = 3,
+}
+
+/** `sock_*_opt` level (`SOL_*`). Wasix only standardises SOL_SOCKET. */
+export const SockLevel = {
+  SOCKET: 0,
+} as const;
+
+/**
+ * `sock_option_t` numbering — only the names this slice references. Match
+ * wasix's `__WASI_SOCK_OPT_*` enum: REUSE_PORT=1, REUSE_ADDR=2, LAST_ERROR=11,
+ * TYPE=25.
+ */
+export enum SockOpt {
+  REUSE_PORT = 1,
+  REUSE_ADDR = 2,
+  LAST_ERROR = 11,
+  TYPE = 25,
+}
+
 // ─── Error class ─────────────────────────────────────────────────────────────
 
 // Thrown by provider implementations to signal a specific WASIX errno.

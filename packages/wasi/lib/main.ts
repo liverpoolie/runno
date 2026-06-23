@@ -16,6 +16,15 @@ export { SeededRandomProvider } from "./wasix/providers/seeded-random.js";
 export { WASIDriveFileSystemProvider } from "./wasix/providers/ergonomic/filesystem-provider.js";
 export { HTTPProvider } from "./wasix/providers/ergonomic/http-provider.js";
 export type {
+  HTTPProviderOptions,
+  OutgoingHandler,
+  IncomingHandler,
+} from "./wasix/providers/ergonomic/http-provider.js";
+export {
+  LoopbackSocketsProvider,
+  LoopbackFabric,
+} from "./wasix/providers/loopback-sockets.js";
+export type {
   ClockProvider,
   RandomProvider,
   TTYProvider,
@@ -26,6 +35,7 @@ export type {
   ProcProvider,
   FileSystemProvider,
   SockAddr,
+  SockAcceptResult,
   AddrHints,
   SockRecvResult,
   TTYState,
