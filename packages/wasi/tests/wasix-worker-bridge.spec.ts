@@ -596,4 +596,291 @@ test.describe("wasix-worker-bridge", () => {
     expect(outcome.opcode).toBe(3 /* Opcode.CLOCK_NOW */);
     expect(outcome.finalState).toBe(outcome.STATE_RESPONSE_READY);
   });
+
+  // ── Per-opcode protocol round trips (Review A1) ───────────────────────────
+  //
+  // The CLOCK_NOW test above proves the SAB state machine end-to-end. These
+  // three prove that the encoder and decoder for each *other* new opcode are
+  // mutual inverses at the wire level. A shared exhaustive switch is not a
+  // substitute: an asymmetric encode/decode bug on an opcode the suite never
+  // round-trips (a dropped field, a misordered u32, a signedness slip on a
+  // payload byte) passes CLOCK_NOW's coverage and current CI untouched. Each
+  // test drives the real codec (`encodeRequest`/`decodeRequest`,
+  // `encodeResponse`/`decodeResponse`) through `__BRIDGE_TEST_API__` — the
+  // same functions `callBridgeSync` / the dispatcher use — over a real bridge
+  // buffer, so a deliberately wrong field would fail here.
+
+  test("RANDOM_FILL request + response round-trip through the wire codec", async ({
+    page,
+  }) => {
+    const outcome = await page.evaluate(async () => {
+      while (
+        (window as unknown as { __BRIDGE_TEST_API__?: unknown })[
+          "__BRIDGE_TEST_API__"
+        ] === undefined
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      type BridgeApi = {
+        createBridgeBuffer: (n?: number) => SharedArrayBuffer;
+        requestRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        responseRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        encodeRequest: (region: Uint8Array, request: unknown) => number;
+        decodeRequest: (
+          opcode: number,
+          region: Uint8Array,
+          argLen: number,
+        ) => { opcode: number; args: { byteLength: number } };
+        encodeResponse: (region: Uint8Array, response: unknown) => number;
+        decodeResponse: (
+          opcode: number,
+          region: Uint8Array,
+          respLen: number,
+        ) => { opcode: number; result: { bytes: Uint8Array } };
+        Opcode: { RANDOM_FILL: number };
+      };
+      const api = (window as unknown as { __BRIDGE_TEST_API__: BridgeApi })
+        .__BRIDGE_TEST_API__;
+
+      const buffer = api.createBridgeBuffer();
+
+      // Request carries only the requested byte length (u32). Round-trip a
+      // non-trivial value so a dropped/zeroed arg is caught.
+      const reqRegion = api.requestRegion(buffer);
+      const argLen = api.encodeRequest(reqRegion, {
+        opcode: api.Opcode.RANDOM_FILL,
+        args: { byteLength: 1234 },
+      });
+      const decodedReq = api.decodeRequest(
+        api.Opcode.RANDOM_FILL,
+        reqRegion,
+        argLen,
+      );
+
+      // Response carries the raw filled bytes. Use a payload with low, high,
+      // and 0x80-straddling values so a signedness slip or off-by-one copy
+      // would corrupt at least one byte.
+      const sent = new Uint8Array(64);
+      for (let i = 0; i < sent.length; i++) sent[i] = (i * 7 + 0x80) & 0xff;
+      sent[0] = 0x00;
+      sent[sent.length - 1] = 0xff;
+      const respRegion = api.responseRegion(buffer);
+      const respLen = api.encodeResponse(respRegion, {
+        opcode: api.Opcode.RANDOM_FILL,
+        result: { bytes: sent },
+      });
+      const decodedResp = api.decodeResponse(
+        api.Opcode.RANDOM_FILL,
+        respRegion,
+        respLen,
+      );
+
+      return {
+        reqOpcode: decodedReq.opcode,
+        reqByteLength: decodedReq.args.byteLength,
+        respOpcode: decodedResp.opcode,
+        gotLen: decodedResp.result.bytes.byteLength,
+        // Array form survives page.evaluate's structured clone for a deep
+        // compare in Node.
+        sent: Array.from(sent),
+        got: Array.from(decodedResp.result.bytes),
+      };
+    });
+
+    expect(outcome.reqOpcode).toBe(4 /* Opcode.RANDOM_FILL */);
+    expect(outcome.reqByteLength).toBe(1234);
+    expect(outcome.respOpcode).toBe(4);
+    expect(outcome.gotLen).toBe(64);
+    expect(outcome.got).toEqual(outcome.sent);
+  });
+
+  test("TTY_GET request + response round-trip preserves every TTYState field", async ({
+    page,
+  }) => {
+    const outcome = await page.evaluate(async () => {
+      while (
+        (window as unknown as { __BRIDGE_TEST_API__?: unknown })[
+          "__BRIDGE_TEST_API__"
+        ] === undefined
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      type TTYStateWire = {
+        cols: number;
+        rows: number;
+        pixelWidth: number;
+        pixelHeight: number;
+        echo: boolean;
+        lineBuffered: boolean;
+        raw: boolean;
+      };
+      type BridgeApi = {
+        createBridgeBuffer: (n?: number) => SharedArrayBuffer;
+        requestRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        responseRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        encodeRequest: (region: Uint8Array, request: unknown) => number;
+        decodeRequest: (
+          opcode: number,
+          region: Uint8Array,
+          argLen: number,
+        ) => { opcode: number; args: Record<string, never> };
+        encodeResponse: (region: Uint8Array, response: unknown) => number;
+        decodeResponse: (
+          opcode: number,
+          region: Uint8Array,
+          respLen: number,
+        ) => { opcode: number; result: { state: TTYStateWire } };
+        Opcode: { TTY_GET: number };
+      };
+      const api = (window as unknown as { __BRIDGE_TEST_API__: BridgeApi })
+        .__BRIDGE_TEST_API__;
+
+      const buffer = api.createBridgeBuffer();
+
+      // TTY_GET request is argless (tag byte only).
+      const reqRegion = api.requestRegion(buffer);
+      const argLen = api.encodeRequest(reqRegion, {
+        opcode: api.Opcode.TTY_GET,
+        args: {},
+      });
+      const decodedReq = api.decodeRequest(
+        api.Opcode.TTY_GET,
+        reqRegion,
+        argLen,
+      );
+
+      // Distinct values per u32 field + a mixed flag triple so a misordered
+      // field or a dropped/swapped boolean is caught (this exercises the
+      // encodeTTYState/decodeTTYState wire helpers — TTY_GET's response is
+      // the only path that encodes a TTYState into a response).
+      const state: TTYStateWire = {
+        cols: 132,
+        rows: 43,
+        pixelWidth: 1920,
+        pixelHeight: 1080,
+        echo: false,
+        lineBuffered: true,
+        raw: true,
+      };
+      const respRegion = api.responseRegion(buffer);
+      const respLen = api.encodeResponse(respRegion, {
+        opcode: api.Opcode.TTY_GET,
+        result: { state },
+      });
+      const decodedResp = api.decodeResponse(
+        api.Opcode.TTY_GET,
+        respRegion,
+        respLen,
+      );
+
+      return {
+        reqOpcode: decodedReq.opcode,
+        argLen,
+        sent: state,
+        got: decodedResp.result.state,
+        respOpcode: decodedResp.opcode,
+      };
+    });
+
+    expect(outcome.reqOpcode).toBe(5 /* Opcode.TTY_GET */);
+    // Argless request is exactly the one tag byte.
+    expect(outcome.argLen).toBe(1);
+    expect(outcome.respOpcode).toBe(5);
+    expect(outcome.got).toEqual(outcome.sent);
+  });
+
+  test("TTY_SET request + response round-trip preserves TTYState args and result", async ({
+    page,
+  }) => {
+    const outcome = await page.evaluate(async () => {
+      while (
+        (window as unknown as { __BRIDGE_TEST_API__?: unknown })[
+          "__BRIDGE_TEST_API__"
+        ] === undefined
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      type TTYStateWire = {
+        cols: number;
+        rows: number;
+        pixelWidth: number;
+        pixelHeight: number;
+        echo: boolean;
+        lineBuffered: boolean;
+        raw: boolean;
+      };
+      type BridgeApi = {
+        createBridgeBuffer: (n?: number) => SharedArrayBuffer;
+        requestRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        responseRegion: (buffer: SharedArrayBuffer) => Uint8Array;
+        encodeRequest: (region: Uint8Array, request: unknown) => number;
+        decodeRequest: (
+          opcode: number,
+          region: Uint8Array,
+          argLen: number,
+        ) => { opcode: number; args: { state: TTYStateWire } };
+        encodeResponse: (region: Uint8Array, response: unknown) => number;
+        decodeResponse: (
+          opcode: number,
+          region: Uint8Array,
+          respLen: number,
+        ) => { opcode: number; result: { result: number } };
+        Opcode: { TTY_SET: number };
+      };
+      const api = (window as unknown as { __BRIDGE_TEST_API__: BridgeApi })
+        .__BRIDGE_TEST_API__;
+
+      const buffer = api.createBridgeBuffer();
+
+      // Request carries the full TTYState — different non-default values from
+      // the TTY_GET test so a copy/paste of the wrong fixture would diverge.
+      // This is the request-side exercise of encodeTTYState/decodeTTYState.
+      const state: TTYStateWire = {
+        cols: 80,
+        rows: 24,
+        pixelWidth: 640,
+        pixelHeight: 480,
+        echo: true,
+        lineBuffered: false,
+        raw: true,
+      };
+      const reqRegion = api.requestRegion(buffer);
+      const argLen = api.encodeRequest(reqRegion, {
+        opcode: api.Opcode.TTY_SET,
+        args: { state },
+      });
+      const decodedReq = api.decodeRequest(
+        api.Opcode.TTY_SET,
+        reqRegion,
+        argLen,
+      );
+
+      // Response carries a single Result (u32). Use a non-zero value so a
+      // zeroed/dropped result word would fail rather than coincidentally
+      // matching SUCCESS=0.
+      const respRegion = api.responseRegion(buffer);
+      const respLen = api.encodeResponse(respRegion, {
+        opcode: api.Opcode.TTY_SET,
+        result: { result: 8 /* a non-SUCCESS Result */ },
+      });
+      const decodedResp = api.decodeResponse(
+        api.Opcode.TTY_SET,
+        respRegion,
+        respLen,
+      );
+
+      return {
+        reqOpcode: decodedReq.opcode,
+        sentState: state,
+        gotState: decodedReq.args.state,
+        respOpcode: decodedResp.opcode,
+        gotResult: decodedResp.result.result,
+      };
+    });
+
+    expect(outcome.reqOpcode).toBe(6 /* Opcode.TTY_SET */);
+    expect(outcome.gotState).toEqual(outcome.sentState);
+    expect(outcome.respOpcode).toBe(6);
+    expect(outcome.gotResult).toBe(8);
+  });
 });
